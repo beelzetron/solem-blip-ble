@@ -7,6 +7,7 @@ COMMIT_COMMAND = bytes.fromhex("3b00")
 
 DEFAULT_BLUETOOTH_TIMEOUT = 15.0
 DEFAULT_MAX_STATION_NUM = 6
+NOTIFY_SETTLE_DELAY = 0.5
 
 # Per pcman75/solem-blip-reverse-engineering (tested up to 15 days, 0x0f)
 MAX_TURN_OFF_DAYS = 15

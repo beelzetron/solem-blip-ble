@@ -75,17 +75,6 @@ async def _run_read_only(
     *,
     verbose: bool,
 ) -> None:
-    step = StepResult("connect", False)
-    try:
-        await client.connect()
-        step.ok = True
-        step.detail = "Write characteristic found"
-    except SolemConnectionError as exc:
-        step.detail = str(exc)
-    report.steps.append(step)
-    if not step.ok:
-        return
-
     for attempt in (1, 2):
         step = StepResult(f"get_status #{attempt}", False)
         try:
@@ -95,6 +84,8 @@ async def _run_read_only(
         except SolemConnectionError as exc:
             step.detail = str(exc)
         report.steps.append(step)
+        if not step.ok:
+            return
 
 
 async def _wait_for_watering(

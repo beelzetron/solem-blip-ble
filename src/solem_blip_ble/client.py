@@ -9,19 +9,20 @@ from typing import Any, TypeVar
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
-from bleak.exc import BleakDBusError
+from bleak.exc import BleakDBusError, BleakGATTProtocolError
 from bleak_retry_connector import (
     BleakClientWithServiceCache,
     BleakOutOfConnectionSlotsError,
     establish_connection,
 )
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from .const import (
     COMMIT_COMMAND,
     DEFAULT_BLUETOOTH_TIMEOUT,
     DEFAULT_MAX_STATION_NUM,
     NOTIFY_CHAR_UUID,
+    NOTIFY_SETTLE_DELAY,
     WRITE_CHAR_UUID,
 )
 from .exceptions import SolemConnectionError
@@ -92,11 +93,41 @@ class SolemClient:
             if not client.is_connected:
                 raise SolemConnectionError("Failed connecting!")
             return await operation(client)
+        except (BleakGATTProtocolError, BleakDBusError) as exc:
+            raise SolemConnectionError("BLE GATT error during device operation") from exc
         finally:
             try:
                 await client.disconnect()
             except Exception:
                 pass
+
+    async def _start_notify(
+        self,
+        client: BleakClient,
+        handler: Callable[[int, bytearray], None],
+    ) -> None:
+        """Subscribe to status notifications with settle time and retries."""
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                await asyncio.sleep(NOTIFY_SETTLE_DELAY if attempt == 0 else 0.5 * attempt)
+                await client.start_notify(NOTIFY_CHAR_UUID, handler)
+                return
+            except (BleakGATTProtocolError, BleakDBusError) as exc:
+                last_exc = exc
+                _LOGGER.debug(
+                    "%s - start_notify attempt %s failed: %s",
+                    self.mac_address,
+                    attempt + 1,
+                    exc,
+                )
+                try:
+                    await client.stop_notify(NOTIFY_CHAR_UUID)
+                except Exception:
+                    pass
+        raise SolemConnectionError(
+            "Failed to subscribe to status notifications"
+        ) from last_exc
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.4, min=0.4, max=2))
     async def _write(self, client: BleakClient, payload: bytes) -> None:
@@ -134,6 +165,18 @@ class SolemClient:
         if self.mock:
             return protocol.mock_status()
 
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=0.5, min=1.0, max=5),
+            retry=retry_if_exception_type(SolemConnectionError),
+            reraise=True,
+        )
+        async def _attempt() -> dict[str, Any]:
+            return await self._get_status_once(include_raw=include_raw)
+
+        return await _attempt()
+
+    async def _get_status_once(self, *, include_raw: bool = False) -> dict[str, Any]:
         status_result: dict[str, Any] = {}
         status_event = asyncio.Event()
 
@@ -154,7 +197,7 @@ class SolemClient:
             status_event.set()
 
         async def _op(client: BleakClient) -> dict[str, Any]:
-            await client.start_notify(NOTIFY_CHAR_UUID, notification_handler)
+            await self._start_notify(client, notification_handler)
             try:
                 await self._write(client, COMMIT_COMMAND)
                 try:

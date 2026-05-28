@@ -15,9 +15,18 @@ Turn-off-for-N-days is capped at **15 days** per the pcman75 documentation.
 
 ```bash
 pip install solem-blip-ble
-# or from this monorepo:
-pip install -e ./solem_blip_ble
+# or from GitHub:
+pip install "solem-blip-ble @ git+https://github.com/beelzetron/solem-blip-ble.git@main"
+# or editable for development:
+pip install -e ".[dev]"
 ```
+
+## CI/CD
+
+- **CI:** GitHub Actions runs tests (Python 3.11–3.13) and verifies the package builds on every push/PR to `main`.
+- **CD:** Creating a [GitHub Release](https://github.com/beelzetron/solem-blip-ble/releases) publishes the package to [PyPI](https://pypi.org/project/solem-blip-ble/) via trusted publishing.
+
+Configure PyPI trusted publishing for this repository: PyPI project → Publishing → Add GitHub Actions publisher (`beelzetron/solem-blip-ble`, workflow `publish.yml`, environment `pypi`).
 
 ## Usage
 

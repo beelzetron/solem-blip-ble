@@ -49,8 +49,8 @@ def test_parse_status_watering_station_1():
     data[2] = 0x02
     data[3] = 0x42  # on + watering
     data[9] = 1
-    data[14] = 0x00
-    data[15] = 0xB4  # 180 seconds
+    data[13] = 0x00
+    data[14] = 0xB4  # 180 seconds (bytes 13-14, big-endian)
     parsed = protocol.parse_status_notification(data)
     assert parsed is not None
     assert parsed["is_watering"] is True

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "solem-blip-ble"
+version = "0.1.1"
+description = "BLE client for Solem BL-IP irrigation controllers"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Solem BL-IP contributors" }]
+dependencies = [
+    "bleak>=0.22.3",
+    "bleak-retry-connector>=3.6.0",
+    "tenacity>=8.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

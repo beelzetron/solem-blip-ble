@@ -111,7 +111,7 @@ station_num = notification[9]  # 1-6, or 0 if idle
 ### Remaining Time
 ```python
 import struct
-remaining_seconds = struct.unpack(">H", notification[14:16])[0]  # Big-endian
+remaining_seconds = struct.unpack(">H", notification[13:15])[0]  # Big-endian
 ```
 
 ---

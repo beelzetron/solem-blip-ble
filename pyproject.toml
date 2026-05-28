@@ -8,7 +8,7 @@ version = "0.1.1"
 description = "BLE client for Solem BL-IP irrigation controllers"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Solem BL-IP contributors" }]
 dependencies = [
     "bleak>=0.22.3",

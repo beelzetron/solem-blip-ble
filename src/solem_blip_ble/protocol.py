@@ -2,7 +2,7 @@
 
 Commands follow https://github.com/pcman75/solem-blip-reverse-engineering (write +
 commit on 108b0002). Status notifications (notify 108b0003, seq 0x02) are from
-live BL-IP testing documented in this monorepo's controller docs/.
+live BL-IP testing documented in docs/ble_protocol.md in this repository.
 """
 
 from __future__ import annotations

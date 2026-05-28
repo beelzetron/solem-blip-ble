@@ -73,13 +73,9 @@ def parse_status_notification(
 
     remaining_seconds = None
     if is_watering:
-        time_14_16 = struct.unpack(">H", data[14:16])[0]
-        time_16_18 = struct.unpack(">H", data[16:18])[0]
-        best = max(time_14_16, time_16_18)
-        if best == 16 and time_16_18 == 0:
-            remaining_seconds = None
-        elif best > 0:
-            remaining_seconds = best
+        seconds = struct.unpack(">H", data[13:15])[0]
+        if 0 < seconds <= 240 * 60:
+            remaining_seconds = seconds
 
     return {
         "controller_state": "On" if is_on else "Off",

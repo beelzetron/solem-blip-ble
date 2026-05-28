@@ -49,8 +49,8 @@ def test_parse_status_watering_station_1():
     data[2] = 0x02
     data[3] = 0x42  # on + watering
     data[9] = 1
-    data[13] = 0x00
-    data[14] = 0xB4  # 180 seconds (bytes 13-14, big-endian)
+    data[14] = 0x00
+    data[15] = 0xB4  # 180 seconds (bytes 14-15, big-endian)
     parsed = protocol.parse_status_notification(data)
     assert parsed is not None
     assert parsed["is_watering"] is True
@@ -62,3 +62,17 @@ def test_parse_ignores_wrong_sequence():
     data = bytearray(18)
     data[2] = 0x01
     assert protocol.parse_status_notification(data) is None
+
+
+def test_parse_remaining_ignores_padding_at_16_18():
+    data = bytearray(18)
+    data[2] = 0x02
+    data[3] = 0x42
+    data[9] = 1
+    data[14] = 0x00
+    data[15] = 0x3C  # 60 seconds
+    data[16] = 0x2F
+    data[17] = 0x10  # unrelated padding; must not override time
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["remaining_seconds"] == 60

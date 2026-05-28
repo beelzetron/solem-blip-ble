@@ -129,7 +129,7 @@ class SolemClient:
 
         await self._run_with_client(_op)
 
-    async def get_status(self) -> dict[str, Any]:
+    async def get_status(self, *, include_raw: bool = False) -> dict[str, Any]:
         """Poll status via commit (triggers seq 0x02 notification)."""
         if self.mock:
             return protocol.mock_status()
@@ -144,6 +144,8 @@ class SolemClient:
             if parsed is None:
                 return
             status_result.update(parsed)
+            if include_raw:
+                status_result["raw_notification_hex"] = bytes(data).hex()
             _LOGGER.debug(
                 "%s - Status notification (seq=2): %s",
                 self.mac_address,

@@ -73,7 +73,7 @@ def parse_status_notification(
 
     remaining_seconds = None
     if is_watering:
-        seconds = struct.unpack(">H", data[13:15])[0]
+        seconds = struct.unpack(">H", data[14:16])[0]
         if 0 < seconds <= 240 * 60:
             remaining_seconds = seconds
 

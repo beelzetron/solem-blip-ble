@@ -67,19 +67,28 @@ class SolemClient:
         *,
         mock: bool = False,
         max_station_num: int = DEFAULT_MAX_STATION_NUM,
+        ble_device: BLEDevice | None = None,
+        ble_device_resolver: Callable[[], BLEDevice | None] | None = None,
     ) -> None:
         self.mac_address = mac_address
         self.bluetooth_timeout = bluetooth_timeout
         self.mock = mock
         self.max_station_num = max_station_num
+        self._ble_device_resolver = ble_device_resolver
         self._conn_lock = asyncio.Lock()
         self._client: BleakClient | None = None
-        self._ble_device: BLEDevice | None = None
+        self._ble_device: BLEDevice | None = ble_device
         self._had_client = False
 
     async def _resolve_ble_device(self) -> BLEDevice:
         if self._ble_device is not None:
             return self._ble_device
+
+        if self._ble_device_resolver is not None:
+            ble_device = self._ble_device_resolver()
+            if ble_device is not None:
+                self._ble_device = ble_device
+                return ble_device
 
         last_round = SCAN_MAX_ROUNDS - 1
         for round_idx in range(SCAN_MAX_ROUNDS):
@@ -101,11 +110,24 @@ class SolemClient:
 
         raise SolemConnectionError("Device not found! Failed connecting!")
 
+    def _ble_device_callback(self) -> BLEDevice:
+        if self._ble_device_resolver is not None:
+            ble_device = self._ble_device_resolver()
+            if ble_device is not None:
+                self._ble_device = ble_device
+                return ble_device
+        if self._ble_device is None:
+            raise SolemConnectionError("Device not found! Failed connecting!")
+        return self._ble_device
+
     async def _establish_ble_connection(self) -> BleakClient:
         if self._had_client:
             await asyncio.sleep(RECONNECT_DELAY)
 
         ble_device = await self._resolve_ble_device()
+        connect_kwargs: dict[str, Any] = {}
+        if self._ble_device_resolver is not None:
+            connect_kwargs["ble_device_callback"] = self._ble_device_callback
         try:
             return await establish_connection(
                 BleakClientWithServiceCache,
@@ -113,6 +135,7 @@ class SolemClient:
                 name=f"Solem - {self.mac_address}",
                 timeout=self.bluetooth_timeout,
                 max_attempts=3,
+                **connect_kwargs,
             )
         except BleakOutOfConnectionSlotsError as exc:
             raise SolemConnectionError(

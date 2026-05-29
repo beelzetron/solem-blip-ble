@@ -9,7 +9,17 @@ from typing import Any, TypeVar
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
-from bleak.exc import BleakDBusError, BleakGATTProtocolError
+from bleak.exc import BleakDBusError
+
+try:
+    from bleak.exc import BleakGATTProtocolError
+except ImportError:  # bleak < 3.0 (Home Assistant core ships 2.x)
+    BleakGATTProtocolError = BleakDBusError
+
+_BLE_GATT_ERRORS: tuple[type[Exception], ...] = (
+    BleakGATTProtocolError,
+    BleakDBusError,
+)
 from bleak_retry_connector import (
     BleakClientWithServiceCache,
     BleakOutOfConnectionSlotsError,
@@ -163,7 +173,7 @@ class SolemClient:
         except SolemConnectionError:
             await self._invalidate_session()
             raise
-        except (BleakGATTProtocolError, BleakDBusError) as exc:
+        except _BLE_GATT_ERRORS as exc:
             await self._invalidate_session()
             raise SolemConnectionError("BLE GATT error during device operation") from exc
 
@@ -175,7 +185,7 @@ class SolemClient:
         await self._ensure_connected(client, phase="write")
         try:
             await client.write_gatt_char(WRITE_CHAR_UUID, payload, response=False)
-        except (BleakGATTProtocolError, BleakDBusError) as exc:
+        except _BLE_GATT_ERRORS as exc:
             raise SolemConnectionError("BLE write failed") from exc
 
     async def _start_notify(
@@ -193,7 +203,7 @@ class SolemClient:
                     await asyncio.sleep(NOTIFY_PARTIAL_RETRY_DELAY)
                 await client.start_notify(NOTIFY_CHAR_UUID, handler)
                 return
-            except (BleakGATTProtocolError, BleakDBusError) as exc:
+            except _BLE_GATT_ERRORS as exc:
                 last_exc = exc
                 _LOGGER.debug(
                     "%s - start_notify attempt %s failed: %s",

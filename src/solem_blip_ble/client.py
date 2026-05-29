@@ -20,7 +20,7 @@ from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_exponential,
+    wait_fixed,
 )
 
 from .const import (
@@ -28,7 +28,15 @@ from .const import (
     DEFAULT_BLUETOOTH_TIMEOUT,
     DEFAULT_MAX_STATION_NUM,
     NOTIFY_CHAR_UUID,
+    NOTIFY_PARTIAL_RETRY_DELAY,
     NOTIFY_SETTLE_DELAY,
+    RECONNECT_DELAY,
+    REQUEST_MAX_ATTEMPTS,
+    REQUEST_RETRY_DELAY,
+    SCAN_DURATION,
+    SCAN_MAX_ROUNDS,
+    SCAN_PAUSE,
+    STATUS_NOTIFY_TIMEOUT,
     WRITE_CHAR_UUID,
 )
 from .exceptions import SolemConnectionError
@@ -55,59 +63,109 @@ class SolemClient:
         self.mock = mock
         self.max_station_num = max_station_num
         self._conn_lock = asyncio.Lock()
+        self._client: BleakClient | None = None
+        self._ble_device: BLEDevice | None = None
+        self._had_client = False
 
     async def _resolve_ble_device(self) -> BLEDevice:
-        ble_device = await BleakScanner.find_device_by_address(
-            self.mac_address, timeout=5.0
-        )
-        if ble_device is not None:
-            return ble_device
+        if self._ble_device is not None:
+            return self._ble_device
 
-        devices = await BleakScanner.discover(timeout=5.0)
-        for device in devices:
-            if (device.address or "").lower() == self.mac_address.lower():
-                return device
+        last_round = SCAN_MAX_ROUNDS - 1
+        for round_idx in range(SCAN_MAX_ROUNDS):
+            ble_device = await BleakScanner.find_device_by_address(
+                self.mac_address, timeout=SCAN_DURATION
+            )
+            if ble_device is not None:
+                self._ble_device = ble_device
+                return ble_device
+
+            devices = await BleakScanner.discover(timeout=SCAN_DURATION)
+            for device in devices:
+                if (device.address or "").lower() == self.mac_address.lower():
+                    self._ble_device = device
+                    return device
+
+            if round_idx < last_round:
+                await asyncio.sleep(SCAN_PAUSE)
 
         raise SolemConnectionError("Device not found! Failed connecting!")
 
-    async def _connect_client(self) -> BleakClient:
+    async def _establish_ble_connection(self) -> BleakClient:
+        if self._had_client:
+            await asyncio.sleep(RECONNECT_DELAY)
+
+        ble_device = await self._resolve_ble_device()
+        try:
+            return await establish_connection(
+                BleakClientWithServiceCache,
+                ble_device,
+                name=f"Solem - {self.mac_address}",
+                timeout=self.bluetooth_timeout,
+                max_attempts=3,
+            )
+        except BleakOutOfConnectionSlotsError as exc:
+            raise SolemConnectionError(
+                "Bluetooth adapter/proxy out of connection slots or device busy"
+            ) from exc
+        except (BleakDBusError, TimeoutError, OSError) as exc:
+            raise SolemConnectionError("Timeout connecting to device") from exc
+        except Exception as exc:
+            raise SolemConnectionError("Unexpected BLE connection error") from exc
+
+    async def _drop_client_unsafe(self) -> None:
+        client = self._client
+        self._client = None
+        if client is None:
+            return
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    async def _invalidate_session(self) -> None:
         async with self._conn_lock:
-            ble_device = await self._resolve_ble_device()
-            try:
-                return await establish_connection(
-                    BleakClientWithServiceCache,
-                    ble_device,
-                    name=f"Solem - {self.mac_address}",
-                    timeout=self.bluetooth_timeout,
-                    max_attempts=3,
-                )
-            except BleakOutOfConnectionSlotsError as exc:
-                raise SolemConnectionError(
-                    "Bluetooth adapter/proxy out of connection slots or device busy"
-                ) from exc
-            except (BleakDBusError, TimeoutError, OSError) as exc:
-                raise SolemConnectionError("Timeout connecting to device") from exc
-            except Exception as exc:
-                raise SolemConnectionError("Unexpected BLE connection error") from exc
+            self._ble_device = None
+            await self._drop_client_unsafe()
+
+    async def _get_connected_client(self) -> BleakClient:
+        async with self._conn_lock:
+            if self._client is not None and self._client.is_connected:
+                return self._client
+
+            if self._client is not None:
+                self._had_client = True
+            await self._drop_client_unsafe()
+            client = await self._establish_ble_connection()
+            self._client = client
+            self._had_client = True
+            return client
+
+    async def disconnect(self) -> None:
+        """Close the persistent BLE session."""
+        async with self._conn_lock:
+            self._ble_device = None
+            self._had_client = False
+            await self._drop_client_unsafe()
 
     async def _run_with_client(
         self,
         operation: Callable[[BleakClient], Awaitable[_T]],
     ) -> _T:
-        client = await self._connect_client()
         try:
+            client = await self._get_connected_client()
             if not client.is_connected:
                 raise SolemConnectionError("Failed connecting!")
             return await operation(client)
         except RetryError as exc:
+            await self._invalidate_session()
             raise SolemConnectionError("BLE operation failed after retries") from exc
+        except SolemConnectionError:
+            await self._invalidate_session()
+            raise
         except (BleakGATTProtocolError, BleakDBusError) as exc:
+            await self._invalidate_session()
             raise SolemConnectionError("BLE GATT error during device operation") from exc
-        finally:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
 
     async def _ensure_connected(self, client: BleakClient, *, phase: str) -> None:
         if not client.is_connected:
@@ -129,7 +187,10 @@ class SolemClient:
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
-                await asyncio.sleep(NOTIFY_SETTLE_DELAY if attempt == 0 else 0.5 * attempt)
+                if attempt == 0:
+                    await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+                else:
+                    await asyncio.sleep(NOTIFY_PARTIAL_RETRY_DELAY)
                 await client.start_notify(NOTIFY_CHAR_UUID, handler)
                 return
             except (BleakGATTProtocolError, BleakDBusError) as exc:
@@ -179,8 +240,8 @@ class SolemClient:
             return protocol.mock_status()
 
         @retry(
-            stop=stop_after_attempt(5),
-            wait=wait_exponential(multiplier=0.5, min=1.0, max=5),
+            stop=stop_after_attempt(REQUEST_MAX_ATTEMPTS),
+            wait=wait_fixed(REQUEST_RETRY_DELAY),
             retry=retry_if_exception_type(SolemConnectionError),
             reraise=True,
         )
@@ -216,7 +277,9 @@ class SolemClient:
             try:
                 await self._write(client, COMMIT_COMMAND)
                 try:
-                    await asyncio.wait_for(status_event.wait(), timeout=5.0)
+                    await asyncio.wait_for(
+                        status_event.wait(), timeout=STATUS_NOTIFY_TIMEOUT
+                    )
                 except asyncio.TimeoutError as exc:
                     raise SolemConnectionError(
                         "Timeout waiting for status notification"

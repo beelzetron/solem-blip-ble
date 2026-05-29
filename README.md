@@ -33,10 +33,11 @@ Configure PyPI trusted publishing for this repository: PyPI project → Publishi
 ```python
 from solem_blip_ble import SolemClient, SolemConnectionError
 
-client = SolemClient("AA:BB:CC:DD:EE:FF", bluetooth_timeout=15)
+client = SolemClient("AA:BB:CC:DD:EE:FF", bluetooth_timeout=30)
 await client.connect()
 status = await client.get_status()
 await client.sprinkle_station_x_for_y_minutes(1, 5)
+await client.disconnect()
 await client.stop_manual_sprinkle()
 ```
 

@@ -111,7 +111,7 @@ station_num = notification[9]  # 1-6, or 0 if idle
 ### Remaining Time
 ```python
 import struct
-remaining_seconds = struct.unpack(">H", notification[14:16])[0]  # Big-endian
+remaining_seconds = struct.unpack(">H", notification[13:15])[0]  # Big-endian
 ```
 
 ---
@@ -133,7 +133,7 @@ remaining_seconds = struct.unpack(">H", notification[14:16])[0]  # Big-endian
 
 ### Time Decrement
 
-The remaining time (byte 14) decrements as watering progresses. Observed values:
+The remaining time (bytes 13-14, big-endian) decrements as watering progresses. Observed values:
 - Initial: 180s (after Station 1 for 3 min command)
 - After 45s: 142s (expected ~135s, slight discrepancy)
 
@@ -175,7 +175,7 @@ async def get_status(self) -> dict:
             "controller_state": "On" if status_byte & 0x40 else "Off",
             "is_watering": bool(status_byte & 0x02),
             "station_num": data[9] if data[9] in [1, 2, 3, 4] else None,
-            "remaining_seconds": struct.unpack(">H", data[14:16])[0],
+            "remaining_seconds": struct.unpack(">H", data[13:15])[0],
         }
 ```
 

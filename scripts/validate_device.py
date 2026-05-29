@@ -24,7 +24,25 @@ from typing import Any
 
 from solem_blip_ble import SolemClient, SolemConnectionError
 
+try:
+    from tenacity import RetryError
+except ImportError:  # pragma: no cover - tenacity is a required dependency
+    RetryError = Exception  # type: ignore[misc, assignment]
+
 DEFAULT_MAC = "C8:B9:61:D4:4D:C8"
+BLE_BUSY_HINT = (
+    "Hint: stop Home Assistant / observed BLE behavior / other BLE clients using this controller, "
+    "then retry. Upgrade with: pip install -U 'solem-blip-ble>=0.1.6'"
+)
+
+
+def _connection_detail(exc: BaseException) -> str:
+    detail = str(exc)
+    if isinstance(exc, RetryError):
+        detail = "BLE operation failed after retries"
+    if "not connected" in detail.lower() or isinstance(exc, RetryError):
+        detail = f"{detail}. {BLE_BUSY_HINT}"
+    return detail
 
 
 @dataclass
@@ -87,8 +105,8 @@ async def _run_read_only(
             status = await client.get_status(include_raw=verbose)
             step.ok = True
             step.data = status
-        except SolemConnectionError as exc:
-            step.detail = str(exc)
+        except (SolemConnectionError, RetryError) as exc:
+            step.detail = _connection_detail(exc)
         report.steps.append(step)
         if not step.ok:
             return
@@ -124,8 +142,8 @@ async def _run_actions(
         await client.stop_manual_sprinkle()
         step.ok = True
         step.detail = "Command sent"
-    except SolemConnectionError as exc:
-        step.detail = str(exc)
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
     report.steps.append(step)
 
     if skip_sprinkle:
@@ -146,8 +164,8 @@ async def _run_actions(
         await client.sprinkle_station_x_for_y_minutes(station, minutes)
         step.ok = True
         step.detail = "Command sent"
-    except SolemConnectionError as exc:
-        step.detail = str(exc)
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
     report.steps.append(step)
     if not step.ok:
         return
@@ -177,8 +195,8 @@ async def _run_actions(
             else:
                 step.ok = True
                 step.data = status
-    except SolemConnectionError as exc:
-        step.detail = str(exc)
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
     report.steps.append(step)
 
     step = StepResult("stop after sprinkle test", False)
@@ -186,8 +204,8 @@ async def _run_actions(
         await client.stop_manual_sprinkle()
         step.ok = True
         step.detail = "Command sent"
-    except SolemConnectionError as exc:
-        step.detail = str(exc)
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
     report.steps.append(step)
 
 
@@ -293,8 +311,8 @@ async def main() -> int:
                     for char in characteristics:
                         props = ", ".join(char["properties"])
                         print(f"         {char['uuid']} [{props}]")
-        except SolemConnectionError as exc:
-            step.detail = str(exc)
+        except (SolemConnectionError, RetryError) as exc:
+            step.detail = _connection_detail(exc)
         report.steps.append(step)
 
     print("-" * 60)
@@ -317,3 +335,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[!] Interrupted")
         sys.exit(130)
+    except RetryError as exc:
+        print(f"[FAIL] {_connection_detail(exc)}")
+        sys.exit(1)

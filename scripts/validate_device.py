@@ -55,6 +55,12 @@ def _format_status(status: dict[str, Any]) -> str:
         parts.append(f"station={status.get('station_num')}")
     if status.get("remaining_seconds") is not None:
         parts.append(f"remaining={status.get('remaining_seconds')}s")
+    if status.get("battery_voltage") is not None:
+        parts.append(f"battery={status['battery_voltage']}V")
+        if status.get("battery_level") is not None:
+            parts.append(f"level={status['battery_level']}/5")
+        if status.get("battery_low"):
+            parts.append("battery_low")
     if status.get("raw_notification_hex"):
         parts.append(f"raw={status['raw_notification_hex']}")
     return ", ".join(parts)

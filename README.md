@@ -46,7 +46,7 @@ Full BLE protocol notes: [docs/ble_protocol.md](docs/ble_protocol.md)
 
 ## Home Assistant
 
-Used by Home Assistant custom integrations (e.g. `solem_bluetooth_watering_controller`, optional `solem_toolkit`).
+Used by the [Solem Bluetooth Watering Controller](https://github.com/beelzetron/Home-Assistant-Solem-Bluetooth-Watering-Controller) Home Assistant integration.
 
 ## Credits
 

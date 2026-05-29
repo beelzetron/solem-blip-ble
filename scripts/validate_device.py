@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover - tenacity is a required dependency
 DEFAULT_MAC = "C8:B9:61:D4:4D:C8"
 SPRINKLE_VERIFY_TIMEOUT = 60.0
 BLE_BUSY_HINT = (
-    "Hint: stop Home Assistant / observed BLE behavior / other BLE clients using this controller, "
+    "Hint: stop Home Assistant / other BLE clients using this controller, "
     "then retry. Upgrade with: pip install -U 'solem-blip-ble>=0.1.8'"
 )
 

@@ -75,7 +75,7 @@ Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
 | 3 | **Status** | Controller state flags (see below) |
 | 4-7 | Station Data | Pattern `0x00aaaaaa` when active, `0x00000000` when idle |
 | 9 | **Station Number** | Active station (1-6), 0 when idle |
-| 10 | **Battery Voltage** | Raw 9 V reading (observed BLE behavior `status notification parser`, byte 10) |
+| 10 | **Battery Voltage** | Raw 9 V reading (status notification, byte 10) |
 | 13-14 | **Remaining Time** | Big-endian uint16, seconds remaining (only meaningful when watering) |
 | 14-15 | Padding | Often `0x3c10` during watering; do not use for remaining time |
 | 16-17 | Padding | Always `0x0000` |
@@ -122,13 +122,13 @@ Only parse when the watering flag is set (`status_byte & 0x02`). Ignore values o
 
 ### Battery (9 V)
 
-BL-IP reports raw battery voltage at **byte 10** of seq=0x02 status frames (observed BLE behavior `status notification frame`).
+BL-IP reports raw battery voltage at **byte 10** of seq=0x02 status frames.
 
 ```python
 battery_voltage = notification[10]  # 0 = not reported
 ```
 
-Map to icon level 0–5 using 9 V thresholds `{60, 65, 70, 75, 80}`. Alert below **50** (observed BLE behavior `PowerSourceType.nineVolts`).
+Map to icon level 0–5 using documented 9 V thresholds `{60, 65, 70, 75, 80}`. Alert below **50**.
 
 Example from HCI capture while watering (`3210024200aaaaaa00014f0c10003c100000`):
 
@@ -137,7 +137,7 @@ Example from HCI capture while watering (`3210024200aaaaaa00014f0c10003c100000`)
 
 **Wrong offset:** Reading bytes 14–16 (`notification[14:16]`) picks up padding and reports bogus values (e.g. `0x3c10` → 15376 s).
 
-### HCI validation (observed BLE behavior app, firmware 5.1.5)
+### HCI validation (firmware 5.1.5)
 
 Command: `3105120100003c` (station 1, 60 s) + commit `3b00`
 
@@ -149,7 +149,7 @@ Notification (seq `0x02`):
                            0x003c = 60 seconds at bytes 13-14
 ```
 
-Cross-checked against Android Bluetooth HCI snoop logs and the official observed BLE behavior app (`V5 protocol handler` for firmware 5.x).
+Validated via Android Bluetooth HCI snoop capture on BL-IP firmware 5.1.5.
 
 ---
 
@@ -225,7 +225,7 @@ async def get_status(self) -> dict:
 - ✅ Turn ON (`0x40`), station sprinkle (`0x42`), STOP, turn OFF (`0x00`)
 - ✅ Stations 1–6 on 6-station BL-IP
 - ✅ Remaining time at **bytes 13–14** (HCI + hardware + `scripts/validate_device.py`)
-- ✅ Battery voltage at **byte 10** (observed BLE behavior `status notification parser`, HCI capture `0x4f` → level 4)
+- ✅ Battery voltage at **byte 10** (HCI capture `0x4f` → level 4)
 
 ### Remaining time
 - ✅ 60 s sprinkle reads `0x003c` at bytes 13–14 (see HCI validation above)
@@ -266,4 +266,4 @@ Parse only notifications with `data[2] == 0x02`. Ignore `0x10` in byte 3 (interm
 
 *Document created: 2026-05-28*  
 *Last updated: 2026-05-29*  
-*Status: Commands per pcman75; status notify protocol validated on BL-IP hardware and observed BLE behavior HCI captures (see `solem_blip_ble` implementation).*
+*Status: Commands per pcman75; status notify protocol validated on BL-IP hardware and HCI capture (see `solem_blip_ble` implementation).*

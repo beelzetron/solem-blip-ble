@@ -246,7 +246,7 @@ class SolemClient:
         self,
         command: bytes,
     ) -> dict[str, Any] | None:
-        """Send command + commit and wait for device notification ack (observed BLE behavior flow)."""
+        """Send command + commit and wait for device notification ack."""
         response_event = asyncio.Event()
         last_status: dict[str, Any] | None = None
 

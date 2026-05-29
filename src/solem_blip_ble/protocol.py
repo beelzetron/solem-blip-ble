@@ -10,7 +10,7 @@ from __future__ import annotations
 import struct
 from typing import Any, TypedDict
 
-from .const import MAX_TURN_OFF_DAYS
+from .const import BATTERY_LEVELS_9V, BATTERY_VOLTAGE_ALERT_9V, MAX_TURN_OFF_DAYS
 
 
 class SolemStatus(TypedDict):
@@ -18,6 +18,9 @@ class SolemStatus(TypedDict):
     is_watering: bool
     station_num: int | None
     remaining_seconds: int | None
+    battery_voltage: int | None
+    battery_level: int | None
+    battery_low: bool
 
 
 def pack_commit() -> bytes:
@@ -57,6 +60,25 @@ def pack_stop_manual_sprinkle() -> bytes:
     return struct.pack(">HBBBH", 0x3105, 0x15, 0x00, 0xFF, 0x0000)
 
 
+def battery_level_9v(voltage: int) -> int:
+    """Map raw 9 V battery voltage to icon level 0–5 (MySOLEM thresholds)."""
+    for level, threshold in enumerate(BATTERY_LEVELS_9V):
+        if voltage < threshold:
+            return level
+    return len(BATTERY_LEVELS_9V)
+
+
+def parse_battery_9v(data: bytes | bytearray) -> tuple[int | None, int | None, bool]:
+    """Parse byte 10 battery voltage; returns (voltage, level, low_alert)."""
+    if len(data) <= 10:
+        return None, None, False
+    voltage = data[10]
+    if voltage == 0:
+        return None, None, False
+    level = battery_level_9v(voltage)
+    return voltage, level, voltage < BATTERY_VOLTAGE_ALERT_9V
+
+
 def parse_status_notification(
     data: bytes | bytearray,
     *,
@@ -77,11 +99,16 @@ def parse_status_notification(
         if 0 < seconds <= 240 * 60:
             remaining_seconds = seconds
 
+    battery_voltage, battery_level, battery_low = parse_battery_9v(data)
+
     return {
         "controller_state": "On" if is_on else "Off",
         "is_watering": is_watering,
         "station_num": station_num,
         "remaining_seconds": remaining_seconds,
+        "battery_voltage": battery_voltage,
+        "battery_level": battery_level,
+        "battery_low": battery_low,
     }
 
 
@@ -91,4 +118,7 @@ def mock_status() -> dict[str, Any]:
         "is_watering": False,
         "station_num": None,
         "remaining_seconds": None,
+        "battery_voltage": None,
+        "battery_level": None,
+        "battery_low": False,
     }

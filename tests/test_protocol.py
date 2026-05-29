@@ -42,6 +42,9 @@ def test_parse_status_on_idle():
     assert parsed["is_watering"] is False
     assert parsed["station_num"] is None
     assert parsed["remaining_seconds"] is None
+    assert parsed["battery_voltage"] is None
+    assert parsed["battery_level"] is None
+    assert parsed["battery_low"] is False
 
 
 def test_parse_status_watering_station_1():
@@ -56,6 +59,23 @@ def test_parse_status_watering_station_1():
     assert parsed["is_watering"] is True
     assert parsed["station_num"] == 1
     assert parsed["remaining_seconds"] == 180
+    assert parsed["battery_voltage"] is None
+
+
+def test_battery_level_9v():
+    assert protocol.battery_level_9v(59) == 0
+    assert protocol.battery_level_9v(64) == 1
+    assert protocol.battery_level_9v(79) == 4
+    assert protocol.battery_level_9v(80) == 5
+
+
+def test_parse_battery_from_hci_capture():
+    data = bytearray.fromhex("3210024200aaaaaa00014f0c10003c100000")
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["battery_voltage"] == 0x4F
+    assert parsed["battery_level"] == 4
+    assert parsed["battery_low"] is False
 
 
 def test_parse_ignores_wrong_sequence():

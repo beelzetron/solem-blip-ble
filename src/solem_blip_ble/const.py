@@ -11,3 +11,7 @@ NOTIFY_SETTLE_DELAY = 0.5
 
 # Per pcman75/solem-blip-reverse-engineering (tested up to 15 days, 0x0f)
 MAX_TURN_OFF_DAYS = 15
+
+# 9 V battery thresholds from observed BLE behavior (documented 9V thresholds)
+BATTERY_LEVELS_9V = (60, 65, 70, 75, 80)
+BATTERY_VOLTAGE_ALERT_9V = 50

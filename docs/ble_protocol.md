@@ -75,6 +75,7 @@ Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
 | 3 | **Status** | Controller state flags (see below) |
 | 4-7 | Station Data | Pattern `0x00aaaaaa` when active, `0x00000000` when idle |
 | 9 | **Station Number** | Active station (1-6), 0 when idle |
+| 10 | **Battery Voltage** | Raw 9 V reading (observed BLE behavior `status notification parser`, byte 10) |
 | 13-14 | **Remaining Time** | Big-endian uint16, seconds remaining (only meaningful when watering) |
 | 14-15 | Padding | Often `0x3c10` during watering; do not use for remaining time |
 | 16-17 | Padding | Always `0x0000` |
@@ -118,6 +119,21 @@ remaining_seconds = struct.unpack(">H", notification[13:15])[0]  # bytes 13-14, 
 ```
 
 Only parse when the watering flag is set (`status_byte & 0x02`). Ignore values outside a sane range (e.g. 1–14400 seconds).
+
+### Battery (9 V)
+
+BL-IP reports raw battery voltage at **byte 10** of seq=0x02 status frames (observed BLE behavior `status notification frame`).
+
+```python
+battery_voltage = notification[10]  # 0 = not reported
+```
+
+Map to icon level 0–5 using 9 V thresholds `{60, 65, 70, 75, 80}`. Alert below **50** (observed BLE behavior `PowerSourceType.nineVolts`).
+
+Example from HCI capture while watering (`3210024200aaaaaa00014f0c10003c100000`):
+
+- byte 10 = `0x4f` (79) → level **4** (full bar at ≥80)
+- bytes 13–14 = `0x003c` (60 s remaining)
 
 **Wrong offset:** Reading bytes 14–16 (`notification[14:16]`) picks up padding and reports bogus values (e.g. `0x3c10` → 15376 s).
 
@@ -165,7 +181,7 @@ The remaining time (bytes 13-14, big-endian) decrements as watering progresses. 
 1. **Spontaneous Notifications:** Unknown if device sends periodic status updates without a prior command
 2. **Error Codes:** Unknown status byte values for error conditions
 3. **Battery Level:** Not observed in notifications
-4. **Bytes 10–12:** Purpose not fully mapped; not required for status polling
+4. **Bytes 11–12:** Purpose not fully mapped; not required for status polling
 
 ---
 
@@ -196,6 +212,8 @@ async def get_status(self) -> dict:
             "is_watering": bool(status_byte & 0x02),
             "station_num": data[9] if 1 <= data[9] <= 6 else None,
             "remaining_seconds": struct.unpack(">H", data[13:15])[0],
+            "battery_voltage": data[10] or None,
+            "battery_level": battery_level_9v(data[10]) if data[10] else None,
         }
 ```
 
@@ -207,6 +225,7 @@ async def get_status(self) -> dict:
 - ✅ Turn ON (`0x40`), station sprinkle (`0x42`), STOP, turn OFF (`0x00`)
 - ✅ Stations 1–6 on 6-station BL-IP
 - ✅ Remaining time at **bytes 13–14** (HCI + hardware + `scripts/validate_device.py`)
+- ✅ Battery voltage at **byte 10** (observed BLE behavior `status notification parser`, HCI capture `0x4f` → level 4)
 
 ### Remaining time
 - ✅ 60 s sprinkle reads `0x003c` at bytes 13–14 (see HCI validation above)

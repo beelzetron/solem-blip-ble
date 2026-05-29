@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover - tenacity is a required dependency
 DEFAULT_MAC = "C8:B9:61:D4:4D:C8"
 BLE_BUSY_HINT = (
     "Hint: stop Home Assistant / MySOLEM / other BLE clients using this controller, "
-    "then retry. Upgrade with: pip install -U 'solem-blip-ble>=0.1.6'"
+    "then retry. Upgrade with: pip install -U 'solem-blip-ble>=0.1.7'"
 )
 
 
@@ -222,8 +222,8 @@ async def main() -> int:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=15.0,
-        help="BLE connection timeout in seconds (default: 15)",
+        default=30.0,
+        help="BLE connection timeout in seconds (default: 30)",
     )
     parser.add_argument(
         "--max-station",
@@ -281,52 +281,55 @@ async def main() -> int:
         max_station_num=args.max_station,
     )
 
-    print("solem-blip-ble device validation")
-    print(f"Package:  solem-blip-ble {package_version}")
-    print(f"MAC:      {mac}")
-    print(f"Mode:     {'actions' if args.actions else 'read-only'}")
-    print("-" * 60)
+    try:
+        print("solem-blip-ble device validation")
+        print(f"Package:  solem-blip-ble {package_version}")
+        print(f"MAC:      {mac}")
+        print(f"Mode:     {'actions' if args.actions else 'read-only'}")
+        print("-" * 60)
 
-    await _run_read_only(client, report, verbose=args.verbose)
+        await _run_read_only(client, report, verbose=args.verbose)
 
-    if args.actions and report.steps and report.steps[0].ok:
-        await _run_actions(
-            client,
-            report,
-            station=args.station,
-            minutes=args.minutes,
-            skip_sprinkle=args.skip_sprinkle,
-            verbose=args.verbose,
-        )
+        if args.actions and report.steps and report.steps[0].ok:
+            await _run_actions(
+                client,
+                report,
+                station=args.station,
+                minutes=args.minutes,
+                skip_sprinkle=args.skip_sprinkle,
+                verbose=args.verbose,
+            )
 
-    if args.list_chars:
-        step = StepResult("list_characteristics", False)
-        try:
-            chars = await client.list_characteristics()
-            step.ok = bool(chars)
-            step.detail = f"{len(chars)} service(s)"
-            if chars:
-                for service_uuid, characteristics in chars.items():
-                    print(f"       service {service_uuid}")
-                    for char in characteristics:
-                        props = ", ".join(char["properties"])
-                        print(f"         {char['uuid']} [{props}]")
-        except (SolemConnectionError, RetryError) as exc:
-            step.detail = _connection_detail(exc)
-        report.steps.append(step)
+        if args.list_chars:
+            step = StepResult("list_characteristics", False)
+            try:
+                chars = await client.list_characteristics()
+                step.ok = bool(chars)
+                step.detail = f"{len(chars)} service(s)"
+                if chars:
+                    for service_uuid, characteristics in chars.items():
+                        print(f"       service {service_uuid}")
+                        for char in characteristics:
+                            props = ", ".join(char["properties"])
+                            print(f"         {char['uuid']} [{props}]")
+            except (SolemConnectionError, RetryError) as exc:
+                step.detail = _connection_detail(exc)
+            report.steps.append(step)
 
-    print("-" * 60)
-    for step in report.steps:
-        _print_step(step)
+        print("-" * 60)
+        for step in report.steps:
+            _print_step(step)
 
-    print("-" * 60)
-    if report.passed:
-        print("Result: ALL CHECKS PASSED")
-        return 0
+        print("-" * 60)
+        if report.passed:
+            print("Result: ALL CHECKS PASSED")
+            return 0
 
-    failed = [step.name for step in report.steps if not step.ok]
-    print(f"Result: FAILED ({len(failed)} step(s): {', '.join(failed)})")
-    return 1
+        failed = [step.name for step in report.steps if not step.ok]
+        print(f"Result: FAILED ({len(failed)} step(s): {', '.join(failed)})")
+        return 1
+    finally:
+        await client.disconnect()
 
 
 if __name__ == "__main__":

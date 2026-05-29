@@ -15,7 +15,13 @@ from bleak_retry_connector import (
     BleakOutOfConnectionSlotsError,
     establish_connection,
 )
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    RetryError,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from .const import (
     COMMIT_COMMAND,
@@ -93,6 +99,8 @@ class SolemClient:
             if not client.is_connected:
                 raise SolemConnectionError("Failed connecting!")
             return await operation(client)
+        except RetryError as exc:
+            raise SolemConnectionError("BLE operation failed after retries") from exc
         except (BleakGATTProtocolError, BleakDBusError) as exc:
             raise SolemConnectionError("BLE GATT error during device operation") from exc
         finally:
@@ -100,6 +108,17 @@ class SolemClient:
                 await client.disconnect()
             except Exception:
                 pass
+
+    async def _ensure_connected(self, client: BleakClient, *, phase: str) -> None:
+        if not client.is_connected:
+            raise SolemConnectionError(f"Client disconnected before {phase}")
+
+    async def _write(self, client: BleakClient, payload: bytes) -> None:
+        await self._ensure_connected(client, phase="write")
+        try:
+            await client.write_gatt_char(WRITE_CHAR_UUID, payload, response=False)
+        except (BleakGATTProtocolError, BleakDBusError) as exc:
+            raise SolemConnectionError("BLE write failed") from exc
 
     async def _start_notify(
         self,
@@ -128,12 +147,6 @@ class SolemClient:
         raise SolemConnectionError(
             "Failed to subscribe to status notifications"
         ) from last_exc
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.4, min=0.4, max=2))
-    async def _write(self, client: BleakClient, payload: bytes) -> None:
-        if not client.is_connected:
-            raise SolemConnectionError("Client not connected")
-        await client.write_gatt_char(WRITE_CHAR_UUID, payload, response=False)
 
     async def _write_and_commit(self, command: bytes) -> None:
         async def _op(client: BleakClient) -> None:
@@ -166,7 +179,7 @@ class SolemClient:
             return protocol.mock_status()
 
         @retry(
-            stop=stop_after_attempt(3),
+            stop=stop_after_attempt(5),
             wait=wait_exponential(multiplier=0.5, min=1.0, max=5),
             retry=retry_if_exception_type(SolemConnectionError),
             reraise=True,
@@ -198,6 +211,8 @@ class SolemClient:
 
         async def _op(client: BleakClient) -> dict[str, Any]:
             await self._start_notify(client, notification_handler)
+            await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+            await self._ensure_connected(client, phase="status poll")
             try:
                 await self._write(client, COMMIT_COMMAND)
                 try:

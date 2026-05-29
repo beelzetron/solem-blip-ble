@@ -40,15 +40,31 @@ def pack_turn_off_x_days(days: int) -> bytes:
     return struct.pack(">HBBBH", 0x3105, 0xC0, 0x00, days & 0xFF, 0x0000)
 
 
+def _pack_v5_duration_command(opcode: int, station: int, seconds: int) -> bytes:
+    """MySOLEM testValvesV5 / manualRunValvesV5 (3-byte big-endian duration)."""
+    seconds = max(1, min(seconds, 0xFFFFFF))
+    return bytes(
+        [
+            0x31,
+            0x05,
+            opcode & 0xFF,
+            station & 0xFF,
+            (seconds >> 16) & 0xFF,
+            (seconds >> 8) & 0xFF,
+            seconds & 0xFF,
+        ]
+    )
+
+
 def pack_sprinkle_station(station: int, minutes: int) -> bytes:
     station = max(1, min(station, 16))
     seconds = max(1, min(minutes, 240)) * 60
-    return struct.pack(">HBBBH", 0x3105, 0x12, station & 0xFF, 0x00, seconds & 0xFFFF)
+    return _pack_v5_duration_command(0x12, station, seconds)
 
 
 def pack_sprinkle_all_stations(minutes: int) -> bytes:
     seconds = max(1, min(minutes, 240)) * 60
-    return struct.pack(">HBBBH", 0x3105, 0x11, 0x00, 0x00, seconds & 0xFFFF)
+    return _pack_v5_duration_command(0x11, 0, seconds)
 
 
 def pack_run_program(program: int) -> bytes:
@@ -110,6 +126,11 @@ def parse_status_notification(
         "battery_level": battery_level,
         "battery_low": battery_low,
     }
+
+
+def is_command_notification(data: bytes | bytearray) -> bool:
+    """True for seq 0x00/0x01/0x02 command-response notifications."""
+    return len(data) >= 3 and data[2] in (0x00, 0x01, 0x02)
 
 
 def mock_status() -> dict[str, Any]:

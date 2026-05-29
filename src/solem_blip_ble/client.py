@@ -209,12 +209,57 @@ class SolemClient:
             "Failed to subscribe to status notifications"
         ) from last_exc
 
-    async def _write_and_commit(self, command: bytes) -> None:
-        async def _op(client: BleakClient) -> None:
-            await self._write(client, command)
-            await self._write(client, protocol.pack_commit())
+    async def _execute_command(
+        self,
+        command: bytes,
+    ) -> dict[str, Any] | None:
+        """Send command + commit and wait for device notification ack (MySOLEM flow)."""
+        response_event = asyncio.Event()
+        last_status: dict[str, Any] | None = None
 
-        await self._run_with_client(_op)
+        def notification_handler(_sender: int, data: bytearray) -> None:
+            nonlocal last_status
+            if not protocol.is_command_notification(data):
+                return
+            parsed = protocol.parse_status_notification(
+                data, max_station_num=self.max_station_num
+            )
+            if parsed is not None:
+                last_status = parsed
+            _LOGGER.debug(
+                "%s - Command notification (seq=%s): %s",
+                self.mac_address,
+                data[2],
+                bytes(data).hex(),
+            )
+            response_event.set()
+
+        async def _op(client: BleakClient) -> dict[str, Any] | None:
+            await self._start_notify(client, notification_handler)
+            await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+            await self._ensure_connected(client, phase="command")
+            try:
+                await self._write(client, command)
+                await self._write(client, protocol.pack_commit())
+                try:
+                    await asyncio.wait_for(
+                        response_event.wait(), timeout=STATUS_NOTIFY_TIMEOUT
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise SolemConnectionError(
+                        "Timeout waiting for command response"
+                    ) from exc
+                return last_status
+            finally:
+                try:
+                    await client.stop_notify(NOTIFY_CHAR_UUID)
+                except Exception as exc:
+                    _LOGGER.debug("%s - stop_notify: %s", self.mac_address, exc)
+
+        return await self._run_with_client(_op)
+
+    async def _write_and_commit(self, command: bytes) -> dict[str, Any] | None:
+        return await self._execute_command(command)
 
     async def connect(self) -> None:
         """Verify the device is reachable and exposes the write characteristic."""
@@ -310,15 +355,21 @@ class SolemClient:
             return
         await self._write_and_commit(protocol.pack_turn_off_x_days(days))
 
-    async def sprinkle_station_x_for_y_minutes(self, station: int, minutes: int) -> None:
+    async def sprinkle_station_x_for_y_minutes(
+        self, station: int, minutes: int
+    ) -> dict[str, Any] | None:
         if self.mock:
-            return
-        await self._write_and_commit(protocol.pack_sprinkle_station(station, minutes))
+            return None
+        return await self._write_and_commit(
+            protocol.pack_sprinkle_station(station, minutes)
+        )
 
-    async def sprinkle_all_stations_for_y_minutes(self, minutes: int) -> None:
+    async def sprinkle_all_stations_for_y_minutes(self, minutes: int) -> dict[str, Any] | None:
         if self.mock:
-            return
-        await self._write_and_commit(protocol.pack_sprinkle_all_stations(minutes))
+            return None
+        return await self._write_and_commit(
+            protocol.pack_sprinkle_all_stations(minutes)
+        )
 
     async def run_program_x(self, program: int) -> None:
         if self.mock:

@@ -41,7 +41,7 @@ def pack_turn_off_x_days(days: int) -> bytes:
 
 
 def _pack_v5_duration_command(opcode: int, station: int, seconds: int) -> bytes:
-    """observed BLE behavior V5 duration command (3-byte big-endian duration)."""
+    """Pack a V5 duration command (3-byte big-endian duration in seconds)."""
     seconds = max(1, min(seconds, 0xFFFFFF))
     return bytes(
         [
@@ -77,7 +77,7 @@ def pack_stop_manual_sprinkle() -> bytes:
 
 
 def battery_level_9v(voltage: int) -> int:
-    """Map raw 9 V battery voltage to icon level 0–5 (observed BLE behavior thresholds)."""
+    """Map raw 9 V battery voltage to icon level 0–5."""
     for level, threshold in enumerate(BATTERY_LEVELS_9V):
         if voltage < threshold:
             return level

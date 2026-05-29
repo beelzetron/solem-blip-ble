@@ -7,7 +7,7 @@ COMMIT_COMMAND = bytes.fromhex("3b00")
 
 DEFAULT_MAX_STATION_NUM = 6
 
-# BLE timing aligned with observed BLE behavior (observed controller behavior).
+# BLE timing from observed controller behavior during hardware validation.
 DEFAULT_BLUETOOTH_TIMEOUT = 30.0
 SCAN_DURATION = 10.0
 SCAN_PAUSE = 1.0
@@ -22,6 +22,6 @@ NOTIFY_PARTIAL_RETRY_DELAY = 2.0
 # Per pcman75/solem-blip-reverse-engineering (tested up to 15 days, 0x0f)
 MAX_TURN_OFF_DAYS = 15
 
-# 9 V battery thresholds from observed BLE behavior (documented 9V thresholds)
+# 9 V battery level thresholds (documented in docs/ble_protocol.md).
 BATTERY_LEVELS_9V = (60, 65, 70, 75, 80)
 BATTERY_VOLTAGE_ALERT_9V = 50

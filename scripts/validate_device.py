@@ -30,9 +30,10 @@ except ImportError:  # pragma: no cover - tenacity is a required dependency
     RetryError = Exception  # type: ignore[misc, assignment]
 
 DEFAULT_MAC = "C8:B9:61:D4:4D:C8"
+SPRINKLE_VERIFY_TIMEOUT = 60.0
 BLE_BUSY_HINT = (
     "Hint: stop Home Assistant / observed BLE behavior / other BLE clients using this controller, "
-    "then retry. Upgrade with: pip install -U 'solem-blip-ble>=0.1.7'"
+    "then retry. Upgrade with: pip install -U 'solem-blip-ble>=0.1.8'"
 )
 
 
@@ -160,8 +161,9 @@ async def _run_actions(
         f"sprinkle_station_{station}_for_{minutes}_minutes",
         False,
     )
+    command_status: dict[str, Any] | None = None
     try:
-        await client.sprinkle_station_x_for_y_minutes(station, minutes)
+        command_status = await client.sprinkle_station_x_for_y_minutes(station, minutes)
         step.ok = True
         step.detail = "Command sent"
     except (SolemConnectionError, RetryError) as exc:
@@ -172,12 +174,18 @@ async def _run_actions(
 
     step = StepResult("verify watering status", False)
     try:
-        status = await _wait_for_watering(
-            client,
-            station=station,
-            timeout=20.0,
-            verbose=verbose,
-        )
+        status = command_status
+        if not (
+            status
+            and status.get("is_watering")
+            and status.get("station_num") == station
+        ):
+            status = await _wait_for_watering(
+                client,
+                station=station,
+                timeout=SPRINKLE_VERIFY_TIMEOUT,
+                verbose=verbose,
+            )
         if status is None:
             step.detail = (
                 f"Timed out waiting for station {station} to report watering"

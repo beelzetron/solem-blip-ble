@@ -4,8 +4,17 @@ from solem_blip_ble import protocol
 
 
 def test_pack_sprinkle_station_1_180s():
-    # 310512010000b4 from test_findings_summary
     assert protocol.pack_sprinkle_station(1, 3) == bytes.fromhex("310512010000b4")
+
+
+def test_pack_sprinkle_station_1_60s():
+    assert protocol.pack_sprinkle_station(1, 1) == bytes.fromhex("3105120100003c")
+
+
+def test_is_command_notification():
+    assert protocol.is_command_notification(bytearray.fromhex("3210024200"))
+    assert protocol.is_command_notification(bytearray.fromhex("3210010000"))
+    assert not protocol.is_command_notification(bytearray([0x32, 0x10, 0x05]))
 
 
 def test_pack_stop_manual():

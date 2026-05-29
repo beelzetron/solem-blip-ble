@@ -59,8 +59,10 @@ All commands follow this structure:
 ```
 Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
       ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
-      │ RT │ 10 │SEQ │STAT│    0xaa    │    ??    │    ??    │    ??    │TIME  │    ??    │
-      └────┴────┴────┴────┴────────────┴──────────┴──────────┴──────────┴──────┴──────────┘
+      │ RT │ 10 │SEQ │STAT│    0xaa    │    ??    │    ??    │TIME│ pad│    0000    │
+      └────┴────┴────┴────┴────────────┴──────────┴──────────┴────┴────┴────────────┘
+                                                      ^^^^^^^^
+                                                   bytes 13-14 (BE uint16, seconds)
 ```
 
 ### Field Definitions
@@ -73,7 +75,8 @@ Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
 | 3 | **Status** | Controller state flags (see below) |
 | 4-7 | Station Data | Pattern `0x00aaaaaa` when active, `0x00000000` when idle |
 | 9 | **Station Number** | Active station (1-6), 0 when idle |
-| 13-14 | **Remaining Time** | Big-endian uint16, seconds remaining |
+| 13-14 | **Remaining Time** | Big-endian uint16, seconds remaining (only meaningful when watering) |
+| 14-15 | Padding | Often `0x3c10` during watering; do not use for remaining time |
 | 16-17 | Padding | Always `0x0000` |
 
 ### Status Byte (Byte 3)
@@ -111,8 +114,26 @@ station_num = notification[9]  # 1-6, or 0 if idle
 ### Remaining Time
 ```python
 import struct
-remaining_seconds = struct.unpack(">H", notification[13:15])[0]  # Big-endian
+remaining_seconds = struct.unpack(">H", notification[13:15])[0]  # bytes 13-14, big-endian
 ```
+
+Only parse when the watering flag is set (`status_byte & 0x02`). Ignore values outside a sane range (e.g. 1–14400 seconds).
+
+**Wrong offset:** Reading bytes 14–16 (`notification[14:16]`) picks up padding and reports bogus values (e.g. `0x3c10` → 15376 s).
+
+### HCI validation (MySOLEM app, firmware 5.1.5)
+
+Command: `3105120100003c` (station 1, 60 s) + commit `3b00`
+
+Notification (seq `0x02`):
+
+```
+3210024200aaaaaa00014f0c10003c100000
+                              ^^^^
+                           0x003c = 60 seconds at bytes 13-14
+```
+
+Cross-checked against Android Bluetooth HCI snoop logs and the official MySOLEM app (`BluetoothV5FrameManager` for firmware 5.x).
 
 ---
 
@@ -141,11 +162,10 @@ The remaining time (bytes 13-14, big-endian) decrements as watering progresses. 
 
 ## Known Issues / Open Questions
 
-1. **Spontaneous Notifications:** Unknown if device sends periodic updates
-2. **Time Position:** Fixed at byte 14, but may vary with message length
-3. **Station 2 Test:** Verification pending
-4. **Error Codes:** Unknown status byte values for error conditions
-5. **Battery Level:** Not observed in notifications
+1. **Spontaneous Notifications:** Unknown if device sends periodic status updates without a prior command
+2. **Error Codes:** Unknown status byte values for error conditions
+3. **Battery Level:** Not observed in notifications
+4. **Bytes 10–12:** Purpose not fully mapped; not required for status polling
 
 ---
 
@@ -174,7 +194,7 @@ async def get_status(self) -> dict:
         return {
             "controller_state": "On" if status_byte & 0x40 else "Off",
             "is_watering": bool(status_byte & 0x02),
-            "station_num": data[9] if data[9] in [1, 2, 3, 4] else None,
+            "station_num": data[9] if 1 <= data[9] <= 6 else None,
             "remaining_seconds": struct.unpack(">H", data[13:15])[0],
         }
 ```
@@ -183,22 +203,38 @@ async def get_status(self) -> dict:
 
 ## Test Results Summary
 
-### Test 1: Basic Commands
-- ✅ Turn ON command works (status byte `0x40`)
-- ✅ Station activation works (status byte `0x42`)
-- ✅ STOP command works (status byte `0x40`)
-- ✅ Turn OFF command works (status byte `0x00`)
+### Commands and status
+- ✅ Turn ON (`0x40`), station sprinkle (`0x42`), STOP, turn OFF (`0x00`)
+- ✅ Stations 1–6 on 6-station BL-IP
+- ✅ Remaining time at **bytes 13–14** (HCI + hardware + `scripts/validate_device.py`)
 
-### Test 2: Station 2 Verification
-- ⏳ Pending (need to run test_final_discovery.py)
+### Remaining time
+- ✅ 60 s sprinkle reads `0x003c` at bytes 13–14 (see HCI validation above)
+- ✅ Time decrements during watering
+- ❌ Bytes 14–16 must not be used (padding reads as ~14000+ seconds)
 
-### Test 3: Spontaneous Notifications
-- ⏳ Pending (need to run test_final_discovery.py)
+### Open
+- ⏳ Spontaneous notifications without polling
 
-### Test 4: Time Decrement
-- ✅ Time field at byte 14 confirmed
-- ✅ Time decrements during watering observed
-- ⚠️ Slight timing discrepancy (180s → 142s in 45s, expected ~135s)
+---
+
+## Quick Reference
+
+| Status byte | Controller | Watering |
+|-------------|------------|----------|
+| `0x40` | ON | idle |
+| `0x42` | ON | active |
+| `0x02` | OFF | active (manual) |
+| `0x00` | OFF | idle |
+
+Parse only notifications with `data[2] == 0x02`. Ignore `0x10` in byte 3 (intermediate).
+
+| Action | Command + commit |
+|--------|------------------|
+| Turn ON | `3105a000000000` + `3b00` |
+| Turn OFF | `3105c000000000` + `3b00` |
+| Station X for Y seconds | `3105120X00YYYY` + `3b00` |
+| STOP | `31051500ff0000` + `3b00` |
 
 ---
 
@@ -210,5 +246,5 @@ async def get_status(self) -> dict:
 ---
 
 *Document created: 2026-05-28*  
-*Last updated: 2026-05-28*  
-*Status: Commands per pcman75; status notify protocol validated on hardware (see `solem_blip_ble` implementation).*
+*Last updated: 2026-05-29*  
+*Status: Commands per pcman75; status notify protocol validated on BL-IP hardware and MySOLEM HCI captures (see `solem_blip_ble` implementation).*

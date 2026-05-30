@@ -13,6 +13,7 @@ from typing import Any, TypedDict
 from .const import (
     BATTERY_LEVELS_9V,
     BATTERY_VOLTAGE_ALERT_9V,
+    MAX_REMAINING_SECONDS,
     MAX_STATION_NUM,
     MAX_TURN_OFF_DAYS,
 )
@@ -100,6 +101,67 @@ def parse_battery_9v(data: bytes | bytearray) -> tuple[int | None, int | None, b
     return voltage, level, voltage < BATTERY_VOLTAGE_ALERT_9V
 
 
+def _parse_int3(b0: int, b1: int, b2: int) -> int:
+    """Parse 3-byte duration (matches Solem Android FrameManager.int3Value)."""
+    return ((b0 & 0x0F) << 16) | ((b1 & 0xFF) << 8) | (b2 & 0xFF)
+
+
+def _valid_remaining(seconds: int) -> int | None:
+    if 0 < seconds <= MAX_REMAINING_SECONDS:
+        return seconds
+    return None
+
+
+def parse_remaining_seconds(
+    data: bytes | bytearray, station_num: int | None
+) -> int | None:
+    """Extract remaining sprinkle seconds from a seq=0x02 status notification.
+
+    Stations 1–2 use a 3-byte slot at bytes 12–14 (station 1) or 15–17 (station 2)
+    per BluetoothV5FrameManager.statusAnswerV5. The same 12–14 slot also carries the
+    active duration for higher stations on many controllers. Fall back to the legacy
+    2-byte field at bytes 13–14 validated on station 1 HCI captures.
+    """
+    if station_num is None or len(data) < 15:
+        return None
+
+    candidates: list[int] = []
+
+    if len(data) >= 15:
+        candidates.append(_parse_int3(data[12], data[13], data[14]))
+
+    if station_num == 2 and len(data) >= 18:
+        candidates.append(_parse_int3(data[15], data[16], data[17]))
+
+    if len(data) >= 15:
+        candidates.append(struct.unpack(">H", data[13:15])[0])
+
+    for seconds in candidates:
+        if remaining := _valid_remaining(seconds):
+            return remaining
+    return None
+
+
+def parse_intermediate_remaining(
+    data: bytes | bytearray,
+    station_num: int,
+    *,
+    max_station_num: int = MAX_STATION_NUM,
+) -> int | None:
+    """Parse remaining seconds from a seq=0x01 notification (stations 3+).
+
+    Matches BluetoothV5FrameManager.statusAnswerV5 when bArr[2] == 1.
+    """
+    if len(data) < 12 or data[2] != 0x01 or not (3 <= station_num <= max_station_num):
+        return None
+    offset = (station_num - 3) * 3 + 3
+    if offset + 2 >= len(data):
+        return None
+    return _valid_remaining(
+        _parse_int3(data[offset], data[offset + 1], data[offset + 2])
+    )
+
+
 def parse_status_notification(
     data: bytes | bytearray,
     *,
@@ -116,9 +178,7 @@ def parse_status_notification(
 
     remaining_seconds = None
     if is_watering:
-        seconds = struct.unpack(">H", data[13:15])[0]
-        if 0 < seconds <= 240 * 60:
-            remaining_seconds = seconds
+        remaining_seconds = parse_remaining_seconds(data, station_num)
 
     battery_voltage, battery_level, battery_low = parse_battery_9v(data)
 

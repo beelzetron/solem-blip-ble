@@ -336,17 +336,42 @@ class SolemClient:
             parsed = protocol.parse_status_notification(
                 data, max_station_num=self.max_station_num
             )
-            if parsed is None:
+            if parsed is not None:
+                status_result.update(parsed)
+                if include_raw:
+                    status_result["raw_notification_hex"] = bytes(data).hex()
+                _LOGGER.debug(
+                    "%s - Status notification (seq=2): %s",
+                    self.mac_address,
+                    status_result,
+                )
+                status_event.set()
                 return
-            status_result.update(parsed)
-            if include_raw:
-                status_result["raw_notification_hex"] = bytes(data).hex()
-            _LOGGER.debug(
-                "%s - Status notification (seq=2): %s",
-                self.mac_address,
-                status_result,
-            )
-            status_event.set()
+
+            station_num = status_result.get("station_num")
+            if (
+                len(data) >= 3
+                and data[2] == 0x01
+                and status_result.get("is_watering")
+                and station_num is not None
+                and status_result.get("remaining_seconds") is None
+                and (
+                    remaining := protocol.parse_intermediate_remaining(
+                        data,
+                        station_num,
+                        max_station_num=self.max_station_num,
+                    )
+                )
+                is not None
+            ):
+                status_result["remaining_seconds"] = remaining
+                _LOGGER.debug(
+                    "%s - Remaining time from seq=1 notification: %ss (station %s)",
+                    self.mac_address,
+                    remaining,
+                    station_num,
+                )
+                status_event.set()
 
         async def _op(client: BleakClient) -> dict[str, Any]:
             await self._start_notify(client, notification_handler)
@@ -364,6 +389,13 @@ class SolemClient:
                     ) from exc
                 if not status_result:
                     raise SolemConnectionError("Empty status notification")
+                # Device sends seq 0x02 then 0x01; wait briefly for intermediate frame.
+                if (
+                    status_result.get("is_watering")
+                    and status_result.get("remaining_seconds") is None
+                    and (status_result.get("station_num") or 0) >= 3
+                ):
+                    await asyncio.sleep(NOTIFY_SETTLE_DELAY)
                 return status_result
             finally:
                 try:

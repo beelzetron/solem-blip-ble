@@ -115,7 +115,10 @@ station_num = notification[9]  # 1-6, or 0 if idle
 ### Remaining Time
 ```python
 import struct
-remaining_seconds = struct.unpack(">H", notification[13:15])[0]  # bytes 13-14, big-endian
+# Prefer 3-byte duration at bytes 12-14 (3-byte big-endian duration, first byte & 0x0F).
+# Station 2 may use bytes 15-17. Stations 3+ may also publish remaining in seq=0x01
+# notifications at offset (station - 3) * 3 + 3.
+remaining_seconds = parse_remaining_seconds(notification, station_num)
 ```
 
 Only parse when the watering flag is set (`status_byte & 0x02`). Ignore values outside a sane range (e.g. 1–14400 seconds).

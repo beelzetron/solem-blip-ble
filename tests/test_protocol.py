@@ -94,13 +94,51 @@ def test_parse_ignores_wrong_sequence():
 
 
 def test_parse_remaining_ignores_padding_at_14_16():
-    # Real HCI capture: rem=60 at bytes 13-14; bytes 14-16 would read 0x3c10 (wrong)
+    # Real HCI capture: rem=60 at bytes 12-14 (int3) and 13-14 (uint16); byte 15+ is padding
     data = bytearray.fromhex("3210024200aaaaaa00014f0c10003c100000")
     parsed = protocol.parse_status_notification(data)
     assert parsed is not None
     assert parsed["is_watering"] is True
     assert parsed["station_num"] == 1
     assert parsed["remaining_seconds"] == 60
+
+
+def test_parse_remaining_station_2_slot():
+    data = bytearray(18)
+    data[2] = 0x02
+    data[3] = 0x42
+    data[9] = 2
+    data[15] = 0x00
+    data[16] = 0x00
+    data[17] = 0xB4  # 180 seconds in station-2 slot (bytes 15-17)
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["station_num"] == 2
+    assert parsed["remaining_seconds"] == 180
+
+
+def test_parse_remaining_station_5_int3_at_12_14():
+    # Same layout as station 1 HCI capture but active station 5
+    data = bytearray.fromhex("3210024200aaaaaa00054f0c10003c100000")
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["station_num"] == 5
+    assert parsed["remaining_seconds"] == 60
+
+
+def test_parse_intermediate_remaining_station_5():
+    data = bytearray(18)
+    data[2] = 0x01
+    data[9] = 0x00
+    data[10] = 0x01
+    data[11] = 0x2C  # 300 seconds at offset (5 - 3) * 3 + 3
+    assert protocol.parse_intermediate_remaining(data, 5) == 300
+
+
+def test_parse_intermediate_remaining_ignores_seq_2():
+    data = bytearray(18)
+    data[2] = 0x02
+    assert protocol.parse_intermediate_remaining(data, 5) is None
 
 
 def test_pack_get_firmware_version():

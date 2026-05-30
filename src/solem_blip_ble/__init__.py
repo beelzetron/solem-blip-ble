@@ -17,6 +17,8 @@ from .protocol import (
     pack_turn_on,
     parse_battery_9v,
     parse_firmware_version_response,
+    parse_intermediate_remaining,
+    parse_remaining_seconds,
     parse_status_notification,
 )
 
@@ -42,5 +44,7 @@ __all__ = [
     "pack_turn_on",
     "parse_battery_9v",
     "parse_firmware_version_response",
+    "parse_intermediate_remaining",
+    "parse_remaining_seconds",
     "parse_status_notification",
 ]

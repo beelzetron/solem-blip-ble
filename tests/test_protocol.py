@@ -101,3 +101,96 @@ def test_parse_remaining_ignores_padding_at_14_16():
     assert parsed["is_watering"] is True
     assert parsed["station_num"] == 1
     assert parsed["remaining_seconds"] == 60
+
+
+def test_pack_get_firmware_version():
+    """Test firmware version query command packing."""
+    assert protocol.pack_get_firmware_version() == bytes.fromhex("010000")
+
+
+def test_parse_firmware_version_response_valid():
+    """Parse identification response with firmware version 5.0.
+
+    Based on the V5 identification response layout:
+    - Byte 0: Command (0x01)
+    - Byte 12: Firmware major version
+    - Byte 13: Firmware minor version
+    """
+    # Simulated response: MAC + HW info + firmware v5.0
+    data = bytearray(16)
+    data[0] = 0x01  # CMD_ID
+    data[1] = 0x00  # Subcommand
+    data[2] = 0x00  # Response type (identification)
+    # Bytes 3-8: MAC address (placeholder)
+    data[3] = 0x10
+    data[4] = 0x8B
+    data[5] = 0x00
+    data[6] = 0x01
+    data[7] = 0xE0
+    data[8] = 0x00
+    # Bytes 9-11: Hardware info
+    data[9] = 0x09
+    data[10] = 0xD0
+    data[11] = 0x46
+    # Bytes 12-13: Firmware version (5.0)
+    data[12] = 0x05
+    data[13] = 0x00
+    # Bytes 14-15: Serial number
+    data[14] = 0xE8
+    data[15] = 0x0B
+
+    result = protocol.parse_firmware_version_response(data)
+    assert result is not None
+    assert result["major"] == 5
+    assert result["minor"] == 0
+    assert result["raw_hex"] == "5.0"
+
+
+def test_parse_firmware_version_response_v6():
+    """Test parsing firmware version 6.x."""
+    data = bytearray(16)
+    data[0] = 0x01
+    data[1] = 0x00
+    data[2] = 0x00
+    data[12] = 0x06
+    data[13] = 0x12  # v6.12
+
+    result = protocol.parse_firmware_version_response(data)
+    assert result is not None
+    assert result["major"] == 6
+    assert result["minor"] == 18
+    assert result["raw_hex"] == "6.18"
+
+
+def test_parse_firmware_version_invalid_command():
+    """Reject responses with wrong command code."""
+    data = bytearray(16)
+    data[0] = 0x3B  # Not CMD_ID
+    data[1] = 0x00
+    data[2] = 0x00
+    data[12] = 0x05
+    data[13] = 0x00
+
+    assert protocol.parse_firmware_version_response(data) is None
+
+
+def test_parse_firmware_version_invalid_subtype():
+    """Reject responses with non-identification subcommand."""
+    data = bytearray(16)
+    data[0] = 0x01
+    data[1] = 0x00
+    data[2] = 0x01  # Not identification (should be 0x00)
+    data[12] = 0x05
+    data[13] = 0x00
+
+    assert protocol.parse_firmware_version_response(data) is None
+
+
+def test_parse_firmware_version_too_short():
+    """Reject responses shorter than 16 bytes."""
+    data = bytearray(10)
+    data[0] = 0x01
+    data[1] = 0x00
+    data[2] = 0x00
+
+    assert protocol.parse_firmware_version_response(data) is None

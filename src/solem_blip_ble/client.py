@@ -36,7 +36,7 @@ from tenacity import (
 from .const import (
     COMMIT_COMMAND,
     DEFAULT_BLUETOOTH_TIMEOUT,
-    DEFAULT_MAX_STATION_NUM,
+    MAX_STATION_NUM,
     NOTIFY_CHAR_UUID,
     NOTIFY_PARTIAL_RETRY_DELAY,
     NOTIFY_SETTLE_DELAY,
@@ -66,7 +66,7 @@ class SolemClient:
         bluetooth_timeout: float = DEFAULT_BLUETOOTH_TIMEOUT,
         *,
         mock: bool = False,
-        max_station_num: int = DEFAULT_MAX_STATION_NUM,
+        max_station_num: int = MAX_STATION_NUM,
         ble_device: BLEDevice | None = None,
         ble_device_resolver: Callable[[], BLEDevice | None] | None = None,
     ) -> None:

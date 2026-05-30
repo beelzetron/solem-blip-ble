@@ -5,7 +5,9 @@ NOTIFY_CHAR_UUID = "108b0003-eab5-bc09-d0ea-0b8f467ce8ee"
 
 COMMIT_COMMAND = bytes.fromhex("3b00")
 
-DEFAULT_MAX_STATION_NUM = 6
+# BL-IP supports up to 8 stations (4- and 6-station models validated; 8 is the spec max).
+MAX_STATION_NUM = 8
+DEFAULT_MAX_STATION_NUM = MAX_STATION_NUM
 
 # BLE timing from observed controller behavior during hardware validation.
 DEFAULT_BLUETOOTH_TIMEOUT = 30.0

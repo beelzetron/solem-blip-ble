@@ -10,7 +10,12 @@ from __future__ import annotations
 import struct
 from typing import Any, TypedDict
 
-from .const import BATTERY_LEVELS_9V, BATTERY_VOLTAGE_ALERT_9V, MAX_TURN_OFF_DAYS
+from .const import (
+    BATTERY_LEVELS_9V,
+    BATTERY_VOLTAGE_ALERT_9V,
+    MAX_STATION_NUM,
+    MAX_TURN_OFF_DAYS,
+)
 
 
 class SolemStatus(TypedDict):
@@ -57,7 +62,7 @@ def _pack_v5_duration_command(opcode: int, station: int, seconds: int) -> bytes:
 
 
 def pack_sprinkle_station(station: int, minutes: int) -> bytes:
-    station = max(1, min(station, 16))
+    station = max(1, min(station, MAX_STATION_NUM))
     seconds = max(1, min(minutes, 240)) * 60
     return _pack_v5_duration_command(0x12, station, seconds)
 
@@ -98,7 +103,7 @@ def parse_battery_9v(data: bytes | bytearray) -> tuple[int | None, int | None, b
 def parse_status_notification(
     data: bytes | bytearray,
     *,
-    max_station_num: int = 6,
+    max_station_num: int = MAX_STATION_NUM,
 ) -> SolemStatus | None:
     """Parse seq=0x02 status notification; return None if not a status frame."""
     if len(data) < 18 or data[2] != 0x02 or data[3] == 0x10:
@@ -142,4 +147,45 @@ def mock_status() -> dict[str, Any]:
         "battery_voltage": None,
         "battery_level": None,
         "battery_low": False,
+    }
+
+
+class FirmwareVersion(TypedDict):
+    major: int
+    minor: int
+    raw_hex: str
+
+
+def pack_get_firmware_version() -> bytes:
+    """Pack identification command to query firmware version (CMD_ID=0x01)."""
+    return struct.pack(">BBB", 0x01, 0x00, 0x00)
+
+
+def parse_firmware_version_response(data: bytes | bytearray) -> FirmwareVersion | None:
+    """Parse identification response (CMD_ID=0x01) to extract firmware version.
+
+    Response format:
+    - Byte 0: Command code (0x01)
+    - Byte 1: Subcommand (0x00)
+    - Byte 2: Response type (0x00 = identification data)
+    - Bytes 3-8: MAC address
+    - Byte 9-10: Hardware revision
+    - Byte 11: Hardware type code
+    - Byte 12: Firmware major version
+    - Byte 13: Firmware minor version
+    - Bytes 14-15: Serial number components
+
+    Returns dict with major, minor, and raw_hex version string, or None if invalid.
+    """
+    if len(data) < 16 or data[0] != 0x01 or data[2] != 0x00:
+        return None
+
+    major = data[12]
+    minor = data[13]
+    raw_hex = f"{major}.{minor}"
+
+    return {
+        "major": major,
+        "minor": minor,
+        "raw_hex": raw_hex,
     }

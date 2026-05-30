@@ -22,8 +22,8 @@ def test_pack_stop_manual():
 
 
 def test_pack_turn_on():
-    # Matches validated controller api.py struct pack
-    assert protocol.pack_turn_on() == bytes.fromhex("3105a000010000")
+    # V5 manual-on command with no station-specific parameter.
+    assert protocol.pack_turn_on() == bytes.fromhex("3105a000000000")
 
 
 def test_pack_turn_off():

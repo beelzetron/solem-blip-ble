@@ -34,7 +34,7 @@ def pack_commit() -> bytes:
 
 
 def pack_turn_on() -> bytes:
-    return struct.pack(">HBBBH", 0x3105, 0xA0, 0x00, 0x01, 0x0000)
+    return struct.pack(">HBBBH", 0x3105, 0xA0, 0x00, 0x00, 0x0000)
 
 
 def pack_turn_off_permanent() -> bytes:
@@ -117,10 +117,10 @@ def parse_remaining_seconds(
 ) -> int | None:
     """Extract remaining sprinkle seconds from a seq=0x02 status notification.
 
-    Stations 1–2 use a 3-byte slot at bytes 12–14 (station 1) or 15–17 (station 2)
-    The same 12–14 slot also carries the
-    active duration for higher stations on many controllers. Fall back to the legacy
-    2-byte field at bytes 13–14 validated on station 1 HCI captures.
+    Stations 1–2 use a 3-byte slot at bytes 12–14 (station 1) or 15–17
+    (station 2). The same 12–14 slot also carries the active duration for higher
+    stations on many controllers. Fall back to the legacy 2-byte field at bytes
+    13–14 validated on station 1 HCI captures.
     """
     if station_num is None or len(data) < 15:
         return None

@@ -22,8 +22,8 @@ def test_pack_stop_manual():
 
 
 def test_pack_turn_on():
-    # Matches validated controller api.py struct pack
-    assert protocol.pack_turn_on() == bytes.fromhex("3105a000010000")
+    # V5 manual-on command with no station-specific parameter.
+    assert protocol.pack_turn_on() == bytes.fromhex("3105a000000000")
 
 
 def test_pack_turn_off():
@@ -149,7 +149,7 @@ def test_pack_get_firmware_version():
 def test_parse_firmware_version_response_valid():
     """Parse identification response with firmware version 5.0.
 
-    Based on decompiled APK BluetoothV5FrameManager.java:1280:
+    Based on the V5 identification response layout:
     - Byte 0: Command (0x01)
     - Byte 12: Firmware major version
     - Byte 13: Firmware minor version

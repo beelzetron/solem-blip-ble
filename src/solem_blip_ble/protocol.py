@@ -34,7 +34,7 @@ def pack_commit() -> bytes:
 
 
 def pack_turn_on() -> bytes:
-    return struct.pack(">HBBBH", 0x3105, 0xA0, 0x00, 0x01, 0x0000)
+    return struct.pack(">HBBBH", 0x3105, 0xA0, 0x00, 0x00, 0x0000)
 
 
 def pack_turn_off_permanent() -> bytes:
@@ -102,7 +102,7 @@ def parse_battery_9v(data: bytes | bytearray) -> tuple[int | None, int | None, b
 
 
 def _parse_int3(b0: int, b1: int, b2: int) -> int:
-    """Parse 3-byte duration (matches Solem Android FrameManager.int3Value)."""
+    """Parse a 3-byte big-endian duration."""
     return ((b0 & 0x0F) << 16) | ((b1 & 0xFF) << 8) | (b2 & 0xFF)
 
 
@@ -117,10 +117,10 @@ def parse_remaining_seconds(
 ) -> int | None:
     """Extract remaining sprinkle seconds from a seq=0x02 status notification.
 
-    Stations 1–2 use a 3-byte slot at bytes 12–14 (station 1) or 15–17 (station 2)
-    per BluetoothV5FrameManager.statusAnswerV5. The same 12–14 slot also carries the
-    active duration for higher stations on many controllers. Fall back to the legacy
-    2-byte field at bytes 13–14 validated on station 1 HCI captures.
+    Stations 1–2 use a 3-byte slot at bytes 12–14 (station 1) or 15–17
+    (station 2). The same 12–14 slot also carries the active duration for higher
+    stations on many controllers. Fall back to the legacy 2-byte field at bytes
+    13–14 validated on station 1 HCI captures.
     """
     if station_num is None or len(data) < 15:
         return None
@@ -150,7 +150,7 @@ def parse_intermediate_remaining(
 ) -> int | None:
     """Parse remaining seconds from a seq=0x01 notification (stations 3+).
 
-    Matches BluetoothV5FrameManager.statusAnswerV5 when bArr[2] == 1.
+    Seq=0x01 carries remaining-time slots for stations 3 and higher.
     """
     if len(data) < 12 or data[2] != 0x01 or not (3 <= station_num <= max_station_num):
         return None
@@ -224,7 +224,7 @@ def pack_get_firmware_version() -> bytes:
 def parse_firmware_version_response(data: bytes | bytearray) -> FirmwareVersion | None:
     """Parse identification response (CMD_ID=0x01) to extract firmware version.
 
-    Response format (from decompiled APK BluetoothV5FrameManager.java:1280):
+    Response format:
     - Byte 0: Command code (0x01)
     - Byte 1: Subcommand (0x00)
     - Byte 2: Response type (0x00 = identification data)

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document captures the discovered BLE protocol for the Solem BL-IP irrigation controller based on reverse engineering and live testing.
+This document captures the discovered BLE protocol for the Solem BL-IP irrigation controller based on protocol analysis and live hardware testing.
 
 **Device:** Solem BL-IP (4- and 6-station models tested)  
 **Controller Software Version:** 5.1.5  
@@ -83,6 +83,279 @@ at bytes 12-14 as major, minor, and patch components.
 
 ---
 
+## V5 Irrigation Schedule / Config Frames
+
+The BL-IP V5 controller has a second BLE protocol family for persisted schedule
+configuration. This is distinct from the simple manual-control `3105 ...` frames
+documented above.
+
+At a high level, the persisted on-device schedule is:
+
+- 3 irrigation programs: `A`, `B`, `C`
+- up to 8 start times per program
+- up to 12 station durations per program
+- one cycle mode per program
+- one water budget per program
+- one inter-station delay per program
+- controller-level `programmationType`
+- controller-level `calendarDayOffDay` / `calendarDayOffMonth`
+
+### Read Requests
+
+These V5 config read requests retrieve schedule data:
+
+| Request | Meaning |
+|---------|---------|
+| `39 00` | Read controller irrigation characteristics |
+| `35 00` | Read irrigation program configuration blocks |
+
+`39 00` reads controller-level irrigation characteristics. `35 00` reads
+per-program irrigation configuration blocks.
+
+### Controller Characteristics Write (`0x3f` / `0x10`)
+
+The V5 writer emits two controller-level frames before or alongside per-program
+writes.
+
+#### Frame 1: `0x3f 0x11 0x00 0x02 ...`
+
+19 bytes total:
+
+| Byte | Meaning |
+|------|---------|
+| 0 | `0x3f` |
+| 1 | `0x11` |
+| 2 | `0x00` |
+| 3 | `0x02` |
+| 4 | `programmationType` (`0 = EU`, `1 = US`) |
+| 5-18 | Monthly water budgets 0-6, 7 values as big-endian uint16 |
+
+If monthly water budgets are disabled, each monthly slot is written as
+`0x0064` (`100`).
+
+#### Frame 2: `0x3f 0x10 0x01 ...`
+
+18 bytes total:
+
+| Byte | Meaning |
+|------|---------|
+| 0 | `0x3f` |
+| 1 | `0x10` |
+| 2 | `0x01` |
+| 3-12 | Monthly water budgets 7-11, 5 values as big-endian uint16 |
+| 13 | Station flags for outputs 1-4 |
+| 14 | Station flags for outputs 5-8 |
+| 15 | Station flags for outputs 9-12 |
+| 16 | `calendarDayOffDay` |
+| 17 | `calendarDayOffMonth` |
+
+Each station flag byte packs 4 outputs in 2 bits each:
+
+- bit `7 - 2*n`: use master valve
+- bit `6 - 2*n`: use sensor
+
+for station slot `n` inside that byte.
+
+On readback, `calendarDayOffDay` and `calendarDayOffMonth` are treated as
+unset when the raw byte is `0`.
+
+### Per-Program Write Frames (`0x2f`, `0x37`)
+
+For irrigation program index `i` (`0`, `1`, `2`), the writer uses a tag byte:
+
+```text
+tag = 0x10 | i
+```
+
+Examples:
+
+- program A (`i = 0`) -> tag `0x10`
+- program B (`i = 1`) -> tag `0x11`
+- program C (`i = 2`) -> tag `0x12`
+
+#### Program Name Frames (`0x2f 0x12`)
+
+Two 20-byte frames:
+
+| Byte | Meaning |
+|------|---------|
+| 0 | `0x2f` |
+| 1 | `0x12` |
+| 2 | fragment index: `0x00` or `0x01` |
+| 3 | program tag (`0x10 | i`) |
+| 4-19 | UTF-8 name payload |
+
+Program names are written as at most 31 bytes of UTF-8 data:
+
+- fragment `0x00`: first 16 bytes
+- fragment `0x01`: remaining 15 bytes plus trailing zero padding
+
+#### Program Header Frame (`0x37 0x0e 0x00`)
+
+16 bytes total:
+
+| Byte | Meaning |
+|------|---------|
+| 0 | `0x37` |
+| 1 | `0x0e` |
+| 2 | `0x00` |
+| 3 | program tag (`0x10 | i`) |
+| 4-5 | `timeInterStation`, big-endian uint16 |
+| 6-7 | `waterBudget`, big-endian uint16 |
+| 8 | `cycle` |
+| 9 | `weekDays` |
+| 10 | `periodLength` |
+| 11 | `synchroDay` |
+| 12 | current day-of-month |
+| 13 | current month (`1-12`) |
+| 14-15 | current year, big-endian uint16 |
+
+Notes:
+
+- `cycle` values are defined as:
+  - `0`: custom weekdays
+  - `1`: even days
+  - `2`: odd days
+  - `3`: odd days except 31
+  - `4`: periodic every `periodLength` days
+- In V5 irrigation program frames, `weekDays` uses a weekday bitmask
+  (`Mon` bit `0` through `Sun` bit `6`). Older V3 frames use a different
+  on-wire encoding (see Weekday Mask Conversion Reference below).
+
+#### Start Times Frame (`0x37 0x12 0x01`)
+
+20 bytes total:
+
+| Byte | Meaning |
+|------|---------|
+| 0 | `0x37` |
+| 1 | `0x12` |
+| 2 | `0x01` |
+| 3 | program tag (`0x10 | i`) |
+| 4-19 | 8 start times, each big-endian uint16 minutes since midnight |
+
+Encoding rules:
+
+- valid range: `0..1440`
+- invalid or disabled start time is written as `1440`
+- on readback, any decoded value `>= 1440` is treated as `-1` / disabled
+
+#### Station Durations Frames
+
+Station durations are stored as 3-byte big-endian integers, in seconds.
+
+Frame layout:
+
+| Frame | Bytes | Stations |
+|-------|-------|----------|
+| `0x37 0x11 0x02` | 19 bytes | stations 1-5 |
+| `0x37 0x11 0x03` | 19 bytes | stations 6-10 |
+| `0x37 0x08 0x04` | 10 bytes | stations 11-12 |
+
+Shared structure:
+
+| Byte | Meaning |
+|------|---------|
+| 0 | `0x37` |
+| 1 | frame subtype (`0x11` or `0x08`) |
+| 2 | chunk index (`0x02`, `0x03`, `0x04`) |
+| 3 | program tag (`0x10 | i`) |
+| 4.. | packed durations, 3 bytes per station |
+
+Packing:
+
+- chunk `0x02`: station indexes `0..4`
+- chunk `0x03`: station indexes `5..9`
+- chunk `0x04`: station indexes `10..11`
+
+Write behavior:
+
+- zero duration is written as `00 00 00`
+- positive duration is written as:
+  - high byte: `(seconds >> 16) & 0xff`
+  - mid byte: `(seconds >> 8) & 0xff`
+  - low byte: `seconds & 0xff`
+
+### V5 Readback Frame Map
+
+The V5 reader decodes schedule/config notifications with this structure:
+
+- `byte 3 low nibble`: program index
+- `byte 3 high nibble`: program class
+  - `0x1`: irrigation
+  - `0x2`: lighting
+  - `0x3`: misting
+- `byte 2`: descending fragment id inside the current program block
+
+The reader captures the first fragment id seen for a program, then computes:
+
+```text
+logical_chunk = first_fragment_id - current_fragment_id
+```
+
+For irrigation programs (`high nibble == 0x1`), the logical chunks are:
+
+| Logical Chunk | Meaning | Parsed Fields |
+|---------------|---------|---------------|
+| `0` | program name, part 1 | bytes `4-19`, stop at first NUL |
+| `1` | program name, part 2 | bytes `4-19`, stop at first NUL |
+| `2` | program header | `timeInterStation`, `waterBudget`, `cycle`, `weekDays`, `periodLength` |
+| `3` | start times | 8 x big-endian uint16 from bytes `4-19` |
+| `4` | station durations 1-5 | 5 x 3-byte int from bytes `4-18` |
+| `5` | station durations 6-10 | 5 x 3-byte int from bytes `4-18` |
+| `6` | station durations 11-12 | 2 x 3-byte int from bytes `4-9` |
+
+Readback details:
+
+- chunk `2` reads:
+  - bytes `4-5`: `timeInterStation`
+  - bytes `6-7`: `waterBudget`
+  - byte `8`: `cycle`
+  - byte `9`: `weekDays`
+  - byte `10`: `periodLength`
+- chunk `3` reads all 8 start times from bytes `4-19`
+- chunks `4-6` decode durations as 3-byte big-endian integers
+- a start time `>= 1440` becomes disabled (`-1`)
+
+Notably, the V5 reader does not currently restore `synchroDay` from program
+config readback; it only restores `periodLength`. The writer still sends
+`synchroDay` in the header frame.
+
+### Station Name / Program Mapping Compatibility Path
+
+An older compact configuration format also emits:
+
+- three program start-time blocks
+- one station mapping block per output
+
+That compact path uses one station frame with:
+
+- output name
+- selected program index for that station
+- station duration in minutes
+
+This is useful as a cross-check for the logical data model, but the richer V5
+program writer frames documented above are the authoritative schedule/config
+path for BL-IP V5 implementation work.
+
+### Weekday Mask Conversion Reference
+
+V3 and compatibility frames encode weekdays with a different on-wire bitmask.
+The V5 weekday mask (`Mon=bit0 ... Sun=bit6`) converts to this form with:
+
+- Monday -> `0x80`
+- Tuesday -> `0x40`
+- Wednesday -> `0x20`
+- Thursday -> `0x10`
+- Friday -> `0x08`
+- Saturday -> `0x04`
+- Sunday -> `0x02`
+
+The older V3 and compatibility paths use this conversion. V5 irrigation program
+frames write the weekday mask directly in the program header frame.
+
+---
+
 ## Notification Protocol
 
 ### Notification Format (18 bytes)
@@ -146,7 +419,7 @@ station_num = notification[9]  # 1-6, or 0 if idle
 ### Remaining Time
 ```python
 import struct
-# Prefer 3-byte duration at bytes 12-14 (3-byte big-endian duration, first byte & 0x0F).
+# Prefer 3-byte big-endian duration at bytes 12-14 (mask first byte with 0x0F).
 # Station 2 may use bytes 15-17. Stations 3+ may also publish remaining in seq=0x01
 # notifications at offset (station - 3) * 3 + 3.
 remaining_seconds = parse_remaining_seconds(notification, station_num)
@@ -183,7 +456,7 @@ Notification (seq `0x02`):
                            0x003c = 60 seconds at bytes 13-14
 ```
 
-Validated via Android Bluetooth HCI snoop capture on BL-IP firmware 5.1.5.
+Validated via Bluetooth HCI snoop capture on BL-IP firmware 5.1.5.
 
 ---
 
@@ -293,11 +566,11 @@ Parse only notifications with `data[2] == 0x02`. Ignore `0x10` in byte 3 (interm
 
 ## References
 
-- **pcman75 Reverse Engineering Repo:** https://github.com/pcman75/solem-blip-reverse-engineering
+- **pcman75 Protocol Reference:** https://github.com/pcman75/solem-blip-reverse-engineering
 - **Solem Product Page:** https://www.solem.fr/en/residential-watering/9-bl-ip.html
 
 ---
 
 *Document created: 2026-05-28*  
 *Last updated: 2026-05-29*  
-*Status: Commands per pcman75; status notify protocol validated on BL-IP hardware and HCI capture (see `solem_blip_ble` implementation).*
+*Status: Commands validated against pcman75 reference; status notify protocol validated on BL-IP hardware and HCI capture (see `solem_blip_ble` implementation).*

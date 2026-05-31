@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import Any, TypeVar
 
 from bleak import BleakClient, BleakScanner
@@ -617,6 +618,18 @@ class SolemClient:
             return await self._run_with_client(_op)
 
         return await _attempt()
+
+    async def set_time(self, when: datetime | None = None) -> None:
+        """Push local date/time to the device RTC (write-only, no commit)."""
+        if self.mock:
+            return
+
+        payload = protocol.pack_set_time(when)
+
+        async def _op(client: BleakClient) -> None:
+            await self._write(client, payload)
+
+        await self._run_with_client(_op)
 
     async def turn_on(self) -> None:
         if self.mock:

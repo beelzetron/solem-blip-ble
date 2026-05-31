@@ -47,7 +47,7 @@ Full BLE protocol notes: [docs/ble_protocol.md](docs/ble_protocol.md)
 
 ## Home Assistant
 
-Used by the [Solem BL-IP](https://github.com/beelzetron/Home-Assistant-Solem-Bluetooth-Watering-Controller) Home Assistant integration.
+Used by the [Solem BL-IP for Home Assistant](https://github.com/beelzetron/solem-blip-ha) integration ([HACS](https://github.com/beelzetron/solem-blip-ha#installation)).
 
 ## Credits
 

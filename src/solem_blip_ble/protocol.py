@@ -8,6 +8,7 @@ live BL-IP testing documented in docs/ble_protocol.md in this repository.
 from __future__ import annotations
 
 import struct
+from datetime import datetime
 from typing import Any, TypedDict
 
 from .const import (
@@ -256,6 +257,28 @@ def parse_station_name_fragment(
 def pack_get_firmware_version() -> bytes:
     """Pack the V5 identification command used to query firmware version."""
     return bytes([0x0F, 0x00])
+
+
+def pack_set_time(when: datetime | None = None) -> bytes:
+    """Pack the V5 set-time command.
+
+    Frame: ``03 06 00 YY MM DD hh mm ss`` where ``YY`` is year minus 1900 and
+    month is ``1-12``. Does **not** use the ``3b00`` commit suffix.
+    """
+    moment = when or datetime.now().astimezone()
+    return bytes(
+        [
+            0x03,
+            0x06,
+            0x00,
+            (moment.year - 1900) & 0xFF,
+            moment.month & 0xFF,
+            moment.day & 0xFF,
+            moment.hour & 0xFF,
+            moment.minute & 0xFF,
+            moment.second & 0xFF,
+        ]
+    )
 
 
 def parse_firmware_version_response(data: bytes | bytearray) -> FirmwareVersion | None:

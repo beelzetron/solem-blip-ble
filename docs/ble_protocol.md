@@ -62,13 +62,15 @@ a separate request and does not require the `3b00` commit:
 The controller replies with two notifications per output:
 
 ```
-35 12 01 NN [first 16 UTF-8 bytes]
-35 12 00 NN [last  16 UTF-8 bytes]
+36 12 SS NN [up to 16 UTF-8 bytes]
 ```
 
-`NN` is the zero-based output index (`00` for station 1). Concatenate the
-payloads at bytes 4-19 in sequence order `01`, then `00`, and stop each fragment
-at its first NUL byte. Names are at most 32 bytes.
+On hardware the response type is `0x36` (response to the `0x35` read). Byte 1 is
+always `0x12`. `SS` is a sequence counter whose least significant bit identifies
+the fragment (`SS & 1 == 1` first, `SS & 1 == 0` last). `NN` is the zero-based
+output index (`00` for station 1). Concatenate the payloads at bytes 4-19 in
+fragment order, then stop each fragment at its first NUL byte. Names are at most
+32 bytes.
 
 ### Read Firmware Version
 
@@ -78,8 +80,15 @@ Firmware metadata is returned by the V5 identification command:
 0f 00
 ```
 
-The identification notification with subtype `01` reports the firmware version
-at bytes 12-14 as major, minor, and patch components.
+The controller sends a wrapped identification notification:
+
+```
+10 0f 01 [MAC 6 bytes] [HW info] [major] [minor] [patch] ...
+```
+
+The subtype at byte 2 is `0x01`. Firmware major, minor, and patch are at bytes
+12-14 regardless of the leading `0x10` wrapper byte. A second notification may
+follow with the controller display name.
 
 ---
 
@@ -102,15 +111,16 @@ At a high level, the persisted on-device schedule is:
 
 ### Read Requests
 
-These V5 config read requests retrieve schedule data:
+These V5 read requests retrieve controller config and output metadata:
 
 | Request | Meaning |
 |---------|---------|
 | `39 00` | Read controller irrigation characteristics |
-| `35 00` | Read irrigation program configuration blocks |
+| `35 00` | Read station/output names |
 
-`39 00` reads controller-level irrigation characteristics. `35 00` reads
-per-program irrigation configuration blocks.
+`39 00` reads controller-level irrigation characteristics and persisted
+irrigation program blocks. `35 00` reads station/output names as documented in
+the command protocol section above.
 
 ### Controller Characteristics Write (`0x3f` / `0x10`)
 

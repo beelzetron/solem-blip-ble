@@ -233,16 +233,22 @@ def parse_station_name_fragment(
 ) -> StationNameFragment | None:
     """Parse one V5 output-name response fragment.
 
-    Names are returned as two notifications with sequence 1 then 0. Each
-    notification contains up to 16 UTF-8 bytes at offsets 4-19.
+    Names are returned as two notifications per output. Each notification
+    contains up to 16 UTF-8 bytes at offsets 4-19. Hardware uses response
+    type 0x36 (0x35 in synthetic fixtures) with byte 1 = 0x12; the fragment
+    index is the least significant bit of byte 2.
     """
-    if len(data) < 4 or data[0] != 0x35 or data[2] not in (0x00, 0x01):
+    if (
+        len(data) < 20
+        or data[0] not in (0x35, 0x36)
+        or data[1] != 0x12
+    ):
         return None
 
     name_bytes = bytes(data[4:20]).split(b"\x00", 1)[0]
     return {
         "station": data[3] + 1,
-        "sequence": data[2],
+        "sequence": data[2] & 1,
         "name_bytes": name_bytes,
     }
 
@@ -255,20 +261,20 @@ def pack_get_firmware_version() -> bytes:
 def parse_firmware_version_response(data: bytes | bytearray) -> FirmwareVersion | None:
     """Parse a V5 identification response to extract firmware version.
 
-    Response format:
-    - Byte 0: Command code (0x0F)
-    - Byte 2: Response type (0x01 = identification data)
-    - Bytes 3-8: MAC address
-    - Byte 9-10: Hardware revision
-    - Byte 11: Hardware type code
-    - Byte 12: Firmware major version
-    - Byte 13: Firmware minor version
-    - Byte 14: Firmware patch version
-    - Bytes 15-16: Serial number components
+    Accepts bare identification frames (command at byte 0) and wrapped
+    notifications (0x10 prefix, command at byte 1). Version is always at
+    bytes 12-14.
 
     Returns dict with major, minor, and raw_hex version string, or None if invalid.
     """
-    if len(data) < 17 or data[0] != 0x0F or data[2] != 0x01:
+    if len(data) < 17:
+        return None
+
+    if data[0] == 0x0F and data[2] == 0x01:
+        pass
+    elif data[0] == 0x10 and data[1] == 0x0F and data[2] == 0x01:
+        pass
+    else:
         return None
 
     major = data[12]

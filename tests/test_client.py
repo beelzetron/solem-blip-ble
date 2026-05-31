@@ -1,8 +1,25 @@
 """Unit tests for Solem BL-IP client BLE exchanges."""
 
+import json
+from pathlib import Path
 from typing import Any
 
 from solem_blip_ble.client import SolemClient
+
+CAPTURE_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "solem_metadata_c8b961d44dcc8.jsonl"
+)
+
+
+def _load_capture_notifications(probe: str) -> list[bytes]:
+    payloads: list[bytes] = []
+    for line in CAPTURE_FIXTURE.read_text().splitlines():
+        if not line:
+            continue
+        event = json.loads(line)
+        if event["probe"] == probe and event["direction"] == "RX":
+            payloads.append(bytes.fromhex(event["payload_hex"]))
+    return payloads
 
 
 class FakeBleakClient:
@@ -47,6 +64,27 @@ class FakeFirmwareBleakClient(FakeBleakClient):
         )
 
 
+class CaptureFirmwareBleakClient(FakeBleakClient):
+    async def write_gatt_char(
+        self, _uuid: str, payload: bytes, *, response: bool
+    ) -> None:
+        self.writes.append(payload)
+        assert response is False
+        assert self.handler is not None
+        self.handler(1, bytearray(_load_capture_notifications("firmware")[0]))
+
+
+class CaptureStationNamesBleakClient(FakeBleakClient):
+    async def write_gatt_char(
+        self, _uuid: str, payload: bytes, *, response: bool
+    ) -> None:
+        self.writes.append(payload)
+        assert response is False
+        assert self.handler is not None
+        for notification in _load_capture_notifications("output_names")[:12]:
+            self.handler(1, bytearray(notification))
+
+
 async def test_get_station_name_reads_two_fragments_without_commit(monkeypatch):
     fake_client = FakeBleakClient()
     client = SolemClient("AA:BB:CC:DD:EE:FF", max_station_num=1)
@@ -78,6 +116,46 @@ async def test_get_firmware_version_reads_identification_without_commit(monkeypa
         "raw_hex": "5.1.5",
     }
     assert fake_client.writes == [bytes.fromhex("0f00")]
+
+
+async def test_get_firmware_version_from_capture(monkeypatch):
+    fake_client = CaptureFirmwareBleakClient()
+    client = SolemClient("C8:B9:61:D4:4D:C8")
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+
+    assert await client.get_firmware_version() == {
+        "major": 5,
+        "minor": 1,
+        "patch": 7,
+        "raw_hex": "5.1.7",
+    }
+    assert fake_client.writes == [bytes.fromhex("0f00")]
+
+
+async def test_get_station_names_from_capture(monkeypatch):
+    fake_client = CaptureStationNamesBleakClient()
+    client = SolemClient("C8:B9:61:D4:4D:C8", max_station_num=6)
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+
+    assert await client.get_station_names() == {
+        1: "Eleagnus",
+        2: "Stazione 2",
+        3: "Stazione 3",
+        4: "Stazione 4",
+        5: "Vasi",
+        6: "Stazione 6",
+    }
+    assert fake_client.writes == [bytes.fromhex("3500")]
 
 
 async def test_get_station_names_uses_configured_station_count():

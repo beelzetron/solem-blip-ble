@@ -50,6 +50,37 @@ All commands follow this structure:
 | Program X | `310514000X0000` + `3b00` | Run program X |
 | STOP | `31051500ff0000` + `3b00` | Stop active watering |
 
+### Read Station Name
+
+Station names are stored on V5 controllers as output names. Reading a name uses
+a separate request and does not require the `3b00` commit:
+
+```
+35 00
+```
+
+The controller replies with two notifications per output:
+
+```
+35 12 01 NN [first 16 UTF-8 bytes]
+35 12 00 NN [last  16 UTF-8 bytes]
+```
+
+`NN` is the zero-based output index (`00` for station 1). Concatenate the
+payloads at bytes 4-19 in sequence order `01`, then `00`, and stop each fragment
+at its first NUL byte. Names are at most 32 bytes.
+
+### Read Firmware Version
+
+Firmware metadata is returned by the V5 identification command:
+
+```
+0f 00
+```
+
+The identification notification with subtype `01` reports the firmware version
+at bytes 12-14 as major, minor, and patch components.
+
 ---
 
 ## Notification Protocol

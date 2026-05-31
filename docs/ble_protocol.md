@@ -290,6 +290,20 @@ Write behavior:
 
 The V5 reader decodes schedule/config notifications with this structure:
 
+- Hardware responds with type `0x3a` (response offset for the `0x39` read).
+  Notifications may also arrive with a leading `0x10` wrapper byte.
+- `byte 1`: frame subtype (`0x12` name/start-times, `0x0e` header, `0x11`
+  durations, `0x08` final duration chunk). Matches the write-frame subtypes.
+- `byte 2`: descending sequence counter. On BL-IP hardware this counts down
+  across the full config dump (not a fixed `6..0` range per program). Group
+  notifications by `byte 3` program tag, take the highest `byte 2` seen for
+  that program as `first_fragment_id`, then compute
+  `logical_chunk = first_fragment_id - byte 2`.
+- `byte 3`: program tag — high nibble `0x1` = irrigation class, low nibble =
+  program index (`0x10` = program A, `0x11` = B, `0x12` = C).
+- Payload fields start at `byte 4`. Frames are variable length (for example
+  the header and final duration chunk are shorter than the 20-byte name
+  frames).
 - `byte 3 low nibble`: program index
 - `byte 3 high nibble`: program class
   - `0x1`: irrigation

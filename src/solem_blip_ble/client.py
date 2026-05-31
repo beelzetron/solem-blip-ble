@@ -537,6 +537,87 @@ class SolemClient:
 
         return await _attempt()
 
+    async def get_irrigation_config(
+        self,
+    ) -> dict[int, protocol.IrrigationProgram]:
+        """Read persisted irrigation programs (A/B/C) from the V5 controller."""
+        request = protocol.pack_get_irrigation_config()
+        if self.mock:
+            return {
+                program_index: {
+                    "name": f"Program {chr(ord('A') + program_index)}",
+                    "inter_station_delay": 0,
+                    "water_budget": 100,
+                    "cycle": 0,
+                    "week_days": 0x7F,
+                    "period_length": 1,
+                    "start_times": [420 + program_index * 60, None, None, None, None, None, None, None],
+                    "station_durations": [
+                        600 if station == 0 else 0
+                        for station in range(self.max_station_num)
+                    ],
+                }
+                for program_index in range(protocol.IRRIGATION_PROGRAM_COUNT)
+            }
+
+        @retry(
+            stop=stop_after_attempt(REQUEST_MAX_ATTEMPTS),
+            wait=wait_fixed(REQUEST_RETRY_DELAY),
+            retry=retry_if_exception_type(SolemConnectionError),
+            reraise=True,
+        )
+        async def _attempt() -> dict[int, protocol.IrrigationProgram]:
+            payloads: list[bytes] = []
+            config_event = asyncio.Event()
+
+            def notification_handler(_sender: int, data: bytearray) -> None:
+                payload = bytes(data)
+                parsed = protocol.parse_irrigation_config_fragment(payload)
+                if parsed is None:
+                    return
+                payloads.append(payload)
+                _LOGGER.debug(
+                    "%s - Irrigation config fragment (program=%s, fragment=%s): %s",
+                    self.mac_address,
+                    parsed["program_index"],
+                    parsed["fragment_id"],
+                    payload.hex(),
+                )
+                if protocol.irrigation_config_complete(payloads):
+                    config_event.set()
+
+            async def _op(client: BleakClient) -> dict[int, protocol.IrrigationProgram]:
+                await self._start_notify(client, notification_handler)
+                await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+                await self._ensure_connected(client, phase="irrigation config read")
+                try:
+                    await self._write(client, request)
+                    try:
+                        await asyncio.wait_for(
+                            config_event.wait(), timeout=STATUS_NOTIFY_TIMEOUT
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise SolemConnectionError(
+                            "Timeout waiting for irrigation config"
+                        ) from exc
+                    programs = protocol.assemble_irrigation_programs(
+                        payloads, max_stations=self.max_station_num
+                    )
+                    if not protocol.irrigation_config_complete(payloads):
+                        raise SolemConnectionError(
+                            "Incomplete irrigation config response"
+                        )
+                    return programs
+                finally:
+                    try:
+                        await client.stop_notify(NOTIFY_CHAR_UUID)
+                    except Exception as exc:
+                        _LOGGER.debug("%s - stop_notify: %s", self.mac_address, exc)
+
+            return await self._run_with_client(_op)
+
+        return await _attempt()
+
     async def turn_on(self) -> None:
         if self.mock:
             return

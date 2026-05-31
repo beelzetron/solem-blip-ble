@@ -77,6 +77,7 @@ class SolemClient:
         self.max_station_num = max_station_num
         self._ble_device_resolver = ble_device_resolver
         self._conn_lock = asyncio.Lock()
+        self._operation_lock = asyncio.Lock()
         self._client: BleakClient | None = None
         self._ble_device: BLEDevice | None = ble_device
         self._had_client = False
@@ -90,6 +91,7 @@ class SolemClient:
             if ble_device is not None:
                 self._ble_device = ble_device
                 return ble_device
+            raise SolemConnectionError("Device not found! Failed connecting!")
 
         last_round = SCAN_MAX_ROUNDS - 1
         for round_idx in range(SCAN_MAX_ROUNDS):
@@ -177,29 +179,31 @@ class SolemClient:
 
     async def disconnect(self) -> None:
         """Close the persistent BLE session."""
-        async with self._conn_lock:
-            self._ble_device = None
-            self._had_client = False
-            await self._drop_client_unsafe()
+        async with self._operation_lock:
+            async with self._conn_lock:
+                self._ble_device = None
+                self._had_client = False
+                await self._drop_client_unsafe()
 
     async def _run_with_client(
         self,
         operation: Callable[[BleakClient], Awaitable[_T]],
     ) -> _T:
-        try:
-            client = await self._get_connected_client()
-            if not client.is_connected:
-                raise SolemConnectionError("Failed connecting!")
-            return await operation(client)
-        except RetryError as exc:
-            await self._invalidate_session()
-            raise SolemConnectionError("BLE operation failed after retries") from exc
-        except SolemConnectionError:
-            await self._invalidate_session()
-            raise
-        except _BLE_GATT_ERRORS as exc:
-            await self._invalidate_session()
-            raise SolemConnectionError("BLE GATT error during device operation") from exc
+        async with self._operation_lock:
+            try:
+                client = await self._get_connected_client()
+                if not client.is_connected:
+                    raise SolemConnectionError("Failed connecting!")
+                return await operation(client)
+            except RetryError as exc:
+                await self._invalidate_session()
+                raise SolemConnectionError("BLE operation failed after retries") from exc
+            except SolemConnectionError:
+                await self._invalidate_session()
+                raise
+            except _BLE_GATT_ERRORS as exc:
+                await self._invalidate_session()
+                raise SolemConnectionError("BLE GATT error during device operation") from exc
 
     async def _ensure_connected(self, client: BleakClient, *, phase: str) -> None:
         if not client.is_connected:

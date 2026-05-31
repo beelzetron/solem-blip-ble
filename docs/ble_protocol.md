@@ -36,7 +36,29 @@ All commands follow this structure:
 | `ZZ` | Parameter 2 (usually 00) |
 | `WWWW` | Duration in seconds (big-endian) |
 
-**Important:** Every command must be followed by `3b00` (commit) to execute.
+**Important:** Irrigation control commands must be followed by `3b00` (commit) to execute. Set-time (`0306`) and read requests do not use commit.
+
+### Set Device Time
+
+Write-only command to sync local date/time to the device RTC:
+
+```
+03 06 00 YY MM DD hh mm ss
+```
+
+| Byte | Meaning |
+|------|---------|
+| 0 | `0x03` — set time |
+| 1 | `0x06` — subtype |
+| 2 | `0x00` |
+| 3 | year minus 1900 |
+| 4 | month (`1-12`) |
+| 5 | day of month |
+| 6 | hour |
+| 7 | minute |
+| 8 | second |
+
+There is no matching read-time command on BL-IP V5.
 
 ### Known Commands
 

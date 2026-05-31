@@ -1,10 +1,12 @@
 """Unit tests for Solem BL-IP client BLE exchanges."""
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from solem_blip_ble.client import SolemClient
+from solem_blip_ble import protocol
 
 CAPTURE_FIXTURE = (
     Path(__file__).parent / "fixtures" / "solem_metadata_c8b961d44dcc8.jsonl"
@@ -23,6 +25,19 @@ def _load_capture_notifications(probe: str) -> list[bytes]:
         if event["probe"] == probe and event["direction"] == "RX":
             payloads.append(bytes.fromhex(event["payload_hex"]))
     return payloads
+
+
+class FakeWriteOnlyBleakClient:
+    is_connected = True
+
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+
+    async def write_gatt_char(
+        self, _uuid: str, payload: bytes, *, response: bool
+    ) -> None:
+        self.writes.append(payload)
+        assert response is False
 
 
 class FakeBleakClient:
@@ -153,6 +168,22 @@ async def test_get_firmware_version_from_capture(monkeypatch):
         "raw_hex": "5.1.7",
     }
     assert fake_client.writes == [bytes.fromhex("0f00")]
+
+
+async def test_set_time_writes_without_commit(monkeypatch):
+    fake_client = FakeWriteOnlyBleakClient()
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    moment = datetime(2026, 5, 31, 22, 46, 14)
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+
+    await client.set_time(moment)
+
+    assert fake_client.writes == [protocol.pack_set_time(moment)]
+    assert all(write != protocol.pack_commit() for write in fake_client.writes)
 
 
 async def test_get_station_names_from_capture(monkeypatch):

@@ -288,3 +288,238 @@ def parse_firmware_version_response(data: bytes | bytearray) -> FirmwareVersion 
         "patch": patch,
         "raw_hex": raw_hex,
     }
+
+
+IRRIGATION_PROGRAM_CLASS = 0x1
+IRRIGATION_PROGRAM_COUNT = 3
+IRRIGATION_LOGICAL_CHUNKS = 7
+DISABLED_START_TIME = 1440
+
+
+class IrrigationProgram(TypedDict):
+    name: str
+    inter_station_delay: int
+    water_budget: int
+    cycle: int
+    week_days: int
+    period_length: int
+    start_times: list[int | None]
+    station_durations: list[int]
+
+
+class IrrigationConfigFragment(TypedDict):
+    program_index: int
+    fragment_id: int
+    logical_chunk: int
+
+
+def pack_get_irrigation_config() -> bytes:
+    """Pack a V5 request for persisted irrigation program configuration."""
+    return bytes([0x39, 0x00])
+
+
+def normalize_config_notification(data: bytes | bytearray) -> bytes | None:
+    """Normalize a V5 irrigation-config notification to canonical layout.
+
+    Accepts bare frames (command at byte 0), response-type offset (0x3a), and
+    hardware-wrapped frames (0x10 prefix).
+    """
+    if len(data) < 4:
+        return None
+
+    if data[0] in (0x39, 0x3A):
+        return bytes(data)
+    if data[0] == 0x10 and len(data) >= 5 and data[1] in (0x39, 0x3A):
+        return bytes(data[1:])
+    return None
+
+
+def _parse_config_int3(b0: int, b1: int, b2: int) -> int:
+    return (b0 << 16) | (b1 << 8) | b2
+
+
+def _empty_irrigation_program(*, max_stations: int) -> IrrigationProgram:
+    return {
+        "name": "",
+        "inter_station_delay": 0,
+        "water_budget": 0,
+        "cycle": 0,
+        "week_days": 0,
+        "period_length": 0,
+        "start_times": [None] * 8,
+        "station_durations": [0] * max_stations,
+    }
+
+
+def parse_irrigation_config_fragment(
+    data: bytes | bytearray,
+    *,
+    first_fragment_id: int | None = None,
+) -> IrrigationConfigFragment | None:
+    """Parse one V5 irrigation-config notification fragment.
+
+    Returns fragment metadata for irrigation programs (class 0x1). When
+    ``first_fragment_id`` is supplied, ``logical_chunk`` is computed from it;
+    otherwise only raw ``fragment_id`` is returned with ``logical_chunk=-1``.
+    """
+    normalized = normalize_config_notification(data)
+    if normalized is None:
+        return None
+
+    program_class = normalized[3] >> 4
+    if program_class != IRRIGATION_PROGRAM_CLASS:
+        return None
+
+    program_index = normalized[3] & 0x0F
+    if program_index >= IRRIGATION_PROGRAM_COUNT:
+        return None
+
+    fragment_id = normalized[2]
+    logical_chunk = (
+        first_fragment_id - fragment_id
+        if first_fragment_id is not None
+        else -1
+    )
+    if first_fragment_id is not None and not 0 <= logical_chunk < IRRIGATION_LOGICAL_CHUNKS:
+        return None
+
+    return {
+        "program_index": program_index,
+        "fragment_id": fragment_id,
+        "logical_chunk": logical_chunk,
+    }
+
+
+def _apply_irrigation_chunk(
+    program: IrrigationProgram,
+    normalized: bytes,
+    logical_chunk: int,
+    *,
+    max_stations: int,
+    name_part_1: bytes | None,
+) -> bytes | None:
+    """Apply one logical chunk to ``program``. Returns updated name part 1 if set."""
+    if logical_chunk == 0:
+        return bytes(normalized[4:20]).split(b"\x00", 1)[0]
+
+    if logical_chunk == 1:
+        part_2 = bytes(normalized[4:20]).split(b"\x00", 1)[0]
+        program["name"] = ((name_part_1 or b"") + part_2).decode(
+            "utf-8", errors="replace"
+        )
+        return name_part_1
+
+    if logical_chunk == 2:
+        program["inter_station_delay"] = struct.unpack(">H", normalized[4:6])[0]
+        program["water_budget"] = struct.unpack(">H", normalized[6:8])[0]
+        program["cycle"] = normalized[8]
+        program["week_days"] = normalized[9]
+        program["period_length"] = normalized[10]
+        return name_part_1
+
+    if logical_chunk == 3:
+        offset = 4
+        for slot in range(8):
+            minutes = struct.unpack(">H", normalized[offset : offset + 2])[0]
+            program["start_times"][slot] = (
+                None if minutes >= DISABLED_START_TIME else minutes
+            )
+            offset += 2
+        return name_part_1
+
+    duration_slots = {
+        4: range(0, 5),
+        5: range(5, 10),
+        6: range(10, min(12, max_stations)),
+    }
+    if logical_chunk in duration_slots:
+        offset = 4
+        for station_index in duration_slots[logical_chunk]:
+            if station_index >= max_stations:
+                break
+            program["station_durations"][station_index] = _parse_config_int3(
+                normalized[offset],
+                normalized[offset + 1],
+                normalized[offset + 2],
+            )
+            offset += 3
+        return name_part_1
+
+    return name_part_1
+
+
+def assemble_irrigation_programs(
+    payloads: list[bytes | bytearray],
+    *,
+    max_stations: int = MAX_STATION_NUM,
+) -> dict[int, IrrigationProgram]:
+    """Assemble irrigation programs from V5 config notification payloads."""
+    grouped: dict[int, list[bytes]] = {}
+    for payload in payloads:
+        normalized = normalize_config_notification(payload)
+        if normalized is None:
+            continue
+        program_class = normalized[3] >> 4
+        if program_class != IRRIGATION_PROGRAM_CLASS:
+            continue
+        program_index = normalized[3] & 0x0F
+        if program_index >= IRRIGATION_PROGRAM_COUNT:
+            continue
+        grouped.setdefault(program_index, []).append(normalized)
+
+    programs: dict[int, IrrigationProgram] = {}
+    for program_index, fragments in grouped.items():
+        first_fragment_id = max(fragment[2] for fragment in fragments)
+        program = _empty_irrigation_program(max_stations=max_stations)
+        name_part_1: bytes | None = None
+
+        for normalized in sorted(fragments, key=lambda item: item[2], reverse=True):
+            logical_chunk = first_fragment_id - normalized[2]
+            if not 0 <= logical_chunk < IRRIGATION_LOGICAL_CHUNKS:
+                continue
+            name_part_1 = _apply_irrigation_chunk(
+                program,
+                normalized,
+                logical_chunk,
+                max_stations=max_stations,
+                name_part_1=name_part_1,
+            )
+
+        programs[program_index] = program
+
+    return programs
+
+
+def irrigation_program_has_final_chunk(
+    payloads: list[bytes | bytearray],
+    program_index: int,
+) -> bool:
+    """Return True when ``program_index`` includes the last logical chunk."""
+    fragments: list[bytes] = []
+    for payload in payloads:
+        normalized = normalize_config_notification(payload)
+        if normalized is None:
+            continue
+        if (normalized[3] >> 4) != IRRIGATION_PROGRAM_CLASS:
+            continue
+        if (normalized[3] & 0x0F) != program_index:
+            continue
+        fragments.append(normalized)
+
+    if not fragments:
+        return False
+
+    first_fragment_id = max(fragment[2] for fragment in fragments)
+    return any(first_fragment_id - fragment[2] == 6 for fragment in fragments)
+
+
+def irrigation_config_complete(
+    payloads: list[bytes | bytearray],
+    *,
+    program_count: int = IRRIGATION_PROGRAM_COUNT,
+) -> bool:
+    """Return True when all expected irrigation programs include chunk 6."""
+    return all(
+        irrigation_program_has_final_chunk(payloads, program_index)
+        for program_index in range(program_count)
+    )

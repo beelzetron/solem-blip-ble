@@ -40,7 +40,7 @@ All commands follow this structure:
 
 ### Set Device Time
 
-MySOLEM pushes phone local time on connect using the V5 set-time command:
+Write-only command to sync local date/time to the device RTC:
 
 ```
 03 06 00 YY MM DD hh mm ss

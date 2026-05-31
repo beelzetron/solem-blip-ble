@@ -260,7 +260,7 @@ def pack_get_firmware_version() -> bytes:
 
 
 def pack_set_time(when: datetime | None = None) -> bytes:
-    """Pack the V5 set-time command (MySOLEM ``setTimeV5``).
+    """Pack the V5 set-time command.
 
     Frame: ``03 06 00 YY MM DD hh mm ss`` where ``YY`` is year minus 1900 and
     month is ``1-12``. Does **not** use the ``3b00`` commit suffix.

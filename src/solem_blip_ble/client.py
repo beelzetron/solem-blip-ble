@@ -620,7 +620,7 @@ class SolemClient:
         return await _attempt()
 
     async def set_time(self, when: datetime | None = None) -> None:
-        """Push local date/time to the device RTC (V5 ``setTimeV5``, no commit)."""
+        """Push local date/time to the device RTC (write-only, no commit)."""
         if self.mock:
             return
 

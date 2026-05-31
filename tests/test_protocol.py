@@ -143,22 +143,52 @@ def test_parse_intermediate_remaining_ignores_seq_2():
 
 def test_pack_get_firmware_version():
     """Test firmware version query command packing."""
-    assert protocol.pack_get_firmware_version() == bytes.fromhex("010000")
+    assert protocol.pack_get_firmware_version() == bytes.fromhex("0f00")
+
+
+def test_pack_get_station_names():
+    assert protocol.pack_get_station_names() == bytes.fromhex("3500")
+
+
+def test_parse_station_name_fragments():
+    first = bytearray.fromhex("3512010046726f6e74206c61776e00000000000000")
+    last = bytearray.fromhex("351200002065617374000000000000000000000000")
+
+    first_parsed = protocol.parse_station_name_fragment(first)
+    last_parsed = protocol.parse_station_name_fragment(last)
+
+    assert first_parsed == {
+        "station": 1,
+        "sequence": 1,
+        "name_bytes": b"Front lawn",
+    }
+    assert last_parsed == {
+        "station": 1,
+        "sequence": 0,
+        "name_bytes": b" east",
+    }
+    assert (
+        first_parsed["name_bytes"] + last_parsed["name_bytes"]
+    ).decode() == "Front lawn east"
+
+
+def test_parse_station_name_fragment_rejects_other_frames():
+    assert protocol.parse_station_name_fragment(bytearray.fromhex("3b00")) is None
+    assert protocol.parse_station_name_fragment(bytearray.fromhex("35120200")) is None
 
 
 def test_parse_firmware_version_response_valid():
-    """Parse identification response with firmware version 5.0.
+    """Parse identification response with firmware version 5.1.5.
 
     Based on the V5 identification response layout:
-    - Byte 0: Command (0x01)
-    - Byte 12: Firmware major version
-    - Byte 13: Firmware minor version
+    - Byte 0: Command (0x0F)
+    - Bytes 12-14: Firmware major, minor, and patch version
     """
-    # Simulated response: MAC + HW info + firmware v5.0
-    data = bytearray(16)
-    data[0] = 0x01  # CMD_ID
+    # Simulated response: MAC + HW info + firmware v5.1.5
+    data = bytearray(17)
+    data[0] = 0x0F  # CMD_ID_V2
     data[1] = 0x00  # Subcommand
-    data[2] = 0x00  # Response type (identification)
+    data[2] = 0x01  # Response type (identification)
     # Bytes 3-8: MAC address (placeholder)
     data[3] = 0x10
     data[4] = 0x8B
@@ -170,39 +200,43 @@ def test_parse_firmware_version_response_valid():
     data[9] = 0x09
     data[10] = 0xD0
     data[11] = 0x46
-    # Bytes 12-13: Firmware version (5.0)
+    # Bytes 12-14: Firmware version (5.1.5)
     data[12] = 0x05
-    data[13] = 0x00
-    # Bytes 14-15: Serial number
-    data[14] = 0xE8
-    data[15] = 0x0B
+    data[13] = 0x01
+    data[14] = 0x05
+    # Bytes 15-16: Serial number
+    data[15] = 0xE8
+    data[16] = 0x0B
 
     result = protocol.parse_firmware_version_response(data)
     assert result is not None
     assert result["major"] == 5
-    assert result["minor"] == 0
-    assert result["raw_hex"] == "5.0"
+    assert result["minor"] == 1
+    assert result["patch"] == 5
+    assert result["raw_hex"] == "5.1.5"
 
 
 def test_parse_firmware_version_response_v6():
     """Test parsing firmware version 6.x."""
-    data = bytearray(16)
-    data[0] = 0x01
+    data = bytearray(17)
+    data[0] = 0x0F
     data[1] = 0x00
-    data[2] = 0x00
+    data[2] = 0x01
     data[12] = 0x06
     data[13] = 0x12  # v6.12
+    data[14] = 0x03
 
     result = protocol.parse_firmware_version_response(data)
     assert result is not None
     assert result["major"] == 6
     assert result["minor"] == 18
-    assert result["raw_hex"] == "6.18"
+    assert result["patch"] == 3
+    assert result["raw_hex"] == "6.18.3"
 
 
 def test_parse_firmware_version_invalid_command():
     """Reject responses with wrong command code."""
-    data = bytearray(16)
+    data = bytearray(17)
     data[0] = 0x3B  # Not CMD_ID
     data[1] = 0x00
     data[2] = 0x00
@@ -214,10 +248,10 @@ def test_parse_firmware_version_invalid_command():
 
 def test_parse_firmware_version_invalid_subtype():
     """Reject responses with non-identification subcommand."""
-    data = bytearray(16)
-    data[0] = 0x01
+    data = bytearray(17)
+    data[0] = 0x0F
     data[1] = 0x00
-    data[2] = 0x01  # Not identification (should be 0x00)
+    data[2] = 0x00  # Not identification (should be 0x01)
     data[12] = 0x05
     data[13] = 0x00
 

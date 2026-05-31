@@ -5,9 +5,11 @@ from .const import DEFAULT_MAX_STATION_NUM, MAX_STATION_NUM
 from .exceptions import SolemConnectionError
 from .protocol import (
     FirmwareVersion,
+    StationNameFragment,
     is_command_notification,
     pack_commit,
     pack_get_firmware_version,
+    pack_get_station_names,
     pack_run_program,
     pack_sprinkle_all_stations,
     pack_sprinkle_station,
@@ -19,6 +21,7 @@ from .protocol import (
     parse_firmware_version_response,
     parse_intermediate_remaining,
     parse_remaining_seconds,
+    parse_station_name_fragment,
     parse_status_notification,
 )
 
@@ -32,9 +35,11 @@ __all__ = [
     "SolemConnectionError",
     "APIConnectionError",
     "FirmwareVersion",
+    "StationNameFragment",
     "is_command_notification",
     "pack_commit",
     "pack_get_firmware_version",
+    "pack_get_station_names",
     "pack_run_program",
     "pack_sprinkle_all_stations",
     "pack_sprinkle_station",
@@ -46,5 +51,6 @@ __all__ = [
     "parse_firmware_version_response",
     "parse_intermediate_remaining",
     "parse_remaining_seconds",
+    "parse_station_name_fragment",
     "parse_status_notification",
 ]

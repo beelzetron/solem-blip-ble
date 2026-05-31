@@ -213,39 +213,72 @@ def mock_status() -> dict[str, Any]:
 class FirmwareVersion(TypedDict):
     major: int
     minor: int
+    patch: int
     raw_hex: str
 
 
+class StationNameFragment(TypedDict):
+    station: int
+    sequence: int
+    name_bytes: bytes
+
+
+def pack_get_station_names() -> bytes:
+    """Pack a V5 request for all output names."""
+    return bytes([0x35, 0x00])
+
+
+def parse_station_name_fragment(
+    data: bytes | bytearray,
+) -> StationNameFragment | None:
+    """Parse one V5 output-name response fragment.
+
+    Names are returned as two notifications with sequence 1 then 0. Each
+    notification contains up to 16 UTF-8 bytes at offsets 4-19.
+    """
+    if len(data) < 4 or data[0] != 0x35 or data[2] not in (0x00, 0x01):
+        return None
+
+    name_bytes = bytes(data[4:20]).split(b"\x00", 1)[0]
+    return {
+        "station": data[3] + 1,
+        "sequence": data[2],
+        "name_bytes": name_bytes,
+    }
+
+
 def pack_get_firmware_version() -> bytes:
-    """Pack identification command to query firmware version (CMD_ID=0x01)."""
-    return struct.pack(">BBB", 0x01, 0x00, 0x00)
+    """Pack the V5 identification command used to query firmware version."""
+    return bytes([0x0F, 0x00])
 
 
 def parse_firmware_version_response(data: bytes | bytearray) -> FirmwareVersion | None:
-    """Parse identification response (CMD_ID=0x01) to extract firmware version.
+    """Parse a V5 identification response to extract firmware version.
 
     Response format:
-    - Byte 0: Command code (0x01)
-    - Byte 1: Subcommand (0x00)
-    - Byte 2: Response type (0x00 = identification data)
+    - Byte 0: Command code (0x0F)
+    - Byte 2: Response type (0x01 = identification data)
     - Bytes 3-8: MAC address
     - Byte 9-10: Hardware revision
     - Byte 11: Hardware type code
     - Byte 12: Firmware major version
     - Byte 13: Firmware minor version
-    - Bytes 14-15: Serial number components
+    - Byte 14: Firmware patch version
+    - Bytes 15-16: Serial number components
 
     Returns dict with major, minor, and raw_hex version string, or None if invalid.
     """
-    if len(data) < 16 or data[0] != 0x01 or data[2] != 0x00:
+    if len(data) < 17 or data[0] != 0x0F or data[2] != 0x01:
         return None
 
     major = data[12]
     minor = data[13]
-    raw_hex = f"{major}.{minor}"
+    patch = data[14]
+    raw_hex = f"{major}.{minor}.{patch}"
 
     return {
         "major": major,
         "minor": minor,
+        "patch": patch,
         "raw_hex": raw_hex,
     }

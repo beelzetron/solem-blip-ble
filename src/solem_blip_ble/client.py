@@ -405,6 +405,138 @@ class SolemClient:
 
         return await self._run_with_client(_op)
 
+    async def get_firmware_version(self) -> protocol.FirmwareVersion:
+        """Read the firmware version stored on the V5 controller."""
+        request = protocol.pack_get_firmware_version()
+        if self.mock:
+            return {"major": 5, "minor": 0, "patch": 0, "raw_hex": "5.0.0"}
+
+        @retry(
+            stop=stop_after_attempt(REQUEST_MAX_ATTEMPTS),
+            wait=wait_fixed(REQUEST_RETRY_DELAY),
+            retry=retry_if_exception_type(SolemConnectionError),
+            reraise=True,
+        )
+        async def _attempt() -> protocol.FirmwareVersion:
+            firmware_version: protocol.FirmwareVersion | None = None
+            firmware_event = asyncio.Event()
+
+            def notification_handler(_sender: int, data: bytearray) -> None:
+                nonlocal firmware_version
+                parsed = protocol.parse_firmware_version_response(data)
+                if parsed is None:
+                    return
+                firmware_version = parsed
+                _LOGGER.debug(
+                    "%s - Firmware version notification: %s",
+                    self.mac_address,
+                    bytes(data).hex(),
+                )
+                firmware_event.set()
+
+            async def _op(client: BleakClient) -> protocol.FirmwareVersion:
+                await self._start_notify(client, notification_handler)
+                await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+                await self._ensure_connected(client, phase="firmware version read")
+                try:
+                    await self._write(client, request)
+                    try:
+                        await asyncio.wait_for(
+                            firmware_event.wait(), timeout=STATUS_NOTIFY_TIMEOUT
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise SolemConnectionError(
+                            "Timeout waiting for firmware version"
+                        ) from exc
+                    if firmware_version is None:
+                        raise SolemConnectionError("Empty firmware version response")
+                    return firmware_version
+                finally:
+                    try:
+                        await client.stop_notify(NOTIFY_CHAR_UUID)
+                    except Exception as exc:
+                        _LOGGER.debug("%s - stop_notify: %s", self.mac_address, exc)
+
+            return await self._run_with_client(_op)
+
+        return await _attempt()
+
+    async def get_station_name(self, station: int) -> str:
+        """Read a station name stored on the V5 controller."""
+        if not 1 <= station <= self.max_station_num:
+            raise ValueError(f"station must be between 1 and {self.max_station_num}")
+        if self.mock:
+            return f"Station {station}"
+        return (await self.get_station_names())[station]
+
+    async def get_station_names(self) -> dict[int, str]:
+        """Read names for each configured station from the V5 controller."""
+        request = protocol.pack_get_station_names()
+        if self.mock:
+            return {
+                station: f"Station {station}"
+                for station in range(1, self.max_station_num + 1)
+            }
+
+        @retry(
+            stop=stop_after_attempt(REQUEST_MAX_ATTEMPTS),
+            wait=wait_fixed(REQUEST_RETRY_DELAY),
+            retry=retry_if_exception_type(SolemConnectionError),
+            reraise=True,
+        )
+        async def _attempt() -> dict[int, str]:
+            fragments: dict[int, dict[int, bytes]] = {}
+            station_names: dict[int, str] = {}
+            name_event = asyncio.Event()
+
+            def notification_handler(_sender: int, data: bytearray) -> None:
+                parsed = protocol.parse_station_name_fragment(data)
+                if parsed is None or not 1 <= parsed["station"] <= self.max_station_num:
+                    return
+                station = parsed["station"]
+                fragments.setdefault(station, {})[parsed["sequence"]] = parsed[
+                    "name_bytes"
+                ]
+                _LOGGER.debug(
+                    "%s - Station %s name fragment (seq=%s): %s",
+                    self.mac_address,
+                    station,
+                    parsed["sequence"],
+                    bytes(data).hex(),
+                )
+                if parsed["sequence"] == 0:
+                    station_fragments = fragments[station]
+                    station_names[station] = (
+                        station_fragments.get(1, b"") + station_fragments[0]
+                    ).decode("utf-8", errors="replace")
+                    if len(station_names) == self.max_station_num:
+                        name_event.set()
+
+            async def _op(client: BleakClient) -> dict[int, str]:
+                await self._start_notify(client, notification_handler)
+                await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+                await self._ensure_connected(client, phase="station names read")
+                try:
+                    await self._write(client, request)
+                    try:
+                        await asyncio.wait_for(
+                            name_event.wait(), timeout=STATUS_NOTIFY_TIMEOUT
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise SolemConnectionError(
+                            "Timeout waiting for station names"
+                        ) from exc
+                    return station_names
+                finally:
+                    try:
+                        await client.stop_notify(NOTIFY_CHAR_UUID)
+                    except Exception as exc:
+                        _LOGGER.debug("%s - stop_notify: %s", self.mac_address, exc)
+
+            return await self._run_with_client(_op)
+
+        return await _attempt()
+
     async def turn_on(self) -> None:
         if self.mock:
             return

@@ -1,5 +1,7 @@
 """Unit tests for Solem BL-IP protocol helpers."""
 
+from datetime import datetime
+
 from solem_blip_ble import protocol
 
 
@@ -38,6 +40,11 @@ def test_pack_turn_off_x_days_clamped_to_15():
 
 def test_pack_commit():
     assert protocol.pack_commit() == bytes.fromhex("3b00")
+
+
+def test_pack_set_time():
+    moment = datetime(2026, 5, 31, 22, 46, 14)
+    assert protocol.pack_set_time(moment) == bytes.fromhex("0306007e051f162e0e")
 
 
 def test_parse_status_on_idle():

@@ -1,5 +1,6 @@
 """Unit tests for Solem BL-IP client BLE exchanges."""
 
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Any
 
 from solem_blip_ble.client import SolemClient
 from solem_blip_ble import protocol
+from solem_blip_ble.exceptions import SolemConnectionError
 
 CAPTURE_FIXTURE = (
     Path(__file__).parent / "fixtures" / "solem_metadata_c8b961d44dcc8.jsonl"
@@ -234,3 +236,98 @@ async def test_get_station_names_uses_configured_station_count():
         1: "Station 1",
         2: "Station 2",
     }
+
+
+async def test_concurrent_operations_execute_sequentially(monkeypatch):
+    fake_client = FakeWriteOnlyBleakClient()
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls: list[str] = []
+
+    async def get_connected_client():
+        return fake_client
+
+    async def first_operation(_client):
+        calls.append("first-start")
+        first_started.set()
+        await release_first.wait()
+        calls.append("first-stop-notify")
+
+    async def second_operation(_client):
+        calls.append("second-start")
+
+    monkeypatch.setattr(client, "_get_connected_client", get_connected_client)
+
+    first_task = asyncio.create_task(client._run_with_client(first_operation))
+    await first_started.wait()
+    second_task = asyncio.create_task(client._run_with_client(second_operation))
+    await asyncio.sleep(0)
+
+    assert calls == ["first-start"]
+
+    release_first.set()
+    await asyncio.gather(first_task, second_task)
+
+    assert calls == ["first-start", "first-stop-notify", "second-start"]
+
+
+async def test_disconnect_waits_for_active_operation(monkeypatch):
+    fake_client = FakeWriteOnlyBleakClient()
+    fake_client.disconnect_called = False
+
+    async def disconnect():
+        fake_client.disconnect_called = True
+
+    fake_client.disconnect = disconnect
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    client._client = fake_client
+    operation_started = asyncio.Event()
+    release_operation = asyncio.Event()
+
+    async def get_connected_client():
+        return fake_client
+
+    async def operation(_client):
+        operation_started.set()
+        await release_operation.wait()
+
+    monkeypatch.setattr(client, "_get_connected_client", get_connected_client)
+
+    operation_task = asyncio.create_task(client._run_with_client(operation))
+    await operation_started.wait()
+    disconnect_task = asyncio.create_task(client.disconnect())
+    await asyncio.sleep(0)
+
+    assert fake_client.disconnect_called is False
+
+    release_operation.set()
+    await asyncio.gather(operation_task, disconnect_task)
+
+    assert fake_client.disconnect_called is True
+
+
+async def test_resolver_does_not_fall_back_to_standalone_scanner(monkeypatch):
+    client = SolemClient(
+        "AA:BB:CC:DD:EE:FF",
+        ble_device_resolver=lambda: None,
+    )
+
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("standalone scanner must not be used with a resolver")
+
+    monkeypatch.setattr(
+        "solem_blip_ble.client.BleakScanner.find_device_by_address",
+        fail_if_called,
+    )
+    monkeypatch.setattr(
+        "solem_blip_ble.client.BleakScanner.discover",
+        fail_if_called,
+    )
+
+    try:
+        await client._resolve_ble_device()
+    except SolemConnectionError:
+        pass
+    else:
+        raise AssertionError("missing resolver device must fail")

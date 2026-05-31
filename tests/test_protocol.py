@@ -174,7 +174,7 @@ def test_parse_station_name_fragments():
 
 def test_parse_station_name_fragment_rejects_other_frames():
     assert protocol.parse_station_name_fragment(bytearray.fromhex("3b00")) is None
-    assert protocol.parse_station_name_fragment(bytearray.fromhex("35120200")) is None
+    assert protocol.parse_station_name_fragment(bytearray.fromhex("35000200")) is None
 
 
 def test_parse_firmware_version_response_valid():

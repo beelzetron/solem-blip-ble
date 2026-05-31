@@ -1,0 +1,735 @@
+"""Validate and troubleshoot all Solem BL-IP BLE library features on real hardware."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import importlib.metadata
+import os
+import sys
+import time
+from pathlib import Path
+from time import monotonic
+from typing import Any
+
+from bleak import BleakClient, BleakScanner
+
+from solem_blip_ble import (
+    IrrigationProgram,
+    SolemClient,
+    SolemConnectionError,
+    assemble_irrigation_programs,
+    irrigation_config_complete,
+    parse_firmware_version_response,
+    parse_station_name_fragment,
+    parse_status_notification,
+)
+from solem_blip_ble.validate_common import (
+    ALL_SECTIONS,
+    BLE_BUSY_HINT,
+    DEFAULT_CAPTURE_SECONDS,
+    DEFAULT_MAC,
+    DEFAULT_SCHEDULE_CAPTURE_SECONDS,
+    DEFAULT_SETTLE_SECONDS,
+    NOTIFY_CHAR_UUID,
+    READ_SECTIONS,
+    WRITE_CHAR_UUID,
+    CaptureEvent,
+    StepResult,
+    capture_probes,
+    default_capture_output,
+    describe_notification,
+    format_minutes,
+    format_status,
+    load_capture_events,
+    selected_sections,
+    timestamp,
+    write_capture_event,
+)
+
+try:
+    from tenacity import RetryError
+except ImportError:  # pragma: no cover
+    RetryError = Exception  # type: ignore[misc, assignment]
+
+PROGRAM_LABELS = ("A", "B", "C")
+SPRINKLE_VERIFY_TIMEOUT = 60.0
+
+
+def _connection_detail(exc: BaseException) -> str:
+    detail = str(exc)
+    if isinstance(exc, RetryError):
+        detail = "BLE operation failed after retries"
+    if "not connected" in detail.lower() or isinstance(exc, RetryError):
+        detail = f"{detail}. {BLE_BUSY_HINT}"
+    return detail
+
+
+def _print_step(step: StepResult) -> None:
+    mark = "PASS" if step.ok else "FAIL"
+    print(f"[{mark}] {step.name}")
+    if step.data:
+        if "controller_state" in step.data:
+            print(f"       {format_status(step.data)}")
+        elif "raw_hex" in step.data and "major" in step.data:
+            print(f"       firmware={step.data['raw_hex']}")
+        elif step.data and all(isinstance(key, int) for key in step.data):
+            for key in sorted(step.data):
+                print(f"       station {key}: {step.data[key]!r}")
+    elif step.detail:
+        print(f"       {step.detail}")
+
+
+def _print_program(program_index: int, program: IrrigationProgram) -> None:
+    label = PROGRAM_LABELS[program_index]
+    print(f"Program {label} ({program_index})")
+    print(f"  name: {program['name']!r}")
+    print(
+        "  header:"
+        f" inter_station={program['inter_station_delay']}s"
+        f" budget={program['water_budget']}%"
+        f" cycle={program['cycle']}"
+        f" week_days=0x{program['week_days']:02x}"
+        f" period={program['period_length']}"
+    )
+    start_times = ", ".join(format_minutes(minutes) for minutes in program["start_times"])
+    print(f"  start_times: {start_times}")
+    durations = ", ".join(
+        f"S{station + 1}={seconds}s"
+        for station, seconds in enumerate(program["station_durations"])
+        if seconds > 0
+    )
+    print(f"  station_durations: {durations or '(none)'}")
+
+
+def _print_programs(programs: dict[int, IrrigationProgram]) -> None:
+    for program_index in sorted(programs):
+        _print_program(program_index, programs[program_index])
+
+
+def _assemble_station_names(payloads: list[bytes], *, max_stations: int) -> dict[int, str]:
+    fragments: dict[int, dict[int, bytes]] = {}
+    station_names: dict[int, str] = {}
+    for payload in payloads:
+        parsed = parse_station_name_fragment(payload)
+        if parsed is None or not 1 <= parsed["station"] <= max_stations:
+            continue
+        station = parsed["station"]
+        fragments.setdefault(station, {})[parsed["sequence"]] = parsed["name_bytes"]
+        if parsed["sequence"] == 0:
+            station_fragments = fragments[station]
+            station_names[station] = (
+                station_fragments.get(1, b"") + station_fragments[0]
+            ).decode("utf-8", errors="replace")
+    return station_names
+
+
+async def _wait_for_watering(
+    client: SolemClient,
+    *,
+    station: int,
+    timeout: float,
+    verbose: bool,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = await client.get_status(include_raw=verbose)
+        if status.get("is_watering") and status.get("station_num") == station:
+            return status
+        await asyncio.sleep(2.0)
+    return None
+
+
+async def _run_status_checks(
+    client: SolemClient,
+    report: list[StepResult],
+    *,
+    verbose: bool,
+    attempts: int = 2,
+) -> bool:
+    ok = True
+    for attempt in range(1, attempts + 1):
+        step = StepResult(f"get_status #{attempt}", False)
+        try:
+            status = await client.get_status(include_raw=verbose)
+            step.ok = True
+            step.data = status
+        except (SolemConnectionError, RetryError) as exc:
+            step.detail = _connection_detail(exc)
+            ok = False
+        report.append(step)
+        if not step.ok:
+            return False
+    return ok
+
+
+async def _run_firmware_check(
+    client: SolemClient,
+    report: list[StepResult],
+) -> None:
+    step = StepResult("get_firmware_version", False)
+    try:
+        step.data = dict(await client.get_firmware_version())
+        step.ok = True
+        step.detail = f"firmware={step.data['raw_hex']}"
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
+    report.append(step)
+
+
+async def _run_names_check(
+    client: SolemClient,
+    report: list[StepResult],
+) -> None:
+    step = StepResult("get_station_names", False)
+    try:
+        names = await client.get_station_names()
+        step.ok = bool(names)
+        step.data = names
+        step.detail = f"{len(names)} station name(s)"
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
+    report.append(step)
+
+
+async def _run_schedule_check(
+    client: SolemClient,
+    report: list[StepResult],
+) -> None:
+    step = StepResult("get_irrigation_config", False)
+    try:
+        programs = await client.get_irrigation_config()
+        step.ok = bool(programs)
+        step.detail = f"{len(programs)} program(s)"
+        report.append(step)
+        for program_index in sorted(programs):
+            program = programs[program_index]
+            detail = (
+                f"Program {PROGRAM_LABELS[program_index]}: {program['name']!r}; "
+                f"starts="
+                + ", ".join(format_minutes(minute) for minute in program["start_times"][:3])
+            )
+            report.append(
+                StepResult(
+                    f"schedule program {PROGRAM_LABELS[program_index]}",
+                    True,
+                    detail=detail,
+                )
+            )
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
+        report.append(step)
+
+
+async def _run_gatt_check(
+    client: SolemClient,
+    report: list[StepResult],
+) -> None:
+    step = StepResult("list_characteristics", False)
+    try:
+        chars = await client.list_characteristics()
+        step.ok = bool(chars)
+        step.detail = f"{len(chars)} service(s)"
+        report.append(step)
+        for service_uuid, characteristics in chars.items():
+            print(f"       service {service_uuid}")
+            for char in characteristics:
+                props = ", ".join(char["properties"])
+                print(f"         {char['uuid']} [{props}]")
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
+        report.append(step)
+
+
+async def _run_action_checks(
+    client: SolemClient,
+    report: list[StepResult],
+    *,
+    station: int,
+    minutes: int,
+    skip_sprinkle: bool,
+    verbose: bool,
+) -> None:
+    step = StepResult("stop_manual_sprinkle (cleanup)", False)
+    try:
+        await client.stop_manual_sprinkle()
+        step.ok = True
+        step.detail = "Command sent"
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
+    report.append(step)
+
+    if skip_sprinkle:
+        report.append(
+            StepResult("sprinkle test", True, detail="Skipped (--skip-sprinkle)")
+        )
+        return
+
+    step = StepResult(f"sprinkle_station_{station}_for_{minutes}_minutes", False)
+    command_status: dict[str, Any] | None = None
+    try:
+        command_status = await client.sprinkle_station_x_for_y_minutes(station, minutes)
+        step.ok = True
+        step.detail = "Command sent"
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
+    report.append(step)
+    if not step.ok:
+        return
+
+    step = StepResult("verify watering status", False)
+    try:
+        status = command_status
+        if not (
+            status
+            and status.get("is_watering")
+            and status.get("station_num") == station
+        ):
+            status = await _wait_for_watering(
+                client,
+                station=station,
+                timeout=SPRINKLE_VERIFY_TIMEOUT,
+                verbose=verbose,
+            )
+        if status is None:
+            step.detail = f"Timed out waiting for station {station} to report watering"
+        else:
+            remaining = status.get("remaining_seconds")
+            expected = minutes * 60
+            if remaining is None:
+                step.detail = "Watering active but remaining_seconds missing"
+            elif remaining > expected + 30:
+                step.detail = (
+                    f"remaining_seconds={remaining}s looks wrong "
+                    f"(expected ~{expected}s for {minutes} min command)"
+                )
+            else:
+                step.ok = True
+                step.data = status
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
+    report.append(step)
+
+    step = StepResult("stop after sprinkle test", False)
+    try:
+        await client.stop_manual_sprinkle()
+        step.ok = True
+        step.detail = "Command sent"
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
+    report.append(step)
+
+
+async def _run_live(args: argparse.Namespace) -> int:
+    sections = selected_sections(args.only, include_actions=args.actions)
+    try:
+        package_version = importlib.metadata.version("solem-blip-ble")
+    except importlib.metadata.PackageNotFoundError:
+        print("[FAIL] solem-blip-ble is not installed in this Python environment")
+        return 1
+
+    client = SolemClient(
+        args.mac,
+        bluetooth_timeout=args.connect_timeout,
+        max_station_num=args.max_stations,
+    )
+    report: list[StepResult] = []
+
+    print("solem-blip-ble validation")
+    print(f"Package:  solem-blip-ble {package_version}")
+    print(f"MAC:      {args.mac}")
+    print(f"Sections: {', '.join(sections)}")
+    print(f"Mode:     {'actions' if args.actions else 'read-only'}")
+    print("-" * 60)
+
+    try:
+        if "status" in sections:
+            if not await _run_status_checks(client, report, verbose=args.verbose):
+                print("-" * 60)
+                for step in report:
+                    _print_step(step)
+                print("-" * 60)
+                print("Result: FAILED (status checks did not complete)")
+                return 1
+
+        if "firmware" in sections:
+            await _run_firmware_check(client, report)
+        if "names" in sections:
+            await _run_names_check(client, report)
+        if "schedule" in sections:
+            await _run_schedule_check(client, report)
+        if "gatt" in sections:
+            await _run_gatt_check(client, report)
+        if "actions" in sections and args.actions:
+            await _run_action_checks(
+                client,
+                report,
+                station=args.station,
+                minutes=args.minutes,
+                skip_sprinkle=args.skip_sprinkle,
+                verbose=args.verbose,
+            )
+
+        print("-" * 60)
+        for step in report:
+            _print_step(step)
+        print("-" * 60)
+        if all(step.ok for step in report):
+            print("Result: ALL CHECKS PASSED")
+            return 0
+        failed = [step.name for step in report if not step.ok]
+        print(f"Result: FAILED ({len(failed)} step(s): {', '.join(failed)})")
+        return 1
+    finally:
+        await client.disconnect()
+
+
+async def _capture(args: argparse.Namespace) -> int:
+    sections = selected_sections(args.only, include_actions=False)
+    probes = capture_probes(sections)
+    if not probes:
+        print("No capture probes selected.", file=sys.stderr)
+        return 1
+
+    output_path = (
+        args.capture
+        if isinstance(args.capture, Path)
+        else default_capture_output(args.capture_prefix)
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    started = monotonic()
+    active_probe = "setup"
+    irrigation_first_fragments: dict[int, int] = {}
+
+    with output_path.open("w", encoding="utf-8") as output:
+        def record(direction: str, probe: str, payload: bytes, note: str = "") -> None:
+            write_capture_event(
+                output,
+                CaptureEvent(
+                    timestamp=timestamp(),
+                    elapsed_seconds=round(monotonic() - started, 6),
+                    direction=direction,
+                    probe=probe,
+                    payload_hex=payload.hex(),
+                    note=note,
+                ),
+                verbose=args.verbose,
+            )
+
+        def notification_handler(_sender: Any, data: bytearray) -> None:
+            payload = bytes(data)
+            record(
+                "RX",
+                active_probe,
+                payload,
+                describe_notification(
+                    payload,
+                    probe=active_probe,
+                    irrigation_first_fragments=irrigation_first_fragments,
+                ),
+            )
+
+        print(f"Scanning for {args.mac}...")
+        device = await BleakScanner.find_device_by_address(
+            args.mac, timeout=args.scan_timeout
+        )
+        if device is None:
+            print(f"Device not found: {args.mac}", file=sys.stderr)
+            return 1
+
+        print(f"Connecting to {args.mac}...")
+        async with BleakClient(device, timeout=args.connect_timeout) as client:
+            await client.start_notify(NOTIFY_CHAR_UUID, notification_handler)
+            await asyncio.sleep(args.settle_seconds)
+
+            for probe_name, payload in probes:
+                active_probe = probe_name
+                dwell = (
+                    args.schedule_capture_seconds
+                    if probe_name == "irrigation_config"
+                    else args.capture_seconds
+                )
+                print(f"Probe {probe_name}: {payload.hex()}")
+                record("TX", probe_name, payload)
+                await client.write_gatt_char(
+                    WRITE_CHAR_UUID, payload, response=False
+                )
+                await asyncio.sleep(dwell)
+
+            active_probe = "teardown"
+            await client.stop_notify(NOTIFY_CHAR_UUID)
+
+    print(f"Capture written to {output_path}")
+    return 0
+
+
+def _replay_status(events: list[dict[str, Any]], *, max_stations: int, verbose: bool) -> bool:
+    payloads = [bytes.fromhex(event["payload_hex"]) for event in events]
+    ok = False
+    for index, payload in enumerate(payloads, start=1):
+        parsed = parse_status_notification(payload, max_station_num=max_stations)
+        if parsed is None:
+            if verbose:
+                print(f"status #{index}: unparsed {payload.hex()}")
+            continue
+        ok = True
+        print(f"status #{index}: {format_status(parsed)}")
+        if verbose:
+            print(f"  raw={payload.hex()}")
+    return ok
+
+
+def _replay_firmware(events: list[dict[str, Any]], *, verbose: bool) -> bool:
+    ok = False
+    for index, event in enumerate(events, start=1):
+        payload = bytes.fromhex(event["payload_hex"])
+        parsed = parse_firmware_version_response(payload)
+        if parsed is None:
+            if verbose:
+                print(f"firmware #{index}: unparsed {payload.hex()}")
+            continue
+        ok = True
+        print(f"firmware #{index}: {parsed['raw_hex']}")
+        if verbose:
+            print(f"  raw={payload.hex()}")
+    return ok
+
+
+def _replay_names(events: list[dict[str, Any]], *, max_stations: int, verbose: bool) -> bool:
+    payloads = [bytes.fromhex(event["payload_hex"]) for event in events]
+    names = _assemble_station_names(payloads, max_stations=max_stations)
+    if verbose:
+        for payload in payloads:
+            print(f"  raw={payload.hex()} | {describe_notification(payload)}")
+    if not names:
+        return False
+    for station in sorted(names):
+        print(f"station {station}: {names[station]!r}")
+    return True
+
+
+def _replay_schedule(events: list[dict[str, Any]], *, max_stations: int, verbose: bool) -> bool:
+    payloads = [bytes.fromhex(event["payload_hex"]) for event in events]
+    if verbose:
+        first_fragments: dict[int, int] = {}
+        for payload in payloads:
+            print(
+                f"  raw={payload.hex()} | "
+                f"{describe_notification(payload, irrigation_first_fragments=first_fragments)}"
+            )
+    programs = assemble_irrigation_programs(payloads, max_stations=max_stations)
+    if not programs:
+        return False
+    _print_programs(programs)
+    return irrigation_config_complete(payloads)
+
+
+def _replay(args: argparse.Namespace) -> int:
+    sections = selected_sections(args.only, include_actions=False)
+    events, used_paths = load_capture_events(args.replay)
+    if not events:
+        paths = ", ".join(str(path) for path in args.replay)
+        print(f"No capture events found in: {paths}", file=sys.stderr)
+        return 1
+
+    source = used_paths[0] if len(used_paths) == 1 else f"{len(used_paths)} files"
+    print(f"Replay from {source} ({len(events)} event(s))")
+    print("-" * 60)
+
+    section_ok: dict[str, bool] = {}
+    if "status" in sections:
+        status_events = [event for event in events if event.get("probe") == "status"]
+        print("[status]")
+        section_ok["status"] = _replay_status(
+            status_events, max_stations=args.max_stations, verbose=args.verbose
+        )
+        print()
+
+    if "firmware" in sections:
+        firmware_events = [event for event in events if event.get("probe") == "firmware"]
+        print("[firmware]")
+        section_ok["firmware"] = _replay_firmware(firmware_events, verbose=args.verbose)
+        print()
+
+    if "names" in sections:
+        name_events = [event for event in events if event.get("probe") == "output_names"]
+        print("[names]")
+        section_ok["names"] = _replay_names(
+            name_events, max_stations=args.max_stations, verbose=args.verbose
+        )
+        print()
+
+    if "schedule" in sections:
+        schedule_events = [
+            event for event in events if event.get("probe") == "irrigation_config"
+        ]
+        print("[schedule]")
+        section_ok["schedule"] = _replay_schedule(
+            schedule_events, max_stations=args.max_stations, verbose=args.verbose
+        )
+        print()
+
+    print("-" * 60)
+    failed = [name for name, ok in section_ok.items() if not ok]
+    if failed:
+        print(f"Result: PARTIAL (failed sections: {', '.join(failed)})")
+        return 1
+    print("Result: ALL SELECTED SECTIONS DECODED")
+    return 0
+
+
+def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Validate and troubleshoot Solem BL-IP BLE library features",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Sections (--only):
+  status     Poll controller state via 3b00 commit
+  firmware   Read identification / firmware version (0f00)
+  names      Read station output names (3500)
+  schedule   Read persisted irrigation programs (3900)
+  gatt       List GATT services and characteristics
+  actions    Manual control writes (requires --actions)
+
+Examples:
+  validate-solem-blip
+  validate-solem-blip --verbose
+  validate-solem-blip --only status --only firmware
+  validate-solem-blip --capture --verbose
+  validate-solem-blip --replay capture.jsonl --only schedule
+  validate-solem-blip --actions --station 1 --minutes 1
+""".strip(),
+    )
+    parser.add_argument(
+        "mac",
+        nargs="?",
+        default=os.environ.get("SOLEM_MAC", DEFAULT_MAC),
+        help=f"Controller MAC (default: {DEFAULT_MAC} or SOLEM_MAC env)",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--capture",
+        nargs="?",
+        const="auto",
+        metavar="PATH",
+        help="Capture raw read-probe notifications to JSONL",
+    )
+    mode.add_argument(
+        "--replay",
+        nargs="+",
+        type=Path,
+        metavar="PATH",
+        help="Replay and decode one or more JSONL captures offline",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        choices=ALL_SECTIONS,
+        dest="only",
+        help="Limit validation to specific section(s); repeatable",
+    )
+    parser.add_argument(
+        "--actions",
+        action="store_true",
+        help="Include manual write/action checks (stop, optional sprinkle test)",
+    )
+    parser.add_argument(
+        "--max-stations",
+        type=int,
+        default=6,
+        help="Configured station count (default: 6)",
+    )
+    parser.add_argument(
+        "--capture-seconds",
+        type=float,
+        default=DEFAULT_CAPTURE_SECONDS,
+        help=f"Capture dwell per probe except schedule (default: {DEFAULT_CAPTURE_SECONDS})",
+    )
+    parser.add_argument(
+        "--schedule-capture-seconds",
+        type=float,
+        default=DEFAULT_SCHEDULE_CAPTURE_SECONDS,
+        help=(
+            "Capture dwell for irrigation_config probe "
+            f"(default: {DEFAULT_SCHEDULE_CAPTURE_SECONDS})"
+        ),
+    )
+    parser.add_argument(
+        "--capture-prefix",
+        default="solem-validate",
+        help="Output filename prefix for --capture (default: solem-validate)",
+    )
+    parser.add_argument(
+        "--settle-seconds",
+        type=float,
+        default=DEFAULT_SETTLE_SECONDS,
+        help=f"Delay after enabling notifications (default: {DEFAULT_SETTLE_SECONDS})",
+    )
+    parser.add_argument(
+        "--scan-timeout",
+        type=float,
+        default=10.0,
+        help="BLE scan timeout in seconds (default: 10)",
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=30.0,
+        help="BLE connection timeout in seconds (default: 30)",
+    )
+    parser.add_argument(
+        "--station",
+        type=int,
+        default=1,
+        help="Station for sprinkle action test (default: 1)",
+    )
+    parser.add_argument(
+        "--minutes",
+        type=int,
+        default=1,
+        help="Minutes for sprinkle action test (default: 1)",
+    )
+    parser.add_argument(
+        "--skip-sprinkle",
+        action="store_true",
+        help="With --actions, only run stop (no sprinkle test)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Include raw notification hex where supported",
+    )
+    return parser
+
+
+async def _async_main(args: argparse.Namespace) -> int:
+    args.mac = args.mac.upper()
+    if args.capture:
+        if args.capture == "auto":
+            args.capture = default_capture_output(args.capture_prefix)
+        else:
+            args.capture = Path(args.capture)
+        return await _capture(args)
+    if args.replay:
+        return _replay(args)
+    return await _run_live(args)
+
+
+def main(default_only: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if default_only and not args.only:
+        args.only = list(default_only)
+    try:
+        return asyncio.run(_async_main(args))
+    except KeyboardInterrupt:
+        print("Validation interrupted", file=sys.stderr)
+        return 130
+    except RetryError as exc:
+        print(f"[FAIL] {_connection_detail(exc)}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,33 @@
+name: Yank contaminated PyPI releases
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  yank:
+    name: Yank releases with scrubbed protocol references
+    runs-on: ubuntu-latest
+    environment: pypi
+
+    steps:
+      - name: Yank 0.1.12 and 0.1.13
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PYPI_TOKEN:-}" ]; then
+            echo "Add PYPI_API_TOKEN to the pypi environment (scope: whole project, incl. yank)."
+            exit 1
+          fi
+          reason="Release contained internal protocol references removed in v0.1.14+."
+          for ver in 0.1.12 0.1.13; do
+            echo "Yanking solem-blip-ble ${ver}..."
+            curl -fsS -X POST \
+              "https://pypi.org/manage/project/solem-blip-ble/release/${ver}/yank/" \
+              -u "__token__:${PYPI_TOKEN}" \
+              -F "reason=${reason}"
+            echo
+          done

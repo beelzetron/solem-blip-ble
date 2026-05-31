@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "solem-blip-ble"
-version = "0.1.15"
+version = "0.1.16"
 description = "BLE client for Solem BL-IP irrigation controllers"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,6 +18,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+validate-solem-schedule-read = "solem_blip_ble.validate_schedule_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

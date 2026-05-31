@@ -9,6 +9,9 @@ from solem_blip_ble.client import SolemClient
 CAPTURE_FIXTURE = (
     Path(__file__).parent / "fixtures" / "solem_metadata_c8b961d44dcc8.jsonl"
 )
+IRRIGATION_CAPTURE_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "solem_irrigation_config_c8b961d44dcc8.jsonl"
+)
 
 
 def _load_capture_notifications(probe: str) -> list[bytes]:
@@ -85,6 +88,21 @@ class CaptureStationNamesBleakClient(FakeBleakClient):
             self.handler(1, bytearray(notification))
 
 
+class CaptureIrrigationConfigBleakClient(FakeBleakClient):
+    async def write_gatt_char(
+        self, _uuid: str, payload: bytes, *, response: bool
+    ) -> None:
+        self.writes.append(payload)
+        assert response is False
+        assert self.handler is not None
+        for line in IRRIGATION_CAPTURE_FIXTURE.read_text().splitlines():
+            if not line:
+                continue
+            event = json.loads(line)
+            if event["probe"] == "irrigation_config" and event["direction"] == "RX":
+                self.handler(1, bytearray.fromhex(event["payload_hex"]))
+
+
 async def test_get_station_name_reads_two_fragments_without_commit(monkeypatch):
     fake_client = FakeBleakClient()
     client = SolemClient("AA:BB:CC:DD:EE:FF", max_station_num=1)
@@ -156,6 +174,26 @@ async def test_get_station_names_from_capture(monkeypatch):
         6: "Stazione 6",
     }
     assert fake_client.writes == [bytes.fromhex("3500")]
+
+
+async def test_get_irrigation_config_from_capture(monkeypatch):
+    fake_client = CaptureIrrigationConfigBleakClient()
+    client = SolemClient("C8:B9:61:D4:4D:C8", max_station_num=12)
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+
+    programs = await client.get_irrigation_config()
+    assert programs[0]["name"] == "Programma A"
+    assert programs[1]["name"] == "Programma B"
+    assert programs[2]["name"] == "Programma C"
+    assert programs[0]["start_times"][0] == 1060
+    assert programs[2]["start_times"][0] == 270
+    assert programs[2]["station_durations"][1:4] == [1500, 1500, 1500]
+    assert fake_client.writes == [bytes.fromhex("3900")]
 
 
 async def test_get_station_names_uses_configured_station_count():

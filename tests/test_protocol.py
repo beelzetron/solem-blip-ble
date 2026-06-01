@@ -141,6 +141,20 @@ def test_parse_status_program_run_uses_0x44():
     assert parsed["remaining_seconds"] == 1500
 
 
+def test_parse_active_program_during_inter_station_idle():
+    """Program index in byte 8 persists when controller is ON but not watering."""
+    data = bytearray(18)
+    data[2] = 0x02
+    data[3] = 0x40
+    data[8] = 1
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["is_watering"] is False
+    assert parsed["active_program"] == 1
+    assert parsed["watering_origin"] == "program"
+    assert parsed["station_num"] is None
+
+
 def test_parse_active_program_from_status_byte_8():
     data = bytearray(18)
     data[2] = 0x02

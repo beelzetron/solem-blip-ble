@@ -174,10 +174,14 @@ def parse_watering_origin(status_byte: int) -> str | None:
 
 
 def parse_active_program(
-    data: bytes | bytearray, *, is_watering: bool
+    data: bytes | bytearray, *, is_controller_on: bool
 ) -> int | None:
-    """Parse active program index (1=A … 3=C) from status byte 8."""
-    if not is_watering or len(data) <= 8:
+    """Parse active program index (1=A … 3=C) from status byte 8.
+
+    Byte 8 remains set while a program run is in progress, including
+    inter-station delays when the controller is ON but not actively watering.
+    """
+    if not is_controller_on or len(data) <= 8:
         return None
     program = data[8]
     if 1 <= program <= IRRIGATION_PROGRAM_COUNT:
@@ -224,7 +228,14 @@ def parse_status_notification(
         remaining_seconds = parse_remaining_seconds(data, station_num)
 
     battery_voltage, battery_level, battery_low = parse_battery_9v(data)
-    active_program = parse_active_program(data, is_watering=is_watering)
+    active_program = parse_active_program(data, is_controller_on=is_on)
+
+    if is_watering:
+        watering_origin = parse_watering_origin(status_byte)
+    elif active_program is not None:
+        watering_origin = "program"
+    else:
+        watering_origin = None
 
     return {
         "controller_state": "On" if is_on else "Off",
@@ -235,9 +246,7 @@ def parse_status_notification(
         "battery_level": battery_level,
         "battery_low": battery_low,
         "active_program": active_program,
-        "watering_origin": parse_watering_origin(status_byte)
-        if is_watering
-        else None,
+        "watering_origin": watering_origin,
     }
 
 

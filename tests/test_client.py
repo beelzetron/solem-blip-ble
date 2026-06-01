@@ -151,6 +151,19 @@ class CaptureStationNamesBleakClient(FakeBleakClient):
             self.handler(1, bytearray(notification))
 
 
+class CapturePartialStationNamesBleakClient(FakeBleakClient):
+    """Deliver name fragments for the first four stations only."""
+
+    async def write_gatt_char(
+        self, _uuid: str, payload: bytes, *, response: bool
+    ) -> None:
+        self.writes.append(payload)
+        assert response is False
+        assert self.handler is not None
+        for notification in _load_capture_notifications("output_names")[:8]:
+            self.handler(1, bytearray(notification))
+
+
 class CaptureIrrigationConfigBleakClient(FakeBleakClient):
     async def write_gatt_char(
         self, _uuid: str, payload: bytes, *, response: bool
@@ -333,6 +346,25 @@ async def test_get_station_names_uses_configured_station_count():
     assert await client.get_station_names() == {
         1: "Station 1",
         2: "Station 2",
+    }
+
+
+async def test_get_station_names_returns_partial_after_idle(monkeypatch):
+    fake_client = CapturePartialStationNamesBleakClient()
+    client = SolemClient("C8:B9:61:D4:4D:C8", max_station_num=6)
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client.STATION_NAMES_IDLE_TIMEOUT", 0.01)
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+
+    assert await client.get_station_names() == {
+        1: "Eleagnus",
+        2: "Stazione 2",
+        3: "Stazione 3",
+        4: "Stazione 4",
     }
 
 

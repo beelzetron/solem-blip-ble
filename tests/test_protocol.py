@@ -120,6 +120,16 @@ def test_parse_ignores_wrong_sequence():
     assert protocol.parse_status_notification(data) is None
 
 
+def test_parse_period_start_date_from_header_bytes():
+    from datetime import date
+
+    normalized = bytearray(20)
+    normalized[12] = 1
+    normalized[13] = 6
+    normalized[14:16] = b"\x07\xea"
+    assert protocol.parse_period_start_date(normalized) == date(2026, 6, 1)
+
+
 def test_parse_status_program_run_uses_0x44():
     # Hardware capture after run_program A: 0x44 + byte8=1 + 1500s remaining
     data = bytearray.fromhex("32100244006aaaaa01014f101005dc100000")

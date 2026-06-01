@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, TypedDict
 
 from .const import (
@@ -377,6 +377,7 @@ class IrrigationProgram(TypedDict):
     week_days: int
     period_length: int
     synchro_day: int
+    period_start_date: date | None
     start_times: list[int | None]
     station_durations: list[int]
 
@@ -412,6 +413,21 @@ def _parse_config_int3(b0: int, b1: int, b2: int) -> int:
     return (b0 << 16) | (b1 << 8) | b2
 
 
+def parse_period_start_date(normalized: bytes | bytearray) -> date | None:
+    """Parse program period start date from header bytes 12-15 (day, month, year BE)."""
+    if len(normalized) < 16:
+        return None
+    day = normalized[12]
+    month = normalized[13]
+    year = struct.unpack(">H", normalized[14:16])[0]
+    if not (2000 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
 def _empty_irrigation_program(*, max_stations: int) -> IrrigationProgram:
     return {
         "name": "",
@@ -421,6 +437,7 @@ def _empty_irrigation_program(*, max_stations: int) -> IrrigationProgram:
         "week_days": 0,
         "period_length": 0,
         "synchro_day": 0,
+        "period_start_date": None,
         "start_times": [None] * 8,
         "station_durations": [0] * max_stations,
     }
@@ -497,6 +514,7 @@ def _apply_irrigation_chunk(
         program["period_length"] = normalized[10]
         if len(normalized) > 11:
             program["synchro_day"] = normalized[11]
+        program["period_start_date"] = parse_period_start_date(normalized)
         return name_part_1
 
     if logical_chunk == 3:

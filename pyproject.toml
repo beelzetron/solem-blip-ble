@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "solem-blip-ble"
-version = "0.1.20"
+version = "0.1.21"
 description = "BLE client for Solem BL-IP irrigation controllers"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+dev = ["build>=1.2", "mypy>=1.13", "pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 validate-solem-blip = "solem_blip_ble.validate:main"
@@ -25,6 +25,21 @@ validate-solem-schedule-read = "solem_blip_ble.validate_schedule:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+solem_blip_ble = ["py.typed"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unused_configs = true
+warn_unused_ignores = true
+files = ["src/solem_blip_ble"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

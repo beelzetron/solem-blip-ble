@@ -364,8 +364,9 @@ Readback details:
 - chunks `4-6` decode durations as 3-byte big-endian integers
 - a start time `>= 1440` becomes disabled (`-1`)
 
-Bytes `12-15` on the header chunk are the device RTC snapshot at read time, not
-part of the schedule definition.
+Bytes `12-15` on the header chunk store the **period start date** when the program
+is written (day-of-month, month `1-12`, year big-endian). On readback they reflect
+the configured start date for cycle 4 (“every N days” from that anchor).
 
 ### Station Name / Program Mapping Compatibility Path
 

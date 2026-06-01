@@ -2,6 +2,8 @@
 
 from datetime import datetime
 
+import pytest
+
 from solem_blip_ble import protocol
 
 
@@ -32,10 +34,28 @@ def test_pack_turn_off():
     assert protocol.pack_turn_off_permanent() == bytes.fromhex("3105c000000000")
 
 
-def test_pack_turn_off_x_days_clamped_to_15():
+def test_pack_turn_off_x_days():
     assert protocol.pack_turn_off_x_days(3) == bytes.fromhex("3105c000030000")
-    # pcman75 documents max 15 days
-    assert protocol.pack_turn_off_x_days(99) == bytes.fromhex("3105c0000f0000")
+
+
+@pytest.mark.parametrize(
+    ("packer", "args"),
+    [
+        (protocol.pack_sprinkle_station, (0, 1)),
+        (protocol.pack_sprinkle_station, (9, 1)),
+        (protocol.pack_sprinkle_station, (1, 0)),
+        (protocol.pack_sprinkle_station, (1, 241)),
+        (protocol.pack_sprinkle_all_stations, (0,)),
+        (protocol.pack_sprinkle_all_stations, (241,)),
+        (protocol.pack_run_program, (0,)),
+        (protocol.pack_run_program, (4,)),
+        (protocol.pack_turn_off_x_days, (-1,)),
+        (protocol.pack_turn_off_x_days, (16,)),
+    ],
+)
+def test_write_packers_reject_out_of_range_values(packer, args):
+    with pytest.raises(ValueError):
+        packer(*args)
 
 
 def test_pack_commit():

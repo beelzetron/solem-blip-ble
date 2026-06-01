@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from solem_blip_ble import protocol
 
@@ -41,7 +42,7 @@ class StepResult:
     name: str
     ok: bool
     detail: str = ""
-    data: dict[str, Any] | None = None
+    data: Mapping[Any, Any] | None = None
 
 
 @dataclass
@@ -170,7 +171,7 @@ def load_capture_events(
     return events, used_paths
 
 
-def write_capture_event(output, event: CaptureEvent, *, verbose: bool) -> None:
+def write_capture_event(output: TextIO, event: CaptureEvent, *, verbose: bool) -> None:
     output.write(json.dumps(asdict(event), sort_keys=True) + "\n")
     output.flush()
     if verbose or event.direction == "TX":
@@ -188,7 +189,7 @@ def format_minutes(minutes: int | None) -> str:
     return f"{hour:02d}:{minute:02d}"
 
 
-def format_status(status: dict[str, Any]) -> str:
+def format_status(status: Mapping[str, Any]) -> str:
     parts = [
         f"controller={status.get('controller_state')}",
         f"watering={status.get('is_watering')}",

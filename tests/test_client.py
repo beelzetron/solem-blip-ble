@@ -460,6 +460,105 @@ async def test_operation_timeout_releases_lock(monkeypatch) -> None:
     assert await client._run_with_client(ok) == "ok"
 
 
+async def test_operation_timeout_releases_lock_when_disconnect_resists_cancellation(
+    monkeypatch,
+) -> None:
+    """Hung disconnect cleanup cannot retain the operation lock."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+    disconnect_cancelled = asyncio.Event()
+    release_disconnect = asyncio.Event()
+
+    async def disconnect():
+        try:
+            await asyncio.sleep(100)
+        except asyncio.CancelledError:
+            disconnect_cancelled.set()
+            await release_disconnect.wait()
+
+    async def get_connected_client():
+        return fake_client
+
+    async def hang(_client):
+        await asyncio.sleep(100)
+
+    async def ok(_client):
+        return "ok"
+
+    fake_client.disconnect = disconnect
+    client._client = fake_client
+    monkeypatch.setattr(client, "_get_connected_client", get_connected_client)
+    monkeypatch.setattr("solem_blip_ble.client.OPERATION_TIMEOUT", 0.05)
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_TIMEOUT", 0.01)
+
+    with pytest.raises(SolemConnectionError, match="timed out"):
+        await client._run_with_client(hang)
+
+    await disconnect_cancelled.wait()
+    assert await client._run_with_client(ok) == "ok"
+    release_disconnect.set()
+
+
+async def test_external_cancellation_releases_lock_when_disconnect_hangs(
+    monkeypatch,
+) -> None:
+    """HA-style wait_for cancellation cannot wedge later operations."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+    disconnect_cancelled = asyncio.Event()
+    release_disconnect = asyncio.Event()
+
+    async def disconnect():
+        try:
+            await asyncio.sleep(100)
+        except asyncio.CancelledError:
+            disconnect_cancelled.set()
+            await release_disconnect.wait()
+
+    async def get_connected_client():
+        return fake_client
+
+    async def hang(_client):
+        await asyncio.sleep(100)
+
+    async def ok(_client):
+        return "ok"
+
+    fake_client.disconnect = disconnect
+    client._client = fake_client
+    monkeypatch.setattr(client, "_get_connected_client", get_connected_client)
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_TIMEOUT", 0.01)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(client._run_with_client(hang), timeout=0.05)
+
+    await disconnect_cancelled.wait()
+    assert await client._run_with_client(ok) == "ok"
+    release_disconnect.set()
+
+
+async def test_disconnect_is_bounded_when_cleanup_hangs(monkeypatch) -> None:
+    """Explicit disconnect returns after the cleanup deadline."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+    release_disconnect = asyncio.Event()
+
+    async def disconnect():
+        try:
+            await asyncio.sleep(100)
+        except asyncio.CancelledError:
+            await release_disconnect.wait()
+
+    fake_client.disconnect = disconnect
+    client._client = fake_client
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_TIMEOUT", 0.01)
+
+    await asyncio.wait_for(client.disconnect(), timeout=0.05)
+
+    assert client._client is None
+    release_disconnect.set()
+
+
 async def test_resolver_does_not_fall_back_to_standalone_scanner(monkeypatch):
     client = SolemClient(
         "AA:BB:CC:DD:EE:FF",

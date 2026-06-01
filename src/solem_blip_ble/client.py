@@ -38,6 +38,7 @@ from tenacity import (
 from .const import (
     COMMIT_COMMAND,
     DEFAULT_BLUETOOTH_TIMEOUT,
+    DISCONNECT_TIMEOUT,
     MAX_STATION_NUM,
     NOTIFY_CHAR_UUID,
     NOTIFY_PARTIAL_RETRY_DELAY,
@@ -59,6 +60,14 @@ from . import protocol
 _LOGGER = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    """Observe a detached cleanup task exception after cancellation."""
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
 
 
 class SolemClient:
@@ -157,8 +166,28 @@ class SolemClient:
         self._client = None
         if client is None:
             return
+        disconnect_task = asyncio.ensure_future(client.disconnect())
         try:
-            await client.disconnect()
+            done, _ = await asyncio.wait(
+                {disconnect_task},
+                timeout=DISCONNECT_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            disconnect_task.cancel()
+            disconnect_task.add_done_callback(_consume_task_exception)
+            raise
+
+        if disconnect_task not in done:
+            _LOGGER.warning(
+                "%s - Timed out disconnecting BLE client",
+                self.mac_address,
+            )
+            disconnect_task.cancel()
+            disconnect_task.add_done_callback(_consume_task_exception)
+            return
+
+        try:
+            await disconnect_task
         except Exception:
             pass
 

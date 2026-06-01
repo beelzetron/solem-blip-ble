@@ -11,7 +11,6 @@ from typing import Any, TextIO
 
 from solem_blip_ble import protocol
 
-DEFAULT_MAC = "C8:B9:61:D4:4D:C8"
 WRITE_CHAR_UUID = "108b0002-eab5-bc09-d0ea-0b8f467ce8ee"
 NOTIFY_CHAR_UUID = "108b0003-eab5-bc09-d0ea-0b8f467ce8ee"
 DEFAULT_SETTLE_SECONDS = 0.5
@@ -19,7 +18,10 @@ DEFAULT_CAPTURE_SECONDS = 5.0
 DEFAULT_SCHEDULE_CAPTURE_SECONDS = 15.0
 
 READ_SECTIONS = ("status", "firmware", "names", "schedule", "gatt")
-ALL_SECTIONS = READ_SECTIONS + ("actions",)
+ACTION_SECTIONS = ("actions",)
+ALL_SECTIONS = READ_SECTIONS + ACTION_SECTIONS
+PROGRAM_LABELS = ("A", "B", "C")
+DEFAULT_ACTION_LISTEN_BUFFER_SECONDS = 5.0
 
 IRRIGATION_CHUNK_NAMES = {
     0: "name_part_1",
@@ -78,6 +80,52 @@ def selected_sections(
     return READ_SECTIONS
 
 
+def action_capture_writes(
+    *,
+    run_program: int | None = None,
+    station: int = 1,
+    minutes: int = 1,
+) -> list[tuple[str, bytes]]:
+    """BLE writes for action capture: cleanup, start watering, final stop."""
+    if run_program is not None:
+        if not 1 <= run_program <= len(PROGRAM_LABELS):
+            raise ValueError(f"run_program must be between 1 and {len(PROGRAM_LABELS)}")
+        start_label = f"run_program_{PROGRAM_LABELS[run_program - 1].lower()}"
+        start_command = protocol.pack_run_program(run_program)
+    else:
+        if not 1 <= station <= protocol.MAX_STATION_NUM:
+            raise ValueError(
+                f"station must be between 1 and {protocol.MAX_STATION_NUM}"
+            )
+        if not 1 <= minutes <= 240:
+            raise ValueError("minutes must be between 1 and 240")
+        start_label = f"sprinkle_station_{station}"
+        start_command = protocol.pack_sprinkle_station(station, minutes)
+
+    return [
+        ("stop_manual_command", protocol.pack_stop_manual_sprinkle()),
+        ("stop_manual_commit", protocol.pack_commit()),
+        (f"{start_label}_command", start_command),
+        (f"{start_label}_commit", protocol.pack_commit()),
+        ("stop_after_command", protocol.pack_stop_manual_sprinkle()),
+        ("stop_after_commit", protocol.pack_commit()),
+    ]
+
+
+def action_listen_dwell_seconds(
+    probe_name: str,
+    *,
+    minutes: int,
+    capture_seconds: float,
+) -> float:
+    """Return how long to record notifications after a start commit."""
+    if probe_name.endswith("_commit") and (
+        probe_name.startswith("run_program_") or probe_name.startswith("sprinkle_station_")
+    ):
+        return max(float(minutes * 60) + DEFAULT_ACTION_LISTEN_BUFFER_SECONDS, capture_seconds)
+    return capture_seconds
+
+
 def capture_probes(sections: tuple[str, ...]) -> list[tuple[str, bytes]]:
     probes: list[tuple[str, bytes]] = []
     if "status" in sections:
@@ -133,10 +181,18 @@ def describe_notification(
         )
     status = protocol.parse_status_notification(payload)
     if status is not None:
-        return (
-            f"status controller={status['controller_state']} "
-            f"watering={status['is_watering']} station={status.get('station_num')}"
-        )
+        parts = [
+            f"status controller={status['controller_state']}",
+            f"watering={status['is_watering']}",
+            f"station={status.get('station_num')}",
+        ]
+        if status.get("active_program") is not None:
+            parts.append(f"program={status['active_program']}")
+        if status.get("watering_origin") is not None:
+            parts.append(f"origin={status['watering_origin']}")
+        if status.get("remaining_seconds") is not None:
+            parts.append(f"remaining={status['remaining_seconds']}s")
+        return " ".join(parts)
     if len(payload) >= 3 and payload[2] in (0x00, 0x01, 0x02):
         return f"notify seq=0x{payload[2]:02x}"
     if probe:
@@ -196,6 +252,10 @@ def format_status(status: Mapping[str, Any]) -> str:
     ]
     if status.get("station_num") is not None:
         parts.append(f"station={status.get('station_num')}")
+    if status.get("active_program") is not None:
+        parts.append(f"program={status['active_program']}")
+    if status.get("watering_origin") is not None:
+        parts.append(f"origin={status['watering_origin']}")
     if status.get("remaining_seconds") is not None:
         parts.append(f"remaining={status.get('remaining_seconds')}s")
     if status.get("battery_voltage") is not None:

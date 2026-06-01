@@ -6,7 +6,7 @@ This document captures the discovered BLE protocol for the Solem BL-IP irrigatio
 
 **Device:** Solem BL-IP (4- and 6-station models tested)  
 **Controller Software Version:** 5.1.5  
-**MAC Address:** C8:B9:61:D4:4D:C8 (example)
+**MAC Address:** device-specific (pass on the CLI, e.g. `AA:BB:CC:DD:EE:FF`)
 
 ---
 
@@ -359,13 +359,13 @@ Readback details:
   - byte `8`: `cycle`
   - byte `9`: `weekDays`
   - byte `10`: `periodLength`
+  - byte `11`: `synchroDay` (periodic phase anchor for cycle 4)
 - chunk `3` reads all 8 start times from bytes `4-19`
 - chunks `4-6` decode durations as 3-byte big-endian integers
 - a start time `>= 1440` becomes disabled (`-1`)
 
-Notably, the V5 reader does not currently restore `synchroDay` from program
-config readback; it only restores `periodLength`. The writer still sends
-`synchroDay` in the header frame.
+Bytes `12-15` on the header chunk are the device RTC snapshot at read time, not
+part of the schedule definition.
 
 ### Station Name / Program Mapping Compatibility Path
 
@@ -424,6 +424,7 @@ Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
 | 2 | Sequence | `0x02` = Full data, `0x01` = Intermediate, `0x00` = Final |
 | 3 | **Status** | Controller state flags (see below) |
 | 4-7 | Station Data | Pattern `0x00aaaaaa` when active, `0x00000000` when idle |
+| 8 | **Active program** | 1-based index while a program runs: `1` = A, `2` = B, `3` = C, `0` = none (station-only manual) |
 | 9 | **Station Number** | Active station (1-6), 0 when idle |
 | 10 | **Battery Voltage** | Raw 9 V reading (status notification, byte 10) |
 | 13-14 | **Remaining Time** | Big-endian uint16, seconds remaining (only meaningful when watering) |
@@ -435,14 +436,16 @@ Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
 | Value | Binary | Controller | Watering | Description |
 |-------|--------|------------|----------|-------------|
 | `0x40` | `01000000` | ON | IDLE | Controller ON, no active watering |
-| `0x42` | `01000010` | ON | ACTIVE | Controller ON, actively watering |
+| `0x42` | `01000010` | ON | ACTIVE | Controller ON, manual/station watering |
+| `0x44` | `01000100` | ON | ACTIVE | Controller ON, program run (byte 8 = program 1–3) |
 | `0x02` | `00000010` | OFF | ACTIVE | Controller OFF, manual watering active |
 | `0x00` | `00000000` | OFF | IDLE | Controller OFF, idle |
 | `0x10` | `00010000` | - | - | Intermediate response (no state) |
 
 **Bit Flags:**
 - **Bit 6 (0x40)**: Controller permanent state (ON/OFF)
-- **Bit 1 (0x02)**: Active watering flag
+- **Bit 1 (0x02)**: Manual / station watering active
+- **Bit 2 (0x04)**: Program run active (often `0x44` with controller ON)
 
 ---
 
@@ -452,7 +455,7 @@ Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
 ```python
 status_byte = notification[3]
 is_controller_on = bool(status_byte & 0x40)
-is_watering = bool(status_byte & 0x02)
+is_watering = bool(status_byte & 0x06)  # 0x02 manual, 0x04 program
 
 controller_state = "On" if is_controller_on else "Off"
 ```
@@ -471,7 +474,7 @@ import struct
 remaining_seconds = parse_remaining_seconds(notification, station_num)
 ```
 
-Only parse when the watering flag is set (`status_byte & 0x02`). Ignore values outside a sane range (e.g. 1–14400 seconds).
+Only parse when a watering flag is set (`status_byte & 0x06`). Ignore values outside a sane range (e.g. 1–14400 seconds).
 
 ### Battery (9 V)
 
@@ -562,7 +565,7 @@ async def get_status(self) -> dict:
         
         return {
             "controller_state": "On" if status_byte & 0x40 else "Off",
-            "is_watering": bool(status_byte & 0x02),
+            "is_watering": bool(status_byte & 0x06),
             "station_num": data[9] if 1 <= data[9] <= 6 else None,
             "remaining_seconds": struct.unpack(">H", data[13:15])[0],
             "battery_voltage": data[10] or None,

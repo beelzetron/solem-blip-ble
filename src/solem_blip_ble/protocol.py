@@ -230,6 +230,7 @@ def parse_status_notification(
     battery_voltage, battery_level, battery_low = parse_battery_9v(data)
     active_program = parse_active_program(data, is_controller_on=is_on)
 
+    watering_origin: str | None
     if is_watering:
         if active_program is not None or bool(status_byte & 0x04):
             watering_origin = "program"

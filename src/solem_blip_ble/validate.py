@@ -8,6 +8,7 @@ import importlib.metadata
 import os
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -116,10 +117,10 @@ def _assemble_station_names(payloads: list[bytes], *, max_stations: int) -> dict
             continue
         station = parsed["station"]
         fragments.setdefault(station, {})[parsed["sequence"]] = parsed["name_bytes"]
-        if parsed["sequence"] == 0:
+        if parsed["sequence"] == 0 and fragments[station].keys() >= {0, 1}:
             station_fragments = fragments[station]
             station_names[station] = (
-                station_fragments.get(1, b"") + station_fragments[0]
+                station_fragments[1] + station_fragments[0]
             ).decode("utf-8", errors="replace")
     return station_names
 
@@ -266,7 +267,7 @@ async def _run_action_checks(
         return
 
     step = StepResult(f"sprinkle_station_{station}_for_{minutes}_minutes", False)
-    command_status: dict[str, Any] | None = None
+    command_status: Mapping[str, Any] | None = None
     try:
         command_status = await client.sprinkle_station_x_for_y_minutes(station, minutes)
         step.ok = True

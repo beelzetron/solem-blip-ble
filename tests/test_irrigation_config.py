@@ -153,3 +153,19 @@ def test_irrigation_config_complete():
     full_payloads = payloads + _program_c_fragments()
     assert protocol.irrigation_program_has_final_chunk(full_payloads, 2)
     assert protocol.irrigation_config_complete(full_payloads)
+
+
+def test_irrigation_config_incomplete_when_middle_chunk_is_missing():
+    payloads = _program_a_fragments() + _program_b_fragments() + _program_c_fragments()
+    payloads.remove(_program_a_fragments()[3])
+
+    assert not protocol.irrigation_program_has_final_chunk(payloads, 0)
+    assert not protocol.irrigation_config_complete(payloads)
+
+
+def test_irrigation_config_incomplete_when_chunk_is_undersized():
+    payloads = _program_a_fragments() + _program_b_fragments() + _program_c_fragments()
+    payloads[payloads.index(_program_a_fragments()[3])] = _program_a_fragments()[3][:-1]
+
+    assert not protocol.irrigation_program_has_final_chunk(payloads, 0)
+    assert not protocol.irrigation_config_complete(payloads)

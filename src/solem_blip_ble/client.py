@@ -15,7 +15,7 @@ from bleak.exc import BleakDBusError
 try:
     from bleak.exc import BleakGATTProtocolError
 except ImportError:  # bleak < 3.0 (Home Assistant core ships 2.x)
-    BleakGATTProtocolError = BleakDBusError
+    BleakGATTProtocolError = BleakDBusError  # type: ignore[misc, assignment]
 
 _BLE_GATT_ERRORS: tuple[type[Exception], ...] = (
     BleakGATTProtocolError,
@@ -219,7 +219,7 @@ class SolemClient:
     async def _start_notify(
         self,
         client: BleakClient,
-        handler: Callable[[int, bytearray], None],
+        handler: Callable[[Any, bytearray], None],
     ) -> None:
         """Subscribe to status notifications with settle time and retries."""
         last_exc: Exception | None = None
@@ -250,10 +250,10 @@ class SolemClient:
     async def _execute_command(
         self,
         command: bytes,
-    ) -> dict[str, Any] | None:
+    ) -> protocol.SolemStatus | None:
         """Send command + commit and wait for device notification ack."""
         response_event = asyncio.Event()
-        last_status: dict[str, Any] | None = None
+        last_status: protocol.SolemStatus | None = None
 
         def notification_handler(_sender: int, data: bytearray) -> None:
             nonlocal last_status
@@ -270,9 +270,10 @@ class SolemClient:
                 data[2],
                 bytes(data).hex(),
             )
-            response_event.set()
+            if data[2] == 0x00:
+                response_event.set()
 
-        async def _op(client: BleakClient) -> dict[str, Any] | None:
+        async def _op(client: BleakClient) -> protocol.SolemStatus | None:
             await self._start_notify(client, notification_handler)
             await asyncio.sleep(NOTIFY_SETTLE_DELAY)
             await self._ensure_connected(client, phase="command")
@@ -296,7 +297,7 @@ class SolemClient:
 
         return await self._run_with_client(_op)
 
-    async def _write_and_commit(self, command: bytes) -> dict[str, Any] | None:
+    async def _write_and_commit(self, command: bytes) -> protocol.SolemStatus | None:
         return await self._execute_command(command)
 
     async def connect(self) -> None:
@@ -509,10 +510,10 @@ class SolemClient:
                     parsed["sequence"],
                     bytes(data).hex(),
                 )
-                if parsed["sequence"] == 0:
+                if parsed["sequence"] == 0 and fragments[station].keys() >= {0, 1}:
                     station_fragments = fragments[station]
                     station_names[station] = (
-                        station_fragments.get(1, b"") + station_fragments[0]
+                        station_fragments[1] + station_fragments[0]
                     ).decode("utf-8", errors="replace")
                     if len(station_names) == self.max_station_num:
                         name_event.set()
@@ -652,14 +653,14 @@ class SolemClient:
 
     async def sprinkle_station_x_for_y_minutes(
         self, station: int, minutes: int
-    ) -> dict[str, Any] | None:
+    ) -> protocol.SolemStatus | None:
         if self.mock:
             return None
         return await self._write_and_commit(
             protocol.pack_sprinkle_station(station, minutes)
         )
 
-    async def sprinkle_all_stations_for_y_minutes(self, minutes: int) -> dict[str, Any] | None:
+    async def sprinkle_all_stations_for_y_minutes(self, minutes: int) -> protocol.SolemStatus | None:
         if self.mock:
             return None
         return await self._write_and_commit(

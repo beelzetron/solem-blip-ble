@@ -8,6 +8,7 @@ live BL-IP testing documented in docs/ble_protocol.md in this repository.
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, TypedDict
 
@@ -43,13 +44,15 @@ def pack_turn_off_permanent() -> bytes:
 
 
 def pack_turn_off_x_days(days: int) -> bytes:
-    days = max(0, min(days, MAX_TURN_OFF_DAYS))
+    if not 0 <= days <= MAX_TURN_OFF_DAYS:
+        raise ValueError(f"days must be between 0 and {MAX_TURN_OFF_DAYS}")
     return struct.pack(">HBBBH", 0x3105, 0xC0, 0x00, days & 0xFF, 0x0000)
 
 
 def _pack_v5_duration_command(opcode: int, station: int, seconds: int) -> bytes:
     """Pack a V5 duration command (3-byte big-endian duration in seconds)."""
-    seconds = max(1, min(seconds, 0xFFFFFF))
+    if not 1 <= seconds <= 0xFFFFFF:
+        raise ValueError("seconds must be between 1 and 16777215")
     return bytes(
         [
             0x31,
@@ -64,18 +67,24 @@ def _pack_v5_duration_command(opcode: int, station: int, seconds: int) -> bytes:
 
 
 def pack_sprinkle_station(station: int, minutes: int) -> bytes:
-    station = max(1, min(station, MAX_STATION_NUM))
-    seconds = max(1, min(minutes, 240)) * 60
+    if not 1 <= station <= MAX_STATION_NUM:
+        raise ValueError(f"station must be between 1 and {MAX_STATION_NUM}")
+    if not 1 <= minutes <= 240:
+        raise ValueError("minutes must be between 1 and 240")
+    seconds = minutes * 60
     return _pack_v5_duration_command(0x12, station, seconds)
 
 
 def pack_sprinkle_all_stations(minutes: int) -> bytes:
-    seconds = max(1, min(minutes, 240)) * 60
+    if not 1 <= minutes <= 240:
+        raise ValueError("minutes must be between 1 and 240")
+    seconds = minutes * 60
     return _pack_v5_duration_command(0x11, 0, seconds)
 
 
 def pack_run_program(program: int) -> bytes:
-    program = max(1, min(program, 3))
+    if not 1 <= program <= 3:
+        raise ValueError("program must be between 1 and 3")
     return struct.pack(">HBBBH", 0x3105, 0x14, 0x00, program & 0xFF, 0x0000)
 
 
@@ -316,6 +325,7 @@ def parse_firmware_version_response(data: bytes | bytearray) -> FirmwareVersion 
 IRRIGATION_PROGRAM_CLASS = 0x1
 IRRIGATION_PROGRAM_COUNT = 3
 IRRIGATION_LOGICAL_CHUNKS = 7
+IRRIGATION_CHUNK_MIN_LENGTHS = (20, 20, 11, 20, 19, 19, 10)
 DISABLED_START_TIME = 1440
 
 
@@ -405,6 +415,11 @@ def parse_irrigation_config_fragment(
     )
     if first_fragment_id is not None and not 0 <= logical_chunk < IRRIGATION_LOGICAL_CHUNKS:
         return None
+    if (
+        first_fragment_id is not None
+        and len(normalized) < IRRIGATION_CHUNK_MIN_LENGTHS[logical_chunk]
+    ):
+        return None
 
     return {
         "program_index": program_index,
@@ -472,7 +487,7 @@ def _apply_irrigation_chunk(
 
 
 def assemble_irrigation_programs(
-    payloads: list[bytes | bytearray],
+    payloads: Sequence[bytes | bytearray],
     *,
     max_stations: int = MAX_STATION_NUM,
 ) -> dict[int, IrrigationProgram]:
@@ -497,13 +512,15 @@ def assemble_irrigation_programs(
         name_part_1: bytes | None = None
 
         for normalized in sorted(fragments, key=lambda item: item[2], reverse=True):
-            logical_chunk = first_fragment_id - normalized[2]
-            if not 0 <= logical_chunk < IRRIGATION_LOGICAL_CHUNKS:
+            parsed = parse_irrigation_config_fragment(
+                normalized, first_fragment_id=first_fragment_id
+            )
+            if parsed is None:
                 continue
             name_part_1 = _apply_irrigation_chunk(
                 program,
                 normalized,
-                logical_chunk,
+                parsed["logical_chunk"],
                 max_stations=max_stations,
                 name_part_1=name_part_1,
             )
@@ -513,11 +530,11 @@ def assemble_irrigation_programs(
     return programs
 
 
-def irrigation_program_has_final_chunk(
-    payloads: list[bytes | bytearray],
+def irrigation_program_complete(
+    payloads: Sequence[bytes | bytearray],
     program_index: int,
 ) -> bool:
-    """Return True when ``program_index`` includes the last logical chunk."""
+    """Return True when ``program_index`` includes every valid logical chunk."""
     fragments: list[bytes] = []
     for payload in payloads:
         normalized = normalize_config_notification(payload)
@@ -533,16 +550,34 @@ def irrigation_program_has_final_chunk(
         return False
 
     first_fragment_id = max(fragment[2] for fragment in fragments)
-    return any(first_fragment_id - fragment[2] == 6 for fragment in fragments)
+    logical_chunks = {
+        parsed["logical_chunk"]
+        for fragment in fragments
+        if (
+            parsed := parse_irrigation_config_fragment(
+                fragment, first_fragment_id=first_fragment_id
+            )
+        )
+        is not None
+    }
+    return logical_chunks == set(range(IRRIGATION_LOGICAL_CHUNKS))
+
+
+def irrigation_program_has_final_chunk(
+    payloads: Sequence[bytes | bytearray],
+    program_index: int,
+) -> bool:
+    """Backward-compatible alias for complete irrigation-program validation."""
+    return irrigation_program_complete(payloads, program_index)
 
 
 def irrigation_config_complete(
-    payloads: list[bytes | bytearray],
+    payloads: Sequence[bytes | bytearray],
     *,
     program_count: int = IRRIGATION_PROGRAM_COUNT,
 ) -> bool:
-    """Return True when all expected irrigation programs include chunk 6."""
+    """Return True when all expected irrigation programs are complete."""
     return all(
-        irrigation_program_has_final_chunk(payloads, program_index)
+        irrigation_program_complete(payloads, program_index)
         for program_index in range(program_count)
     )

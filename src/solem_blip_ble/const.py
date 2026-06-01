@@ -11,6 +11,7 @@ DEFAULT_MAX_STATION_NUM = MAX_STATION_NUM
 
 # BLE timing from observed controller behavior during hardware validation.
 DEFAULT_BLUETOOTH_TIMEOUT = 30.0
+OPERATION_TIMEOUT = 45.0
 SCAN_DURATION = 10.0
 SCAN_PAUSE = 1.0
 SCAN_MAX_ROUNDS = 3

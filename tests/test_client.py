@@ -437,6 +437,29 @@ async def test_disconnect_waits_for_active_operation(monkeypatch):
     assert fake_client.disconnect_called is True
 
 
+async def test_operation_timeout_releases_lock(monkeypatch) -> None:
+    """Hung BLE operations time out and release the operation lock."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+
+    async def get_connected_client():
+        return fake_client
+
+    async def hang(_client):
+        await asyncio.sleep(100)
+
+    monkeypatch.setattr(client, "_get_connected_client", get_connected_client)
+    monkeypatch.setattr("solem_blip_ble.client.OPERATION_TIMEOUT", 0.05)
+
+    with pytest.raises(SolemConnectionError, match="timed out"):
+        await client._run_with_client(hang)
+
+    async def ok(_client):
+        return "ok"
+
+    assert await client._run_with_client(ok) == "ok"
+
+
 async def test_resolver_does_not_fall_back_to_standalone_scanner(monkeypatch):
     client = SolemClient(
         "AA:BB:CC:DD:EE:FF",

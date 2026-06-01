@@ -33,10 +33,13 @@ from solem_blip_ble.validate_common import (
     DEFAULT_SCHEDULE_CAPTURE_SECONDS,
     DEFAULT_SETTLE_SECONDS,
     NOTIFY_CHAR_UUID,
+    PROGRAM_LABELS,
     READ_SECTIONS,
     WRITE_CHAR_UUID,
     CaptureEvent,
     StepResult,
+    action_capture_writes,
+    action_listen_dwell_seconds,
     capture_probes,
     default_capture_output,
     describe_notification,
@@ -53,8 +56,13 @@ try:
 except ImportError:  # pragma: no cover
     RetryError = Exception  # type: ignore[misc, assignment]
 
-PROGRAM_LABELS = ("A", "B", "C")
 SPRINKLE_VERIFY_TIMEOUT = 60.0
+ACTION_PROBE_PREFIXES = (
+    "stop_manual",
+    "run_program_",
+    "sprinkle_station_",
+    "stop_after",
+)
 
 
 def _connection_detail(exc: BaseException) -> str:
@@ -92,6 +100,7 @@ def _print_program(program_index: int, program: IrrigationProgram) -> None:
         f" cycle={program['cycle']}"
         f" week_days=0x{program['week_days']:02x}"
         f" period={program['period_length']}"
+        f" synchro_day={program['synchro_day']}"
     )
     start_times = ", ".join(format_minutes(minutes) for minutes in program["start_times"])
     print(f"  start_times: {start_times}")
@@ -139,6 +148,26 @@ async def _wait_for_watering(
             return status
         await asyncio.sleep(2.0)
     return None
+
+
+async def _wait_for_program_watering(
+    client: SolemClient,
+    *,
+    program: int,
+    timeout: float,
+    verbose: bool,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = await client.get_status(include_raw=verbose)
+        if status.get("is_watering") and status.get("active_program") == program:
+            return status
+        await asyncio.sleep(2.0)
+    return None
+
+
+def _is_action_capture_probe(probe: str) -> bool:
+    return any(probe.startswith(prefix) for prefix in ACTION_PROBE_PREFIXES)
 
 
 async def _run_status_checks(
@@ -248,6 +277,7 @@ async def _run_action_checks(
     *,
     station: int,
     minutes: int,
+    run_program: int | None,
     skip_sprinkle: bool,
     verbose: bool,
 ) -> None:
@@ -260,10 +290,56 @@ async def _run_action_checks(
         step.detail = _connection_detail(exc)
     report.append(step)
 
-    if skip_sprinkle:
+    if skip_sprinkle and run_program is None:
         report.append(
             StepResult("sprinkle test", True, detail="Skipped (--skip-sprinkle)")
         )
+        return
+
+    if run_program is not None:
+        label = PROGRAM_LABELS[run_program - 1]
+        step = StepResult(f"run_program_{label.lower()}", False)
+        try:
+            await client.run_program_x(run_program)
+            step.ok = True
+            step.detail = "Command sent"
+        except (SolemConnectionError, RetryError) as exc:
+            step.detail = _connection_detail(exc)
+        report.append(step)
+        if not step.ok:
+            return
+
+        step = StepResult("verify program watering status", False)
+        try:
+            status = await _wait_for_program_watering(
+                client,
+                program=run_program,
+                timeout=SPRINKLE_VERIFY_TIMEOUT,
+                verbose=verbose,
+            )
+            if status is None:
+                step.detail = (
+                    f"Timed out waiting for program {label} "
+                    f"(active_program={run_program}) to report watering"
+                )
+            else:
+                step.ok = True
+                step.data = status
+        except (SolemConnectionError, RetryError) as exc:
+            step.detail = _connection_detail(exc)
+        report.append(step)
+
+        if step.ok:
+            await asyncio.sleep(minutes * 60)
+
+        step = StepResult("stop after program run test", False)
+        try:
+            await client.stop_manual_sprinkle()
+            step.ok = True
+            step.detail = "Command sent"
+        except (SolemConnectionError, RetryError) as exc:
+            step.detail = _connection_detail(exc)
+        report.append(step)
         return
 
     step = StepResult(f"sprinkle_station_{station}_for_{minutes}_minutes", False)
@@ -340,7 +416,13 @@ async def _run_live(args: argparse.Namespace) -> int:
     print(f"Package:  solem-blip-ble {package_version}")
     print(f"MAC:      {args.mac}")
     print(f"Sections: {', '.join(sections)}")
-    print(f"Mode:     {'actions' if args.actions else 'read-only'}")
+    if args.run_program is not None:
+        action_mode = f"program {PROGRAM_LABELS[args.run_program - 1]}"
+    elif args.actions:
+        action_mode = "actions"
+    else:
+        action_mode = "read-only"
+    print(f"Mode:     {action_mode}")
     print("-" * 60)
 
     try:
@@ -367,6 +449,7 @@ async def _run_live(args: argparse.Namespace) -> int:
                 report,
                 station=args.station,
                 minutes=args.minutes,
+                run_program=args.run_program,
                 skip_sprinkle=args.skip_sprinkle,
                 verbose=args.verbose,
             )
@@ -464,6 +547,96 @@ async def _capture(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _capture_actions(args: argparse.Namespace) -> int:
+    try:
+        writes = action_capture_writes(
+            run_program=args.run_program,
+            station=args.station,
+            minutes=args.minutes,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    output_path = (
+        args.capture
+        if isinstance(args.capture, Path)
+        else default_capture_output(args.capture_prefix)
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    started = monotonic()
+    active_probe = "setup"
+    irrigation_first_fragments: dict[int, int] = {}
+
+    if args.run_program is not None:
+        label = PROGRAM_LABELS[args.run_program - 1]
+        action_label = f"program {label}"
+    else:
+        action_label = f"station {args.station} for {args.minutes} min"
+
+    with output_path.open("w", encoding="utf-8") as output:
+        def record(direction: str, probe: str, payload: bytes, note: str = "") -> None:
+            write_capture_event(
+                output,
+                CaptureEvent(
+                    timestamp=timestamp(),
+                    elapsed_seconds=round(monotonic() - started, 6),
+                    direction=direction,
+                    probe=probe,
+                    payload_hex=payload.hex(),
+                    note=note,
+                ),
+                verbose=args.verbose,
+            )
+
+        def notification_handler(_sender: Any, data: bytearray) -> None:
+            payload = bytes(data)
+            record(
+                "RX",
+                active_probe,
+                payload,
+                describe_notification(
+                    payload,
+                    probe=active_probe,
+                    irrigation_first_fragments=irrigation_first_fragments,
+                ),
+            )
+
+        print(f"Scanning for {args.mac}...")
+        device = await BleakScanner.find_device_by_address(
+            args.mac, timeout=args.scan_timeout
+        )
+        if device is None:
+            print(f"Device not found: {args.mac}", file=sys.stderr)
+            return 1
+
+        print(f"Connecting to {args.mac}...")
+        print(f"Action capture: {action_label}")
+        async with BleakClient(device, timeout=args.connect_timeout) as client:
+            await client.start_notify(NOTIFY_CHAR_UUID, notification_handler)
+            await asyncio.sleep(args.settle_seconds)
+
+            for probe_name, payload in writes:
+                active_probe = probe_name
+                dwell = action_listen_dwell_seconds(
+                    probe_name,
+                    minutes=args.minutes,
+                    capture_seconds=args.capture_seconds,
+                )
+                print(f"Write {probe_name}: {payload.hex()} (listen {dwell:.0f}s)")
+                record("TX", probe_name, payload)
+                await client.write_gatt_char(
+                    WRITE_CHAR_UUID, payload, response=False
+                )
+                await asyncio.sleep(dwell)
+
+            active_probe = "teardown"
+            await client.stop_notify(NOTIFY_CHAR_UUID)
+
+    print(f"Action capture written to {output_path}")
+    return 0
+
+
 def _replay_status(events: list[dict[str, Any]], *, max_stations: int, verbose: bool) -> bool:
     payloads = [bytes.fromhex(event["payload_hex"]) for event in events]
     ok = False
@@ -525,8 +698,42 @@ def _replay_schedule(events: list[dict[str, Any]], *, max_stations: int, verbose
     return irrigation_config_complete(payloads)
 
 
+def _replay_actions(events: list[dict[str, Any]], *, max_stations: int, verbose: bool) -> bool:
+    ok = False
+    rx_index = 0
+    for event in events:
+        if event.get("direction") != "RX":
+            if verbose and event.get("direction") == "TX":
+                probe = event.get("probe", "")
+                if _is_action_capture_probe(probe):
+                    print(
+                        f"tx {probe}: {event.get('payload_hex', '')} "
+                        f"@ {event.get('elapsed_seconds', 0):.3f}s"
+                    )
+            continue
+        probe = event.get("probe", "")
+        if not _is_action_capture_probe(probe):
+            continue
+        payload = bytes.fromhex(event["payload_hex"])
+        parsed = parse_status_notification(payload, max_station_num=max_stations)
+        rx_index += 1
+        if parsed is None:
+            note = describe_notification(payload, probe=probe)
+            if verbose or "status" not in note:
+                print(f"actions #{rx_index} [{probe}]: {note}")
+                if verbose:
+                    print(f"  raw={payload.hex()}")
+            continue
+        ok = True
+        print(f"actions #{rx_index} [{probe}]: {format_status(parsed)}")
+        if verbose:
+            print(f"  raw={payload.hex()}")
+    return ok
+
+
 def _replay(args: argparse.Namespace) -> int:
-    sections = selected_sections(args.only, include_actions=False)
+    include_actions = "actions" in (args.only or [])
+    sections = selected_sections(args.only, include_actions=include_actions)
     events, used_paths = load_capture_events(args.replay)
     if not events:
         paths = ", ".join(str(path) for path in args.replay)
@@ -570,6 +777,13 @@ def _replay(args: argparse.Namespace) -> int:
         )
         print()
 
+    if "actions" in sections:
+        print("[actions]")
+        section_ok["actions"] = _replay_actions(
+            events, max_stations=args.max_stations, verbose=args.verbose
+        )
+        print()
+
     print("-" * 60)
     failed = [name for name, ok in section_ok.items() if not ok]
     if failed:
@@ -593,13 +807,21 @@ Sections (--only):
   gatt       List GATT services and characteristics
   actions    Manual control writes (requires --actions)
 
+Capture modes:
+  --capture              Read probes only (status, firmware, names, schedule)
+  --capture --actions    Action writes + notification capture (default: station 1, 1 min)
+  --capture --actions --run-program 1   Program A run for --minutes, then stop
+
 Examples:
   validate-solem-blip
   validate-solem-blip --verbose
   validate-solem-blip --only status --only firmware
   validate-solem-blip --capture --verbose
+  validate-solem-blip --capture --actions --run-program 1 --minutes 1
+  validate-solem-blip --replay capture.jsonl --only actions
   validate-solem-blip --replay capture.jsonl --only schedule
   validate-solem-blip --actions --station 1 --minutes 1
+  validate-solem-blip --actions --run-program 1 --minutes 1
 """.strip(),
     )
     parser.add_argument(
@@ -633,7 +855,14 @@ Examples:
     parser.add_argument(
         "--actions",
         action="store_true",
-        help="Include manual write/action checks (stop, optional sprinkle test)",
+        help="Include manual write/action checks (stop, sprinkle or program run)",
+    )
+    parser.add_argument(
+        "--run-program",
+        type=int,
+        choices=range(1, len(PROGRAM_LABELS) + 1),
+        metavar="N",
+        help="Run program N (1=A, 2=B, 3=C) instead of manual station sprinkle",
     )
     parser.add_argument(
         "--max-stations",
@@ -706,11 +935,16 @@ Examples:
 
 async def _async_main(args: argparse.Namespace) -> int:
     args.mac = args.mac.upper()
+    if args.run_program is not None and not args.actions:
+        print("--run-program requires --actions", file=sys.stderr)
+        return 2
     if args.capture:
         if args.capture == "auto":
             args.capture = default_capture_output(args.capture_prefix)
         else:
             args.capture = Path(args.capture)
+        if args.actions:
+            return await _capture_actions(args)
         return await _capture(args)
     if args.replay:
         return _replay(args)

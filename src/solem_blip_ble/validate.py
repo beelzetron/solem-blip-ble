@@ -138,7 +138,7 @@ async def _wait_for_watering(
     station: int,
     timeout: float,
     verbose: bool,
-) -> dict[str, Any] | None:
+) -> Mapping[str, Any] | None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status = await client.get_status(include_raw=verbose)
@@ -154,7 +154,7 @@ async def _wait_for_program_watering(
     program: int,
     timeout: float,
     verbose: bool,
-) -> dict[str, Any] | None:
+) -> Mapping[str, Any] | None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status = await client.get_status(include_raw=verbose)

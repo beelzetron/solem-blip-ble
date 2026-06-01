@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any, TypeVar
@@ -47,6 +48,7 @@ from .const import (
     SCAN_DURATION,
     SCAN_MAX_ROUNDS,
     SCAN_PAUSE,
+    STATION_NAMES_IDLE_TIMEOUT,
     STATUS_NOTIFY_TIMEOUT,
     WRITE_CHAR_UUID,
 )
@@ -493,12 +495,14 @@ class SolemClient:
         async def _attempt() -> dict[int, str]:
             fragments: dict[int, dict[int, bytes]] = {}
             station_names: dict[int, str] = {}
-            name_event = asyncio.Event()
+            last_fragment_at: float | None = None
 
             def notification_handler(_sender: int, data: bytearray) -> None:
+                nonlocal last_fragment_at
                 parsed = protocol.parse_station_name_fragment(data)
                 if parsed is None or not 1 <= parsed["station"] <= self.max_station_num:
                     return
+                last_fragment_at = time.monotonic()
                 station = parsed["station"]
                 fragments.setdefault(station, {})[parsed["sequence"]] = parsed[
                     "name_bytes"
@@ -515,8 +519,26 @@ class SolemClient:
                     station_names[station] = (
                         station_fragments[1] + station_fragments[0]
                     ).decode("utf-8", errors="replace")
+
+            async def _wait_for_station_names() -> dict[int, str]:
+                deadline = time.monotonic() + STATUS_NOTIFY_TIMEOUT
+                while True:
                     if len(station_names) == self.max_station_num:
-                        name_event.set()
+                        return station_names
+                    now = time.monotonic()
+                    if (
+                        station_names
+                        and last_fragment_at is not None
+                        and now - last_fragment_at >= STATION_NAMES_IDLE_TIMEOUT
+                    ):
+                        return station_names
+                    if now >= deadline:
+                        if station_names:
+                            return station_names
+                        raise SolemConnectionError(
+                            "Timeout waiting for station names"
+                        )
+                    await asyncio.sleep(0.05)
 
             async def _op(client: BleakClient) -> dict[int, str]:
                 await self._start_notify(client, notification_handler)
@@ -524,15 +546,7 @@ class SolemClient:
                 await self._ensure_connected(client, phase="station names read")
                 try:
                     await self._write(client, request)
-                    try:
-                        await asyncio.wait_for(
-                            name_event.wait(), timeout=STATUS_NOTIFY_TIMEOUT
-                        )
-                    except asyncio.TimeoutError as exc:
-                        raise SolemConnectionError(
-                            "Timeout waiting for station names"
-                        ) from exc
-                    return station_names
+                    return await _wait_for_station_names()
                 finally:
                     try:
                         await client.stop_notify(NOTIFY_CHAR_UUID)

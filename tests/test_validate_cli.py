@@ -1,5 +1,6 @@
 """Tests for the packaged validation CLI helpers."""
 
+import pytest
 from pathlib import Path
 
 from solem_blip_ble.validate import build_parser
@@ -11,6 +12,16 @@ from solem_blip_ble.validate_common import (
     selected_sections,
 )
 from solem_blip_ble import protocol
+
+TEST_MAC = "AA:BB:CC:DD:EE:FF"
+
+
+def test_build_parser_requires_mac():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([])
+    args = parser.parse_args([TEST_MAC])
+    assert args.mac == TEST_MAC
 
 
 def test_selected_sections_defaults_to_all_reads():
@@ -44,10 +55,10 @@ def test_capture_probes_for_full_read_set():
 
 def test_build_parser_capture_and_replay():
     parser = build_parser()
-    capture_args = parser.parse_args(["--capture"])
+    capture_args = parser.parse_args([TEST_MAC, "--capture"])
     assert capture_args.capture == "auto"
     replay_args = parser.parse_args(
-        ["--replay", "capture.jsonl", "--only", "names"]
+        [TEST_MAC, "--replay", "capture.jsonl", "--only", "names"]
     )
     assert replay_args.replay == [Path("capture.jsonl")]
     assert replay_args.only == ["names"]
@@ -96,11 +107,13 @@ def test_describe_notification_includes_active_program():
 
 def test_build_parser_run_program_requires_actions():
     parser = build_parser()
-    args = parser.parse_args(["--actions", "--run-program", "1", "--minutes", "1"])
+    args = parser.parse_args(
+        [TEST_MAC, "--actions", "--run-program", "1", "--minutes", "1"]
+    )
     assert args.run_program == 1
     assert args.actions is True
     capture_args = parser.parse_args(
-        ["--capture", "--actions", "--run-program", "1"]
+        [TEST_MAC, "--capture", "--actions", "--run-program", "1"]
     )
     assert capture_args.capture == "auto"
     assert capture_args.actions is True

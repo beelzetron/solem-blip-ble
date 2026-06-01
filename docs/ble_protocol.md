@@ -6,7 +6,7 @@ This document captures the discovered BLE protocol for the Solem BL-IP irrigatio
 
 **Device:** Solem BL-IP (4- and 6-station models tested)  
 **Controller Software Version:** 5.1.5  
-**MAC Address:** C8:B9:61:D4:4D:C8 (example)
+**MAC Address:** device-specific (pass on the CLI, e.g. `AA:BB:CC:DD:EE:FF`)
 
 ---
 

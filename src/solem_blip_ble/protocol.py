@@ -21,6 +21,15 @@ from .const import (
 )
 
 
+# Status byte 3: bit 0x02 = manual/station watering; bit 0x04 = program run (0x44 on HW).
+WATERING_STATUS_MASK = 0x06
+
+
+def is_watering_status(status_byte: int) -> bool:
+    """Return True when seq=0x02 status byte indicates active irrigation."""
+    return bool(status_byte & WATERING_STATUS_MASK)
+
+
 class SolemStatus(TypedDict):
     controller_state: str
     is_watering: bool
@@ -29,6 +38,8 @@ class SolemStatus(TypedDict):
     battery_voltage: int | None
     battery_level: int | None
     battery_low: bool
+    active_program: int | None
+    watering_origin: str | None
 
 
 def pack_commit() -> bytes:
@@ -152,6 +163,28 @@ def parse_remaining_seconds(
     return None
 
 
+def parse_watering_origin(status_byte: int) -> str | None:
+    """Return manual vs schedule origin from status byte low nibble when watering."""
+    origin = status_byte & 0x0F
+    if 0 < origin < 5:
+        return "manual"
+    if origin != 0:
+        return "schedule"
+    return None
+
+
+def parse_active_program(
+    data: bytes | bytearray, *, is_watering: bool
+) -> int | None:
+    """Parse active program index (1=A … 3=C) from status byte 8."""
+    if not is_watering or len(data) <= 8:
+        return None
+    program = data[8]
+    if 1 <= program <= IRRIGATION_PROGRAM_COUNT:
+        return program
+    return None
+
+
 def parse_intermediate_remaining(
     data: bytes | bytearray,
     station_num: int,
@@ -183,7 +216,7 @@ def parse_status_notification(
 
     status_byte = data[3]
     is_on = bool(status_byte & 0x40)
-    is_watering = bool(status_byte & 0x02)
+    is_watering = is_watering_status(status_byte)
     station_num = data[9] if 1 <= data[9] <= max_station_num else None
 
     remaining_seconds = None
@@ -191,6 +224,7 @@ def parse_status_notification(
         remaining_seconds = parse_remaining_seconds(data, station_num)
 
     battery_voltage, battery_level, battery_low = parse_battery_9v(data)
+    active_program = parse_active_program(data, is_watering=is_watering)
 
     return {
         "controller_state": "On" if is_on else "Off",
@@ -200,6 +234,10 @@ def parse_status_notification(
         "battery_voltage": battery_voltage,
         "battery_level": battery_level,
         "battery_low": battery_low,
+        "active_program": active_program,
+        "watering_origin": parse_watering_origin(status_byte)
+        if is_watering
+        else None,
     }
 
 
@@ -217,6 +255,8 @@ def mock_status() -> dict[str, Any]:
         "battery_voltage": None,
         "battery_level": None,
         "battery_low": False,
+        "active_program": None,
+        "watering_origin": None,
     }
 
 
@@ -336,6 +376,7 @@ class IrrigationProgram(TypedDict):
     cycle: int
     week_days: int
     period_length: int
+    synchro_day: int
     start_times: list[int | None]
     station_durations: list[int]
 
@@ -379,6 +420,7 @@ def _empty_irrigation_program(*, max_stations: int) -> IrrigationProgram:
         "cycle": 0,
         "week_days": 0,
         "period_length": 0,
+        "synchro_day": 0,
         "start_times": [None] * 8,
         "station_durations": [0] * max_stations,
     }
@@ -453,6 +495,8 @@ def _apply_irrigation_chunk(
         program["cycle"] = normalized[8]
         program["week_days"] = normalized[9]
         program["period_length"] = normalized[10]
+        if len(normalized) > 11:
+            program["synchro_day"] = normalized[11]
         return name_part_1
 
     if logical_chunk == 3:

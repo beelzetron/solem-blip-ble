@@ -120,6 +120,40 @@ def test_parse_ignores_wrong_sequence():
     assert protocol.parse_status_notification(data) is None
 
 
+def test_parse_status_program_run_uses_0x44():
+    # Hardware capture after run_program A: 0x44 + byte8=1 + 1500s remaining
+    data = bytearray.fromhex("32100244006aaaaa01014f101005dc100000")
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["is_watering"] is True
+    assert parsed["active_program"] == 1
+    assert parsed["station_num"] == 1
+    assert parsed["remaining_seconds"] == 1500
+
+
+def test_parse_active_program_from_status_byte_8():
+    data = bytearray(18)
+    data[2] = 0x02
+    data[3] = 0x42
+    data[8] = 3
+    data[9] = 2
+    data[10] = 0x4F
+    data[12] = 0x00
+    data[13] = 0x05
+    data[14] = 0xDC
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["active_program"] == 3
+    assert parsed["watering_origin"] == "manual"
+
+
+def test_parse_active_program_zero_for_station_manual():
+    data = bytearray.fromhex("3210024200aaaaaa00014f0c10003c100000")
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["active_program"] is None
+
+
 def test_parse_remaining_ignores_padding_at_14_16():
     # Real HCI capture: rem=60 at bytes 12-14 (int3) and 13-14 (uint16); byte 15+ is padding
     data = bytearray.fromhex("3210024200aaaaaa00014f0c10003c100000")

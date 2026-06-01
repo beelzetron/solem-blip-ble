@@ -20,6 +20,7 @@ CAPTURE_PROGRAMS = {
         "cycle": 4,
         "week_days": 0x7F,
         "period_length": 2,
+        "synchro_day": 0,
         "start_times": [1060, None, None, None, None, None, None, None],
         "station_durations": [1200, 0, 0, 0, 1800, 0],
     },
@@ -29,6 +30,7 @@ CAPTURE_PROGRAMS = {
         "cycle": 4,
         "week_days": 0x7F,
         "period_length": 2,
+        "synchro_day": 0,
         "start_times": [None] * 8,
         "station_durations": [0] * 6,
     },
@@ -38,6 +40,7 @@ CAPTURE_PROGRAMS = {
         "cycle": 4,
         "week_days": 0x11,
         "period_length": 3,
+        "synchro_day": 1,
         "start_times": [270, None, None, None, None, None, None, None],
         "station_durations": [0, 1500, 1500, 1500, 0, 0],
     },
@@ -88,5 +91,6 @@ def test_capture_programs_match_hardware(capture_payloads: list[bytes]):
         assert program["cycle"] == expected["cycle"]
         assert program["week_days"] == expected["week_days"]
         assert program["period_length"] == expected["period_length"]
+        assert program["synchro_day"] == expected["synchro_day"]
         assert program["start_times"] == expected["start_times"]
         assert program["station_durations"] == expected["station_durations"]

@@ -510,7 +510,7 @@ class SolemClient:
                     parsed["sequence"],
                     bytes(data).hex(),
                 )
-                if parsed["sequence"] == 0 and fragments[station].keys() >= {0, 1}:
+                if fragments[station].keys() >= {0, 1}:
                     station_fragments = fragments[station]
                     station_names[station] = (
                         station_fragments[1] + station_fragments[0]

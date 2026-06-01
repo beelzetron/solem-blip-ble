@@ -124,7 +124,7 @@ def _assemble_station_names(payloads: list[bytes], *, max_stations: int) -> dict
             continue
         station = parsed["station"]
         fragments.setdefault(station, {})[parsed["sequence"]] = parsed["name_bytes"]
-        if parsed["sequence"] == 0 and fragments[station].keys() >= {0, 1}:
+        if fragments[station].keys() >= {0, 1}:
             station_fragments = fragments[station]
             station_names[station] = (
                 station_fragments[1] + station_fragments[0]

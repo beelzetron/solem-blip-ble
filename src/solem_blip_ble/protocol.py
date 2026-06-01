@@ -231,7 +231,10 @@ def parse_status_notification(
     active_program = parse_active_program(data, is_controller_on=is_on)
 
     if is_watering:
-        watering_origin = parse_watering_origin(status_byte)
+        if active_program is not None or bool(status_byte & 0x04):
+            watering_origin = "program"
+        else:
+            watering_origin = parse_watering_origin(status_byte)
     elif active_program is not None:
         watering_origin = "program"
     else:

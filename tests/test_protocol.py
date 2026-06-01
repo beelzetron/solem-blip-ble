@@ -139,6 +139,18 @@ def test_parse_status_program_run_uses_0x44():
     assert parsed["active_program"] == 1
     assert parsed["station_num"] == 1
     assert parsed["remaining_seconds"] == 1500
+    assert parsed["watering_origin"] == "program"
+
+
+def test_parse_status_program_b_watering_uses_byte_8():
+    """Program B (Vasi): 0x42 watering with byte 8=2 is a program run, not manual."""
+    data = bytearray.fromhex("3c10024200aaaaaa02054f11100000100000")
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["is_watering"] is True
+    assert parsed["active_program"] == 2
+    assert parsed["station_num"] == 5
+    assert parsed["watering_origin"] == "program"
 
 
 def test_parse_active_program_during_inter_station_idle():
@@ -168,7 +180,7 @@ def test_parse_active_program_from_status_byte_8():
     parsed = protocol.parse_status_notification(data)
     assert parsed is not None
     assert parsed["active_program"] == 3
-    assert parsed["watering_origin"] == "manual"
+    assert parsed["watering_origin"] == "program"
 
 
 def test_parse_active_program_zero_for_station_manual():

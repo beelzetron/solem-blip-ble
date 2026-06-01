@@ -70,6 +70,12 @@ def _consume_task_exception(task: asyncio.Task[Any]) -> None:
         pass
 
 
+def _cancel_task(task: asyncio.Task[Any]) -> None:
+    """Cancel a task without waiting indefinitely for BLE cleanup."""
+    task.cancel()
+    task.add_done_callback(_consume_task_exception)
+
+
 class SolemClient:
     """Async BLE client for Solem BL-IP controllers."""
 
@@ -173,8 +179,7 @@ class SolemClient:
                 timeout=DISCONNECT_TIMEOUT,
             )
         except asyncio.CancelledError:
-            disconnect_task.cancel()
-            disconnect_task.add_done_callback(_consume_task_exception)
+            _cancel_task(disconnect_task)
             raise
 
         if disconnect_task not in done:
@@ -182,8 +187,7 @@ class SolemClient:
                 "%s - Timed out disconnecting BLE client",
                 self.mac_address,
             )
-            disconnect_task.cancel()
-            disconnect_task.add_done_callback(_consume_task_exception)
+            _cancel_task(disconnect_task)
             return
 
         try:
@@ -231,15 +235,21 @@ class SolemClient:
         operation: Callable[[BleakClient], Awaitable[_T]],
     ) -> _T:
         async with self._operation_lock:
+            operation_task = asyncio.create_task(
+                self._execute_locked_operation(operation)
+            )
             try:
-                return await asyncio.wait_for(
-                    self._execute_locked_operation(operation),
+                done, _ = await asyncio.wait(
+                    {operation_task},
                     timeout=OPERATION_TIMEOUT,
                 )
-            except asyncio.TimeoutError as exc:
-                await self._invalidate_session()
-                raise SolemConnectionError("BLE operation timed out") from exc
+                if operation_task not in done:
+                    _cancel_task(operation_task)
+                    await self._invalidate_session()
+                    raise SolemConnectionError("BLE operation timed out")
+                return await operation_task
             except asyncio.CancelledError:
+                _cancel_task(operation_task)
                 await self._invalidate_session()
                 raise
             except RetryError as exc:

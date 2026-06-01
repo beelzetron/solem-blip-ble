@@ -499,6 +499,42 @@ async def test_operation_timeout_releases_lock_when_disconnect_resists_cancellat
     release_disconnect.set()
 
 
+async def test_operation_timeout_releases_lock_when_operation_resists_cancellation(
+    monkeypatch,
+) -> None:
+    """Cancellation-resistant BLE cleanup cannot retain the operation lock."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+    operation_cancelled = asyncio.Event()
+    release_operation = asyncio.Event()
+
+    async def get_connected_client():
+        return fake_client
+
+    async def resist_cancellation(_client):
+        try:
+            await asyncio.sleep(100)
+        except asyncio.CancelledError:
+            operation_cancelled.set()
+            await release_operation.wait()
+
+    async def ok(_client):
+        return "ok"
+
+    monkeypatch.setattr(client, "_get_connected_client", get_connected_client)
+    monkeypatch.setattr("solem_blip_ble.client.OPERATION_TIMEOUT", 0.01)
+
+    with pytest.raises(SolemConnectionError, match="timed out"):
+        await asyncio.wait_for(
+            client._run_with_client(resist_cancellation),
+            timeout=0.05,
+        )
+
+    await operation_cancelled.wait()
+    assert await client._run_with_client(ok) == "ok"
+    release_operation.set()
+
+
 async def test_external_cancellation_releases_lock_when_disconnect_hangs(
     monkeypatch,
 ) -> None:
@@ -535,6 +571,41 @@ async def test_external_cancellation_releases_lock_when_disconnect_hangs(
     await disconnect_cancelled.wait()
     assert await client._run_with_client(ok) == "ok"
     release_disconnect.set()
+
+
+async def test_external_cancellation_releases_lock_when_operation_hangs(
+    monkeypatch,
+) -> None:
+    """HA metadata timeout releases the lock despite stuck BLE cleanup."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+    operation_cancelled = asyncio.Event()
+    release_operation = asyncio.Event()
+
+    async def get_connected_client():
+        return fake_client
+
+    async def resist_cancellation(_client):
+        try:
+            await asyncio.sleep(100)
+        except asyncio.CancelledError:
+            operation_cancelled.set()
+            await release_operation.wait()
+
+    async def ok(_client):
+        return "ok"
+
+    monkeypatch.setattr(client, "_get_connected_client", get_connected_client)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            client._run_with_client(resist_cancellation),
+            timeout=0.01,
+        )
+
+    await operation_cancelled.wait()
+    assert await client._run_with_client(ok) == "ok"
+    release_operation.set()
 
 
 async def test_disconnect_is_bounded_when_cleanup_hangs(monkeypatch) -> None:

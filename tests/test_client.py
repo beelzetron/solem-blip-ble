@@ -99,6 +99,23 @@ class FakePartialStationNameBleakClient(FakeBleakClient):
         )
 
 
+class FakeReversedStationNameBleakClient(FakeBleakClient):
+    async def write_gatt_char(
+        self, _uuid: str, payload: bytes, *, response: bool
+    ) -> None:
+        self.writes.append(payload)
+        assert response is False
+        assert self.handler is not None
+        self.handler(
+            1,
+            bytearray.fromhex("351200002065617374000000000000000000000000"),
+        )
+        self.handler(
+            1,
+            bytearray.fromhex("3512010046726f6e74206c61776e00000000000000"),
+        )
+
+
 class FakeCommandBleakClient(FakeBleakClient):
     async def write_gatt_char(
         self, _uuid: str, payload: bytes, *, response: bool
@@ -273,6 +290,20 @@ async def test_get_station_names_from_capture(monkeypatch):
         5: "Vasi",
         6: "Stazione 6",
     }
+    assert fake_client.writes == [bytes.fromhex("3500")]
+
+
+async def test_get_station_names_assembles_reversed_fragment_order(monkeypatch):
+    fake_client = FakeReversedStationNameBleakClient()
+    client = SolemClient("AA:BB:CC:DD:EE:FF", max_station_num=1)
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+
+    assert await client.get_station_names() == {1: "Front lawn east"}
     assert fake_client.writes == [bytes.fromhex("3500")]
 
 

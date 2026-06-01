@@ -11,7 +11,6 @@ from typing import Any, TextIO
 
 from solem_blip_ble import protocol
 
-DEFAULT_MAC = "C8:B9:61:D4:4D:C8"
 WRITE_CHAR_UUID = "108b0002-eab5-bc09-d0ea-0b8f467ce8ee"
 NOTIFY_CHAR_UUID = "108b0003-eab5-bc09-d0ea-0b8f467ce8ee"
 DEFAULT_SETTLE_SECONDS = 0.5

@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.metadata
-import os
 import sys
 import time
 from collections.abc import Mapping
@@ -29,7 +28,6 @@ from solem_blip_ble.validate_common import (
     ALL_SECTIONS,
     BLE_BUSY_HINT,
     DEFAULT_CAPTURE_SECONDS,
-    DEFAULT_MAC,
     DEFAULT_SCHEDULE_CAPTURE_SECONDS,
     DEFAULT_SETTLE_SECONDS,
     NOTIFY_CHAR_UUID,
@@ -813,22 +811,18 @@ Capture modes:
   --capture --actions --run-program 1   Program A run for --minutes, then stop
 
 Examples:
-  validate-solem-blip
-  validate-solem-blip --verbose
-  validate-solem-blip --only status --only firmware
-  validate-solem-blip --capture --verbose
-  validate-solem-blip --capture --actions --run-program 1 --minutes 1
-  validate-solem-blip --replay capture.jsonl --only actions
-  validate-solem-blip --replay capture.jsonl --only schedule
-  validate-solem-blip --actions --station 1 --minutes 1
-  validate-solem-blip --actions --run-program 1 --minutes 1
+  validate-solem-blip AA:BB:CC:DD:EE:FF
+  validate-solem-blip AA:BB:CC:DD:EE:FF --verbose
+  validate-solem-blip AA:BB:CC:DD:EE:FF --only status --only firmware
+  validate-solem-blip AA:BB:CC:DD:EE:FF --capture --verbose
+  validate-solem-blip AA:BB:CC:DD:EE:FF --capture --actions --run-program 1 --minutes 1
+  validate-solem-blip AA:BB:CC:DD:EE:FF --replay capture.jsonl --only actions
+  validate-solem-blip AA:BB:CC:DD:EE:FF --actions --run-program 1 --minutes 1
 """.strip(),
     )
     parser.add_argument(
         "mac",
-        nargs="?",
-        default=os.environ.get("SOLEM_MAC", DEFAULT_MAC),
-        help=f"Controller MAC (default: {DEFAULT_MAC} or SOLEM_MAC env)",
+        help="Controller Bluetooth MAC address (required)",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(

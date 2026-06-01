@@ -42,6 +42,7 @@ from .const import (
     NOTIFY_CHAR_UUID,
     NOTIFY_PARTIAL_RETRY_DELAY,
     NOTIFY_SETTLE_DELAY,
+    OPERATION_TIMEOUT,
     RECONNECT_DELAY,
     REQUEST_MAX_ATTEMPTS,
     REQUEST_RETRY_DELAY,
@@ -187,16 +188,31 @@ class SolemClient:
                 self._had_client = False
                 await self._drop_client_unsafe()
 
+    async def _execute_locked_operation(
+        self,
+        operation: Callable[[BleakClient], Awaitable[_T]],
+    ) -> _T:
+        client = await self._get_connected_client()
+        if not client.is_connected:
+            raise SolemConnectionError("Failed connecting!")
+        return await operation(client)
+
     async def _run_with_client(
         self,
         operation: Callable[[BleakClient], Awaitable[_T]],
     ) -> _T:
         async with self._operation_lock:
             try:
-                client = await self._get_connected_client()
-                if not client.is_connected:
-                    raise SolemConnectionError("Failed connecting!")
-                return await operation(client)
+                return await asyncio.wait_for(
+                    self._execute_locked_operation(operation),
+                    timeout=OPERATION_TIMEOUT,
+                )
+            except asyncio.TimeoutError as exc:
+                await self._invalidate_session()
+                raise SolemConnectionError("BLE operation timed out") from exc
+            except asyncio.CancelledError:
+                await self._invalidate_session()
+                raise
             except RetryError as exc:
                 await self._invalidate_session()
                 raise SolemConnectionError("BLE operation failed after retries") from exc

@@ -32,6 +32,16 @@ python -m pytest -v tests/test_client.py
 - **CI:** GitHub Actions tests on Python 3.11–3.14, builds sdist/wheel
 - **CD:** Creating a GitHub Release triggers PyPI publish via trusted publishing
 
+## Branching and releases
+
+Use the lightweight Git Flow policy in `docs/branching_and_release.md`.
+
+- Do not commit directly to `main` for normal work.
+- Start changes from `feature/<topic>`, `fix/<topic>`, or `hotfix/<topic>`.
+- Merge to `main` through a pull request after CI passes.
+- Cut GitHub releases only from merged `main`.
+- Keep release commits scoped to the BLE library; do not combine HA integration changes.
+
 ## Protocol Implementation Notes
 
 **Critical BLE details** (see `docs/ble_protocol.md` for full spec):

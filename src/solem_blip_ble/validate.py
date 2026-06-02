@@ -44,6 +44,7 @@ from solem_blip_ble.validate_common import (
     format_minutes,
     format_status,
     load_capture_events,
+    off_days_capture_writes,
     selected_sections,
     timestamp,
     write_capture_event,
@@ -60,6 +61,8 @@ ACTION_PROBE_PREFIXES = (
     "run_program_",
     "sprinkle_station_",
     "stop_after",
+    "turn_on_",
+    "turn_off_days_",
 )
 
 
@@ -635,6 +638,84 @@ async def _capture_actions(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _capture_off_days(args: argparse.Namespace) -> int:
+    try:
+        writes = off_days_capture_writes(args.capture_off_days)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    output_path = (
+        args.capture
+        if isinstance(args.capture, Path)
+        else default_capture_output(args.capture_prefix)
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    started = monotonic()
+    active_probe = "setup"
+    irrigation_first_fragments: dict[int, int] = {}
+
+    with output_path.open("w", encoding="utf-8") as output:
+        def record(direction: str, probe: str, payload: bytes, note: str = "") -> None:
+            write_capture_event(
+                output,
+                CaptureEvent(
+                    timestamp=timestamp(),
+                    elapsed_seconds=round(monotonic() - started, 6),
+                    direction=direction,
+                    probe=probe,
+                    payload_hex=payload.hex(),
+                    note=note,
+                ),
+                verbose=args.verbose,
+            )
+
+        def notification_handler(_sender: Any, data: bytearray) -> None:
+            payload = bytes(data)
+            record(
+                "RX",
+                active_probe,
+                payload,
+                describe_notification(
+                    payload,
+                    probe=active_probe,
+                    irrigation_first_fragments=irrigation_first_fragments,
+                ),
+            )
+
+        print(f"Scanning for {args.mac}...")
+        device = await BleakScanner.find_device_by_address(
+            args.mac, timeout=args.scan_timeout
+        )
+        if device is None:
+            print(f"Device not found: {args.mac}", file=sys.stderr)
+            return 1
+
+        print(f"Connecting to {args.mac}...")
+        print(f"Off-days capture: {args.capture_off_days} day(s)")
+        async with BleakClient(device, timeout=args.connect_timeout) as client:
+            await client.start_notify(NOTIFY_CHAR_UUID, notification_handler)
+            await asyncio.sleep(args.settle_seconds)
+
+            for probe_name, payload in writes:
+                active_probe = probe_name
+                print(
+                    f"Write {probe_name}: {payload.hex()} "
+                    f"(listen {args.capture_seconds:.0f}s)"
+                )
+                record("TX", probe_name, payload)
+                await client.write_gatt_char(
+                    WRITE_CHAR_UUID, payload, response=False
+                )
+                await asyncio.sleep(args.capture_seconds)
+
+            active_probe = "teardown"
+            await client.stop_notify(NOTIFY_CHAR_UUID)
+
+    print(f"Off-days capture written to {output_path}")
+    return 0
+
+
 def _replay_status(events: list[dict[str, Any]], *, max_stations: int, verbose: bool) -> bool:
     payloads = [bytes.fromhex(event["payload_hex"]) for event in events]
     ok = False
@@ -809,6 +890,7 @@ Capture modes:
   --capture              Read probes only (status, firmware, names, schedule)
   --capture --actions    Action writes + notification capture (default: station 1, 1 min)
   --capture --actions --run-program 1   Program A run for --minutes, then stop
+  --capture-off-days 3   Turn off for 3 days, capture status, then turn back on
 
 Examples:
   validate-solem-blip AA:BB:CC:DD:EE:FF
@@ -816,6 +898,7 @@ Examples:
   validate-solem-blip AA:BB:CC:DD:EE:FF --only status --only firmware
   validate-solem-blip AA:BB:CC:DD:EE:FF --capture --verbose
   validate-solem-blip AA:BB:CC:DD:EE:FF --capture --actions --run-program 1 --minutes 1
+  validate-solem-blip AA:BB:CC:DD:EE:FF --capture-off-days 3 --verbose
   validate-solem-blip AA:BB:CC:DD:EE:FF --replay capture.jsonl --only actions
   validate-solem-blip AA:BB:CC:DD:EE:FF --actions --run-program 1 --minutes 1
 """.strip(),
@@ -850,6 +933,13 @@ Examples:
         "--actions",
         action="store_true",
         help="Include manual write/action checks (stop, sprinkle or program run)",
+    )
+    parser.add_argument(
+        "--capture-off-days",
+        type=int,
+        choices=range(1, 16),
+        metavar="N",
+        help="Capture turn-on, temporary off for N days, and turn-on recovery",
     )
     parser.add_argument(
         "--run-program",
@@ -932,6 +1022,18 @@ async def _async_main(args: argparse.Namespace) -> int:
     if args.run_program is not None and not args.actions:
         print("--run-program requires --actions", file=sys.stderr)
         return 2
+    if args.capture_off_days is not None and args.replay:
+        print("--capture-off-days cannot be used with --replay", file=sys.stderr)
+        return 2
+    if args.capture_off_days is not None and args.actions:
+        print("--capture-off-days cannot be combined with --actions", file=sys.stderr)
+        return 2
+    if args.capture_off_days is not None:
+        if args.capture == "auto" or args.capture is None:
+            args.capture = default_capture_output(args.capture_prefix)
+        else:
+            args.capture = Path(args.capture)
+        return await _capture_off_days(args)
     if args.capture:
         if args.capture == "auto":
             args.capture = default_capture_output(args.capture_prefix)

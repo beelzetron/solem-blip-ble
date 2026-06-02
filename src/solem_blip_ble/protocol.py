@@ -32,6 +32,8 @@ def is_watering_status(status_byte: int) -> bool:
 
 class SolemStatus(TypedDict):
     controller_state: str
+    controller_off_mode: str
+    controller_off_days_remaining: int | None
     is_watering: bool
     station_num: int | None
     remaining_seconds: int | None
@@ -189,6 +191,18 @@ def parse_active_program(
     return None
 
 
+def parse_controller_off_state(
+    data: bytes | bytearray, *, is_controller_on: bool
+) -> tuple[str, int]:
+    """Parse V5 controller temporary/permanent off state from status byte 4."""
+    if is_controller_on:
+        return "on", 0
+    off_days = data[4] & 0x3F
+    if 1 <= off_days <= MAX_TURN_OFF_DAYS:
+        return "temporary", off_days
+    return "permanent", 0
+
+
 def parse_intermediate_remaining(
     data: bytes | bytearray,
     station_num: int,
@@ -220,6 +234,9 @@ def parse_status_notification(
 
     status_byte = data[3]
     is_on = bool(status_byte & 0x40)
+    controller_off_mode, controller_off_days_remaining = parse_controller_off_state(
+        data, is_controller_on=is_on
+    )
     is_watering = is_watering_status(status_byte)
     station_num = data[9] if 1 <= data[9] <= max_station_num else None
 
@@ -243,6 +260,8 @@ def parse_status_notification(
 
     return {
         "controller_state": "On" if is_on else "Off",
+        "controller_off_mode": controller_off_mode,
+        "controller_off_days_remaining": controller_off_days_remaining,
         "is_watering": is_watering,
         "station_num": station_num,
         "remaining_seconds": remaining_seconds,
@@ -262,6 +281,8 @@ def is_command_notification(data: bytes | bytearray) -> bool:
 def mock_status() -> dict[str, Any]:
     return {
         "controller_state": "Unknown",
+        "controller_off_mode": "unknown",
+        "controller_off_days_remaining": None,
         "is_watering": False,
         "station_num": None,
         "remaining_seconds": None,

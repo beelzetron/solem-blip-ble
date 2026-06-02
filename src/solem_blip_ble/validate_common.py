@@ -112,6 +112,20 @@ def action_capture_writes(
     ]
 
 
+def off_days_capture_writes(days: int) -> list[tuple[str, bytes]]:
+    """BLE writes for temporary controller-off capture with recovery."""
+    if not 1 <= days <= protocol.MAX_TURN_OFF_DAYS:
+        raise ValueError(f"days must be between 1 and {protocol.MAX_TURN_OFF_DAYS}")
+    return [
+        ("turn_on_before_off_days_command", protocol.pack_turn_on()),
+        ("turn_on_before_off_days_commit", protocol.pack_commit()),
+        (f"turn_off_days_{days}_command", protocol.pack_turn_off_x_days(days)),
+        (f"turn_off_days_{days}_commit", protocol.pack_commit()),
+        ("turn_on_after_off_days_command", protocol.pack_turn_on()),
+        ("turn_on_after_off_days_commit", protocol.pack_commit()),
+    ]
+
+
 def action_listen_dwell_seconds(
     probe_name: str,
     *,
@@ -192,6 +206,10 @@ def describe_notification(
             parts.append(f"origin={status['watering_origin']}")
         if status.get("remaining_seconds") is not None:
             parts.append(f"remaining={status['remaining_seconds']}s")
+        if status.get("controller_off_mode") is not None:
+            parts.append(f"off_mode={status['controller_off_mode']}")
+        if status.get("controller_off_days_remaining") is not None:
+            parts.append(f"off_days={status['controller_off_days_remaining']}")
         return " ".join(parts)
     if len(payload) >= 3 and payload[2] in (0x00, 0x01, 0x02):
         return f"notify seq=0x{payload[2]:02x}"
@@ -258,6 +276,10 @@ def format_status(status: Mapping[str, Any]) -> str:
         parts.append(f"origin={status['watering_origin']}")
     if status.get("remaining_seconds") is not None:
         parts.append(f"remaining={status.get('remaining_seconds')}s")
+    if status.get("controller_off_mode") is not None:
+        parts.append(f"off_mode={status['controller_off_mode']}")
+    if status.get("controller_off_days_remaining") is not None:
+        parts.append(f"off_days={status['controller_off_days_remaining']}")
     if status.get("battery_voltage") is not None:
         parts.append(f"battery={status['battery_voltage']}V")
         if status.get("battery_level") is not None:

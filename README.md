@@ -45,6 +45,17 @@ await client.stop_manual_sprinkle()
 
 Full BLE protocol notes: [docs/ble_protocol.md](docs/ble_protocol.md)
 
+## Validation CLI
+
+The packaged debug tool is the single supported raw capture path:
+
+```bash
+validate-solem-blip AA:BB:CC:DD:EE:FF --capture --verbose
+validate-solem-blip AA:BB:CC:DD:EE:FF --capture --only status
+validate-solem-blip AA:BB:CC:DD:EE:FF --capture-off-days 3 --verbose
+validate-solem-blip AA:BB:CC:DD:EE:FF --replay btsnoop/captures/capture.jsonl
+```
+
 ## Home Assistant
 
 Used by the [Solem BL-IP for Home Assistant](https://github.com/beelzetron/solem-blip-ha) integration ([HACS](https://github.com/beelzetron/solem-blip-ha#installation)).

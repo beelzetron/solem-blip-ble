@@ -424,7 +424,8 @@ Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
 | 1 | Constant | Always `0x10` |
 | 2 | Sequence | `0x02` = Full data, `0x01` = Intermediate, `0x00` = Final |
 | 3 | **Status** | Controller state flags (see below) |
-| 4-7 | Station Data | Pattern `0x00aaaaaa` when active, `0x00000000` when idle |
+| 4 | **Rain delay / off days** | `byte & 0x3f`: `1..15` = temporary off-days while controller is OFF |
+| 5-7 | Station Data | Pattern `0xaaaaaa` when active, `0x000000` when idle |
 | 8 | **Active program** | 1-based index while a program runs: `1` = A, `2` = B, `3` = C, `0` = none (station-only manual) |
 | 9 | **Station Number** | Active station (1-6), 0 when idle |
 | 10 | **Battery Voltage** | Raw 9 V reading (status notification, byte 10) |
@@ -459,6 +460,20 @@ is_controller_on = bool(status_byte & 0x40)
 is_watering = bool(status_byte & 0x06)  # 0x02 manual, 0x04 program
 
 controller_state = "On" if is_controller_on else "Off"
+```
+
+### Controller Off Days
+```python
+off_days = notification[4] & 0x3F
+if is_controller_on:
+    controller_off_mode = "on"
+    controller_off_days_remaining = 0
+elif 1 <= off_days <= 15:
+    controller_off_mode = "temporary"
+    controller_off_days_remaining = off_days
+else:
+    controller_off_mode = "permanent"
+    controller_off_days_remaining = 0
 ```
 
 ### Station Number
@@ -566,6 +581,8 @@ async def get_status(self) -> dict:
         
         return {
             "controller_state": "On" if status_byte & 0x40 else "Off",
+            "controller_off_mode": "on" if status_byte & 0x40 else "temporary/permanent",
+            "controller_off_days_remaining": data[4] & 0x3f,
             "is_watering": bool(status_byte & 0x06),
             "station_num": data[9] if 1 <= data[9] <= 6 else None,
             "remaining_seconds": struct.unpack(">H", data[13:15])[0],
@@ -583,6 +600,7 @@ async def get_status(self) -> dict:
 - ✅ Stations 1–6 on 6-station BL-IP
 - ✅ Remaining time at **bytes 13–14** (HCI + hardware + `scripts/validate_device.py`)
 - ✅ Battery voltage at **byte 10** (HCI capture `0x4f` → level 4)
+- ✅ Temporary off-days at **byte 4 & 0x3f**
 
 ### Remaining time
 - ✅ 60 s sprinkle reads `0x003c` at bytes 13–14 (see HCI validation above)

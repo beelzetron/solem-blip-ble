@@ -75,12 +75,49 @@ def test_parse_status_on_idle():
     parsed = protocol.parse_status_notification(data)
     assert parsed is not None
     assert parsed["controller_state"] == "On"
+    assert parsed["controller_off_mode"] == "on"
+    assert parsed["controller_off_days_remaining"] == 0
     assert parsed["is_watering"] is False
     assert parsed["station_num"] is None
     assert parsed["remaining_seconds"] is None
     assert parsed["battery_voltage"] is None
     assert parsed["battery_level"] is None
     assert parsed["battery_low"] is False
+
+
+def test_parse_status_off_for_days():
+    data = bytearray(18)
+    data[2] = 0x02
+    data[3] = 0x00
+    data[4] = 0x03
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["controller_state"] == "Off"
+    assert parsed["controller_off_mode"] == "temporary"
+    assert parsed["controller_off_days_remaining"] == 3
+
+
+def test_parse_status_off_permanent_without_delay():
+    data = bytearray(18)
+    data[2] = 0x02
+    data[3] = 0x00
+    data[4] = 0x00
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["controller_state"] == "Off"
+    assert parsed["controller_off_mode"] == "permanent"
+    assert parsed["controller_off_days_remaining"] == 0
+
+
+def test_parse_status_off_ignores_out_of_range_delay_bits():
+    data = bytearray(18)
+    data[2] = 0x02
+    data[3] = 0x00
+    data[4] = 0x3F
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["controller_off_mode"] == "permanent"
+    assert parsed["controller_off_days_remaining"] == 0
 
 
 def test_parse_status_watering_station_1():

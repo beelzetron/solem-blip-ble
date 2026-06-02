@@ -9,6 +9,7 @@ from solem_blip_ble.validate_common import (
     action_listen_dwell_seconds,
     capture_probes,
     describe_notification,
+    off_days_capture_writes,
     selected_sections,
 )
 from solem_blip_ble import protocol
@@ -83,6 +84,24 @@ def test_action_capture_writes_station_sprinkle():
     assert writes[2] == ("sprinkle_station_2_command", protocol.pack_sprinkle_station(2, 3))
 
 
+def test_off_days_capture_writes():
+    writes = off_days_capture_writes(3)
+    assert writes == [
+        ("turn_on_before_off_days_command", protocol.pack_turn_on()),
+        ("turn_on_before_off_days_commit", protocol.pack_commit()),
+        ("turn_off_days_3_command", protocol.pack_turn_off_x_days(3)),
+        ("turn_off_days_3_commit", protocol.pack_commit()),
+        ("turn_on_after_off_days_command", protocol.pack_turn_on()),
+        ("turn_on_after_off_days_commit", protocol.pack_commit()),
+    ]
+
+
+@pytest.mark.parametrize("days", [0, 16])
+def test_off_days_capture_writes_rejects_out_of_range(days):
+    with pytest.raises(ValueError):
+        off_days_capture_writes(days)
+
+
 def test_action_listen_dwell_after_start_commit():
     assert action_listen_dwell_seconds(
         "run_program_a_commit", minutes=1, capture_seconds=2.0
@@ -105,6 +124,16 @@ def test_describe_notification_includes_active_program():
     assert "watering=True" in note
 
 
+def test_describe_notification_includes_off_days():
+    data = bytearray(18)
+    data[2] = 0x02
+    data[3] = 0x00
+    data[4] = 0x03
+    note = describe_notification(bytes(data))
+    assert "off_mode=temporary" in note
+    assert "off_days=3" in note
+
+
 def test_build_parser_run_program_requires_actions():
     parser = build_parser()
     args = parser.parse_args(
@@ -118,3 +147,17 @@ def test_build_parser_run_program_requires_actions():
     assert capture_args.capture == "auto"
     assert capture_args.actions is True
     assert capture_args.run_program == 1
+
+
+def test_build_parser_capture_off_days():
+    parser = build_parser()
+    args = parser.parse_args([TEST_MAC, "--capture-off-days", "3"])
+    assert args.capture_off_days == 3
+    assert args.capture is None
+
+
+@pytest.mark.parametrize("days", ["0", "16"])
+def test_build_parser_capture_off_days_rejects_out_of_range(days):
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([TEST_MAC, "--capture-off-days", days])

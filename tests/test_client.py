@@ -44,6 +44,38 @@ class FakeWriteOnlyBleakClient:
         assert response is False
 
 
+class FakeCharacteristic:
+    def __init__(self, uuid: str) -> None:
+        self.uuid = uuid
+
+
+class FakeServices:
+    def __init__(self) -> None:
+        self.write = FakeCharacteristic("108b0002-eab5-bc09-d0ea-0b8f467ce8ee")
+        self.notify = FakeCharacteristic("108b0003-eab5-bc09-d0ea-0b8f467ce8ee")
+
+    def get_characteristic(self, uuid: str) -> FakeCharacteristic | None:
+        by_uuid = {
+            self.write.uuid: self.write,
+            self.notify.uuid: self.notify,
+        }
+        return by_uuid.get(uuid)
+
+    def __iter__(self):
+        return iter(())
+
+
+class FakeRawBleakClient(FakeWriteOnlyBleakClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.services = FakeServices()
+        self.disconnects = 0
+
+    async def disconnect(self) -> None:
+        self.disconnects += 1
+        self.is_connected = False
+
+
 class FakeBleakClient:
     is_connected = True
 
@@ -787,6 +819,20 @@ async def test_disconnect_is_bounded_when_cleanup_hangs(monkeypatch) -> None:
 
     assert client._client is None
     release_disconnect.set()
+
+
+async def test_raw_ble_session_resolves_characteristics_and_disconnects() -> None:
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeRawBleakClient()
+    client._client = fake_client
+
+    async with client.raw_ble_session() as session:
+        assert session.client is fake_client
+        assert session.notify_characteristic is fake_client.services.notify
+        assert session.write_characteristic is fake_client.services.write
+
+    assert client._client is None
+    assert fake_client.disconnects == 1
 
 
 async def test_resolver_does_not_fall_back_to_standalone_scanner(monkeypatch):

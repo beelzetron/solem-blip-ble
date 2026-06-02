@@ -109,6 +109,8 @@ def test_validate_capture_status_program_idle():
 
     assert status == {
         "controller_state": "On",
+        "controller_off_mode": "on",
+        "controller_off_days_remaining": 0,
         "is_watering": False,
         "station_num": 5,
         "remaining_seconds": None,

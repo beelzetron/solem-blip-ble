@@ -100,6 +100,7 @@ class SolemClient:
         self._client: BleakClient | None = None
         self._ble_device: BLEDevice | None = ble_device
         self._had_client = False
+        self._session_generation = 0
 
     async def _resolve_ble_device(self) -> BLEDevice:
         if self._ble_device is not None:
@@ -173,6 +174,10 @@ class SolemClient:
         self._client = None
         if client is None:
             return
+        await self._disconnect_client(client)
+
+    async def _disconnect_client(self, client: BleakClient) -> None:
+        """Disconnect one client without retaining session state indefinitely."""
         disconnect_task = asyncio.ensure_future(client.disconnect())
         try:
             done, _ = await asyncio.wait(
@@ -197,9 +202,11 @@ class SolemClient:
             pass
 
     async def _invalidate_session(self) -> None:
-        async with self._conn_lock:
-            self._ble_device = None
-            await self._drop_client_unsafe()
+        self._ble_device = None
+        self._session_generation += 1
+        # A detached connection attempt may still own the previous lock.
+        self._conn_lock = asyncio.Lock()
+        await self._drop_client_unsafe()
 
     async def _get_connected_client(self) -> BleakClient:
         async with self._conn_lock:
@@ -209,7 +216,11 @@ class SolemClient:
             if self._client is not None:
                 self._had_client = True
             await self._drop_client_unsafe()
+            session_generation = self._session_generation
             client = await self._establish_ble_connection()
+            if session_generation != self._session_generation:
+                await self._disconnect_client(client)
+                raise SolemConnectionError("BLE session invalidated during connect")
             self._client = client
             self._had_client = True
             return client
@@ -220,6 +231,7 @@ class SolemClient:
             async with self._conn_lock:
                 self._ble_device = None
                 self._had_client = False
+                self._session_generation += 1
                 await self._drop_client_unsafe()
 
     async def _execute_locked_operation(

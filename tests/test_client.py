@@ -654,6 +654,46 @@ async def test_operation_timeout_releases_lock_when_operation_resists_cancellati
     release_operation.set()
 
 
+async def test_operation_timeout_releases_lock_when_connect_resists_cancellation(
+    monkeypatch,
+) -> None:
+    """Cancellation-resistant connection setup cannot retain the connection lock."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+    connect_cancelled = asyncio.Event()
+    release_connect = asyncio.Event()
+    establish_calls = 0
+
+    async def disconnect():
+        return None
+
+    async def establish_ble_connection():
+        nonlocal establish_calls
+        establish_calls += 1
+        if establish_calls == 1:
+            try:
+                await asyncio.sleep(100)
+            except asyncio.CancelledError:
+                connect_cancelled.set()
+                await release_connect.wait()
+        return fake_client
+
+    async def ok(_client):
+        return "ok"
+
+    fake_client.disconnect = disconnect
+    monkeypatch.setattr(client, "_establish_ble_connection", establish_ble_connection)
+    monkeypatch.setattr("solem_blip_ble.client.OPERATION_TIMEOUT", 0.01)
+
+    with pytest.raises(SolemConnectionError, match="timed out"):
+        await client._run_with_client(ok)
+
+    await connect_cancelled.wait()
+    assert await client._run_with_client(ok) == "ok"
+    release_connect.set()
+    await asyncio.sleep(0)
+
+
 async def test_external_cancellation_releases_lock_when_disconnect_hangs(
     monkeypatch,
 ) -> None:

@@ -179,6 +179,90 @@ class CaptureIrrigationConfigBleakClient(FakeBleakClient):
                 self.handler(1, bytearray.fromhex(event["payload_hex"]))
 
 
+class StreamingStationNamesBleakClient(FakeBleakClient):
+    """Deliver an unused output slot after the configured station name."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tail_delivered = asyncio.Event()
+        self.stopped_before_tail = False
+        self.delivery_task: asyncio.Task[None] | None = None
+
+    async def write_gatt_char(
+        self, _uuid: str, payload: bytes, *, response: bool
+    ) -> None:
+        self.writes.append(payload)
+        assert response is False
+        assert self.handler is not None
+
+        async def deliver() -> None:
+            assert self.handler is not None
+            self.handler(
+                1,
+                bytearray.fromhex("3512010046726f6e74206c61776e00000000000000"),
+            )
+            self.handler(
+                1,
+                bytearray.fromhex("351200002065617374000000000000000000000000"),
+            )
+            await asyncio.sleep(0.01)
+            assert self.handler is not None
+            self.handler(1, bytearray.fromhex("3612030100000000000000000000000000000000"))
+            self.tail_delivered.set()
+
+        self.delivery_task = asyncio.create_task(deliver())
+
+    async def stop_notify(self, uuid: str) -> None:
+        self.stopped_before_tail = not self.tail_delivered.is_set()
+        await super().stop_notify(uuid)
+
+
+class StreamingIrrigationConfigBleakClient(FakeBleakClient):
+    """Deliver an unused program slot after programs A/B/C are complete."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tail_delivered = asyncio.Event()
+        self.stopped_before_tail = False
+        self.delivery_task: asyncio.Task[None] | None = None
+
+    async def write_gatt_char(
+        self, _uuid: str, payload: bytes, *, response: bool
+    ) -> None:
+        self.writes.append(payload)
+        assert response is False
+        assert self.handler is not None
+
+        async def deliver() -> None:
+            assert self.handler is not None
+            delivered = 0
+            for line in IRRIGATION_CAPTURE_FIXTURE.read_text().splitlines():
+                if not line:
+                    continue
+                event = json.loads(line)
+                if (
+                    event["probe"] == "irrigation_config"
+                    and event["direction"] == "RX"
+                ):
+                    self.handler(1, bytearray.fromhex(event["payload_hex"]))
+                    delivered += 1
+                    if delivered == 21:
+                        break
+            await asyncio.sleep(0.01)
+            assert self.handler is not None
+            self.handler(
+                1,
+                bytearray.fromhex("3a120d1a00000000000000000000000000000000"),
+            )
+            self.tail_delivered.set()
+
+        self.delivery_task = asyncio.create_task(deliver())
+
+    async def stop_notify(self, uuid: str) -> None:
+        self.stopped_before_tail = not self.tail_delivered.is_set()
+        await super().stop_notify(uuid)
+
+
 async def test_get_station_name_reads_two_fragments_without_commit(monkeypatch):
     fake_client = FakeBleakClient()
     client = SolemClient("AA:BB:CC:DD:EE:FF", max_station_num=1)
@@ -338,6 +422,41 @@ async def test_get_irrigation_config_from_capture(monkeypatch):
     assert programs[2]["start_times"][0] == 270
     assert programs[2]["station_durations"][1:4] == [1500, 1500, 1500]
     assert fake_client.writes == [bytes.fromhex("3900")]
+
+
+async def test_get_station_names_drains_unused_output_slots(monkeypatch):
+    fake_client = StreamingStationNamesBleakClient()
+    client = SolemClient("AA:BB:CC:DD:EE:FF", max_station_num=1)
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client.STATION_NAMES_IDLE_TIMEOUT", 0.02)
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+
+    assert await client.get_station_names() == {1: "Front lawn east"}
+    assert fake_client.delivery_task is not None
+    await fake_client.delivery_task
+    assert not fake_client.stopped_before_tail
+
+
+async def test_get_irrigation_config_drains_unused_program_slots(monkeypatch):
+    fake_client = StreamingIrrigationConfigBleakClient()
+    client = SolemClient("C8:B9:61:D4:4D:C8", max_station_num=6)
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client.IRRIGATION_CONFIG_IDLE_TIMEOUT", 0.02)
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+
+    programs = await client.get_irrigation_config()
+    assert set(programs) == {0, 1, 2}
+    assert fake_client.delivery_task is not None
+    await fake_client.delivery_task
+    assert not fake_client.stopped_before_tail
 
 
 async def test_get_station_names_uses_configured_station_count():

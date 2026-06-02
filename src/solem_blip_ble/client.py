@@ -39,6 +39,7 @@ from .const import (
     COMMIT_COMMAND,
     DEFAULT_BLUETOOTH_TIMEOUT,
     DISCONNECT_TIMEOUT,
+    IRRIGATION_CONFIG_IDLE_TIMEOUT,
     MAX_STATION_NUM,
     NOTIFY_CHAR_UUID,
     NOTIFY_PARTIAL_RETRY_DELAY,
@@ -555,9 +556,11 @@ class SolemClient:
             def notification_handler(_sender: int, data: bytearray) -> None:
                 nonlocal last_fragment_at
                 parsed = protocol.parse_station_name_fragment(data)
-                if parsed is None or not 1 <= parsed["station"] <= self.max_station_num:
+                if parsed is None:
                     return
                 last_fragment_at = time.monotonic()
+                if not 1 <= parsed["station"] <= self.max_station_num:
+                    return
                 station = parsed["station"]
                 fragments.setdefault(station, {})[parsed["sequence"]] = parsed[
                     "name_bytes"
@@ -578,8 +581,6 @@ class SolemClient:
             async def _wait_for_station_names() -> dict[int, str]:
                 deadline = time.monotonic() + STATUS_NOTIFY_TIMEOUT
                 while True:
-                    if len(station_names) == self.max_station_num:
-                        return station_names
                     now = time.monotonic()
                     if (
                         station_names
@@ -645,10 +646,17 @@ class SolemClient:
         )
         async def _attempt() -> dict[int, protocol.IrrigationProgram]:
             payloads: list[bytes] = []
-            config_event = asyncio.Event()
+            last_fragment_at: float | None = None
 
             def notification_handler(_sender: int, data: bytearray) -> None:
+                nonlocal last_fragment_at
                 payload = bytes(data)
+                normalized = protocol.normalize_config_notification(payload)
+                if (
+                    normalized is not None
+                    and normalized[3] >> 4 == protocol.IRRIGATION_PROGRAM_CLASS
+                ):
+                    last_fragment_at = time.monotonic()
                 parsed = protocol.parse_irrigation_config_fragment(payload)
                 if parsed is None:
                     return
@@ -660,8 +668,24 @@ class SolemClient:
                     parsed["fragment_id"],
                     payload.hex(),
                 )
-                if protocol.irrigation_config_complete(payloads):
-                    config_event.set()
+
+            async def _wait_for_irrigation_config() -> None:
+                deadline = time.monotonic() + STATUS_NOTIFY_TIMEOUT
+                while True:
+                    now = time.monotonic()
+                    if (
+                        protocol.irrigation_config_complete(payloads)
+                        and last_fragment_at is not None
+                        and now - last_fragment_at >= IRRIGATION_CONFIG_IDLE_TIMEOUT
+                    ):
+                        return
+                    if now >= deadline:
+                        if protocol.irrigation_config_complete(payloads):
+                            return
+                        raise SolemConnectionError(
+                            "Timeout waiting for irrigation config"
+                        )
+                    await asyncio.sleep(0.05)
 
             async def _op(client: BleakClient) -> dict[int, protocol.IrrigationProgram]:
                 await self._start_notify(client, notification_handler)
@@ -669,14 +693,7 @@ class SolemClient:
                 await self._ensure_connected(client, phase="irrigation config read")
                 try:
                     await self._write(client, request)
-                    try:
-                        await asyncio.wait_for(
-                            config_event.wait(), timeout=STATUS_NOTIFY_TIMEOUT
-                        )
-                    except asyncio.TimeoutError as exc:
-                        raise SolemConnectionError(
-                            "Timeout waiting for irrigation config"
-                        ) from exc
+                    await _wait_for_irrigation_config()
                     programs = protocol.assemble_irrigation_programs(
                         payloads, max_stations=self.max_station_num
                     )

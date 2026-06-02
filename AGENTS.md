@@ -42,6 +42,7 @@ Use the lightweight Git Flow policy in `docs/branching_and_release.md`.
 - Cut GitHub releases only from merged `main`.
 - Use immutable `-beta.N` or `-rc.N` pre-releases for changes that need live HA or hardware validation before stable release.
 - Commit version-only release bumps directly to `main` after candidate PR CI is green; do not open release-bump PRs.
+- BLE CI skips test/mypy jobs for version-only release-bump pushes and runs only distribution build sanity.
 - Keep release commits scoped to the BLE library; do not combine HA integration changes.
 
 ## Protocol Implementation Notes

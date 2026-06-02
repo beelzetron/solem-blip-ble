@@ -12,7 +12,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
-from bleak import BleakClient, BleakScanner
+from bleak import BleakScanner
 
 from solem_blip_ble import (
     IrrigationProgram,
@@ -523,8 +523,16 @@ async def _capture(args: argparse.Namespace) -> int:
             return 1
 
         print(f"Connecting to {args.mac}...")
-        async with BleakClient(device, timeout=args.connect_timeout) as client:
-            await client.start_notify(NOTIFY_CHAR_UUID, notification_handler)
+        client = SolemClient(
+            args.mac,
+            bluetooth_timeout=args.connect_timeout,
+            ble_device=device,
+        )
+        async with client.raw_ble_session() as session:
+            ble_client = session.client
+            notify_char = session.notify_characteristic
+            write_char = session.write_characteristic
+            await ble_client.start_notify(notify_char, notification_handler)
             await asyncio.sleep(args.settle_seconds)
 
             for probe_name, payload in probes:
@@ -536,13 +544,11 @@ async def _capture(args: argparse.Namespace) -> int:
                 )
                 print(f"Probe {probe_name}: {payload.hex()}")
                 record("TX", probe_name, payload)
-                await client.write_gatt_char(
-                    WRITE_CHAR_UUID, payload, response=False
-                )
+                await ble_client.write_gatt_char(write_char, payload, response=False)
                 await asyncio.sleep(dwell)
 
             active_probe = "teardown"
-            await client.stop_notify(NOTIFY_CHAR_UUID)
+            await ble_client.stop_notify(notify_char)
 
     print(f"Capture written to {output_path}")
     return 0
@@ -613,8 +619,16 @@ async def _capture_actions(args: argparse.Namespace) -> int:
 
         print(f"Connecting to {args.mac}...")
         print(f"Action capture: {action_label}")
-        async with BleakClient(device, timeout=args.connect_timeout) as client:
-            await client.start_notify(NOTIFY_CHAR_UUID, notification_handler)
+        client = SolemClient(
+            args.mac,
+            bluetooth_timeout=args.connect_timeout,
+            ble_device=device,
+        )
+        async with client.raw_ble_session() as session:
+            ble_client = session.client
+            notify_char = session.notify_characteristic
+            write_char = session.write_characteristic
+            await ble_client.start_notify(notify_char, notification_handler)
             await asyncio.sleep(args.settle_seconds)
 
             for probe_name, payload in writes:
@@ -626,13 +640,11 @@ async def _capture_actions(args: argparse.Namespace) -> int:
                 )
                 print(f"Write {probe_name}: {payload.hex()} (listen {dwell:.0f}s)")
                 record("TX", probe_name, payload)
-                await client.write_gatt_char(
-                    WRITE_CHAR_UUID, payload, response=False
-                )
+                await ble_client.write_gatt_char(write_char, payload, response=False)
                 await asyncio.sleep(dwell)
 
             active_probe = "teardown"
-            await client.stop_notify(NOTIFY_CHAR_UUID)
+            await ble_client.stop_notify(notify_char)
 
     print(f"Action capture written to {output_path}")
     return 0
@@ -693,8 +705,16 @@ async def _capture_off_days(args: argparse.Namespace) -> int:
 
         print(f"Connecting to {args.mac}...")
         print(f"Off-days capture: {args.capture_off_days} day(s)")
-        async with BleakClient(device, timeout=args.connect_timeout) as client:
-            await client.start_notify(NOTIFY_CHAR_UUID, notification_handler)
+        client = SolemClient(
+            args.mac,
+            bluetooth_timeout=args.connect_timeout,
+            ble_device=device,
+        )
+        async with client.raw_ble_session() as session:
+            ble_client = session.client
+            notify_char = session.notify_characteristic
+            write_char = session.write_characteristic
+            await ble_client.start_notify(notify_char, notification_handler)
             await asyncio.sleep(args.settle_seconds)
 
             for probe_name, payload in writes:
@@ -704,13 +724,11 @@ async def _capture_off_days(args: argparse.Namespace) -> int:
                     f"(listen {args.capture_seconds:.0f}s)"
                 )
                 record("TX", probe_name, payload)
-                await client.write_gatt_char(
-                    WRITE_CHAR_UUID, payload, response=False
-                )
+                await ble_client.write_gatt_char(write_char, payload, response=False)
                 await asyncio.sleep(args.capture_seconds)
 
             active_probe = "teardown"
-            await client.stop_notify(NOTIFY_CHAR_UUID)
+            await ble_client.stop_notify(notify_char)
 
     print(f"Off-days capture written to {output_path}")
     return 0

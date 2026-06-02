@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, TypeVar
+from typing import Any, AsyncIterator, TypeVar
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -63,6 +65,15 @@ _LOGGER = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 
+@dataclass(frozen=True)
+class SolemRawBleSession:
+    """Connected BL-IP BLE session for raw validation/debug captures."""
+
+    client: BleakClient
+    notify_characteristic: Any
+    write_characteristic: Any
+
+
 def _consume_task_exception(task: asyncio.Task[Any]) -> None:
     """Observe a detached cleanup task exception after cancellation."""
     try:
@@ -75,6 +86,22 @@ def _cancel_task(task: asyncio.Task[Any]) -> None:
     """Cancel a task without waiting indefinitely for BLE cleanup."""
     task.cancel()
     task.add_done_callback(_consume_task_exception)
+
+
+def _find_characteristic(client: BleakClient, uuid: str) -> Any:
+    services = client.services
+    get_characteristic = getattr(services, "get_characteristic", None)
+    if callable(get_characteristic):
+        characteristic = get_characteristic(uuid)
+        if characteristic is not None:
+            return characteristic
+
+    for service in services:
+        for characteristic in service.characteristics:
+            if str(characteristic.uuid).lower() == uuid.lower():
+                return characteristic
+
+    raise SolemConnectionError(f"Missing BLE characteristic: {uuid}")
 
 
 class SolemClient:
@@ -233,6 +260,25 @@ class SolemClient:
                 self._had_client = False
                 self._session_generation += 1
                 await self._drop_client_unsafe()
+
+    @asynccontextmanager
+    async def raw_ble_session(self) -> AsyncIterator[SolemRawBleSession]:
+        """Open a connected raw BLE session for validation/debug capture tooling."""
+        if self.mock:
+            raise SolemConnectionError("Raw BLE sessions are unavailable in mock mode")
+
+        async with self._operation_lock:
+            try:
+                client = await self._get_connected_client()
+                await self._ensure_connected(client, phase="raw session setup")
+                yield SolemRawBleSession(
+                    client=client,
+                    notify_characteristic=_find_characteristic(client, NOTIFY_CHAR_UUID),
+                    write_characteristic=_find_characteristic(client, WRITE_CHAR_UUID),
+                )
+            finally:
+                async with self._conn_lock:
+                    await self._drop_client_unsafe()
 
     async def _execute_locked_operation(
         self,

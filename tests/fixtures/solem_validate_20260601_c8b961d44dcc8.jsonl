@@ -1,5 +1,5 @@
 {"direction": "TX", "elapsed_seconds": 20.746556, "note": "", "payload_hex": "3b00", "probe": "status", "timestamp": "2026-06-01T16:05:54.581+00:00"}
-{"direction": "RX", "elapsed_seconds": 22.487924, "note": "status controller=On watering=False station=5 program=2 origin=program", "payload_hex": "3c10024000aaaaaa02054f11100000100000", "probe": "status", "timestamp": "2026-06-01T16:05:56.322+00:00"}
+{"direction": "RX", "elapsed_seconds": 22.487924, "note": "status controller=On watering=True station=5 program=2 origin=program", "payload_hex": "3c10024000aaaaaa02054f11100000100000", "probe": "status", "timestamp": "2026-06-01T16:05:56.322+00:00"}
 {"direction": "RX", "elapsed_seconds": 22.780563, "note": "notify seq=0x01", "payload_hex": "3c10011000001000001005b6100000000000", "probe": "status", "timestamp": "2026-06-01T16:05:56.615+00:00"}
 {"direction": "RX", "elapsed_seconds": 22.781724, "note": "notify seq=0x00", "payload_hex": "3c1000000000000000000000000000000000", "probe": "status", "timestamp": "2026-06-01T16:05:56.616+00:00"}
 {"direction": "TX", "elapsed_seconds": 25.752883, "note": "", "payload_hex": "0f00", "probe": "firmware", "timestamp": "2026-06-01T16:05:59.587+00:00"}

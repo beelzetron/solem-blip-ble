@@ -100,7 +100,7 @@ def load_irrigation_config_payloads() -> list[bytes]:
 
 
 def test_validate_capture_status_program_idle():
-    """Program B (Vasi) stays visible while controller is idle between stations."""
+    """Program B (Vasi) reports active station 5 without status low bits set."""
     payloads = load_capture_events("status")
     parsed = [
         protocol.parse_status_notification(payload) for payload in payloads
@@ -111,7 +111,7 @@ def test_validate_capture_status_program_idle():
         "controller_state": "On",
         "controller_off_mode": "on",
         "controller_off_days_remaining": 0,
-        "is_watering": False,
+        "is_watering": True,
         "station_num": 5,
         "remaining_seconds": None,
         "battery_voltage": 79,

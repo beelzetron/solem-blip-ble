@@ -427,7 +427,7 @@ Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
 | 4 | **Rain delay / off days** | `byte & 0x3f`: `1..15` = temporary off-days while controller is OFF |
 | 5-7 | Station Data | Pattern `0xaaaaaa` when active, `0x000000` when idle |
 | 8 | **Active program** | 1-based index while a program runs: `1` = A, `2` = B, `3` = C, `0` = none (station-only manual) |
-| 9 | **Station Number** | Active station (1-6), 0 when idle |
+| 9 | **Station Number** | Current active station/valve (1-6), 0 when no station is active |
 | 10 | **Battery Voltage** | Raw 9 V reading (status notification, byte 10) |
 | 13-14 | **Remaining Time** | Big-endian uint16, seconds remaining (only meaningful when watering) |
 | 14-15 | Padding | Often `0x3c10` during watering; do not use for remaining time |
@@ -435,19 +435,24 @@ Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
 
 ### Status Byte (Byte 3)
 
-| Value | Binary | Controller | Watering | Description |
-|-------|--------|------------|----------|-------------|
-| `0x40` | `01000000` | ON | IDLE | Controller ON, no active watering |
-| `0x42` | `01000010` | ON | ACTIVE | Controller ON, manual/station watering |
-| `0x44` | `01000100` | ON | ACTIVE | Controller ON, program run (byte 8 = program 1–3) |
-| `0x02` | `00000010` | OFF | ACTIVE | Controller OFF, manual watering active |
-| `0x00` | `00000000` | OFF | IDLE | Controller OFF, idle |
+| Value | Binary | Controller | Low-bit meaning | Description |
+|-------|--------|------------|-----------------|-------------|
+| `0x40` | `01000000` | ON | none | Controller ON. A station can still be active when byte 9 is nonzero. |
+| `0x42` | `01000010` | ON | manual/station | Controller ON, manual/station command frame |
+| `0x44` | `01000100` | ON | program | Controller ON, program command frame (byte 8 = program 1–3) |
+| `0x02` | `00000010` | OFF | manual/station | Controller OFF, manual watering active |
+| `0x00` | `00000000` | OFF | none | Controller OFF, no station active |
 | `0x10` | `00010000` | - | - | Intermediate response (no state) |
 
 **Bit Flags:**
 - **Bit 6 (0x40)**: Controller permanent state (ON/OFF)
-- **Bit 1 (0x02)**: Manual / station watering active
-- **Bit 2 (0x04)**: Program run active (often `0x44` with controller ON)
+- **Bit 1 (0x02)**: Manual / station command activity bit
+- **Bit 2 (0x04)**: Program command activity bit (often `0x44` with controller ON)
+
+**Important:** The low bits of byte 3 are not the authoritative valve-active
+indicator. Validated captures show byte 8 carries the running program, byte 9
+carries the running station, and the low nibble of byte 3 indicates command
+origin/mode. Use byte 9 to decide whether a station valve is active.
 
 ---
 
@@ -457,7 +462,9 @@ Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
 ```python
 status_byte = notification[3]
 is_controller_on = bool(status_byte & 0x40)
-is_watering = bool(status_byte & 0x06)  # 0x02 manual, 0x04 program
+activity_bits = bool(status_byte & 0x06)  # 0x02 manual, 0x04 program command bits
+station_num = notification[9] if 1 <= notification[9] <= 6 else None
+is_watering = station_num is not None or activity_bits
 
 controller_state = "On" if is_controller_on else "Off"
 ```
@@ -481,6 +488,18 @@ else:
 station_num = notification[9]  # 1-6, or 0 if idle
 ```
 
+Captured scheduled Vasi run:
+
+```
+3c10024000aaaaaa02054f11100000100000
+      ^^        ^^
+      0x40      station 5
+```
+
+This frame has status byte `0x40` but still reports program `2` at byte 8 and
+station `5` at byte 9. Treat station 5 as active; do not infer idle from
+`status_byte & 0x06 == 0`.
+
 ### Remaining Time
 ```python
 import struct
@@ -490,7 +509,10 @@ import struct
 remaining_seconds = parse_remaining_seconds(notification, station_num)
 ```
 
-Only parse when a watering flag is set (`status_byte & 0x06`). Ignore values outside a sane range (e.g. 1–14400 seconds).
+Only use remaining time when a station is active or a command activity bit is
+set. Ignore values outside a sane range (e.g. 1–14400 seconds). For stations 3+
+the seq `0x02` frame may omit the remaining value; wait briefly for seq `0x01`
+and parse `offset = (station - 3) * 3 + 3`.
 
 ### Battery (9 V)
 
@@ -578,13 +600,14 @@ async def get_status(self) -> dict:
             return None
         
         status_byte = data[3]
+        station_num = data[9] if 1 <= data[9] <= 6 else None
         
         return {
             "controller_state": "On" if status_byte & 0x40 else "Off",
             "controller_off_mode": "on" if status_byte & 0x40 else "temporary/permanent",
             "controller_off_days_remaining": data[4] & 0x3f,
-            "is_watering": bool(status_byte & 0x06),
-            "station_num": data[9] if 1 <= data[9] <= 6 else None,
+            "is_watering": station_num is not None or bool(status_byte & 0x06),
+            "station_num": station_num,
             "remaining_seconds": struct.unpack(">H", data[13:15])[0],
             "battery_voltage": data[10] or None,
             "battery_level": battery_level_9v(data[10]) if data[10] else None,

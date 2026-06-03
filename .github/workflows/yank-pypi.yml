@@ -13,7 +13,7 @@ jobs:
     environment: pypi
 
     steps:
-      - name: Yank 0.1.12 and 0.1.13
+      - name: Yank contaminated releases
         env:
           PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: |
@@ -22,8 +22,8 @@ jobs:
             echo "Add PYPI_API_TOKEN to the pypi environment (scope: whole project, incl. yank)."
             exit 1
           fi
-          reason="Release contained internal protocol references removed in v0.1.14+."
-          for ver in 0.1.12 0.1.13; do
+          reason="Release contained internal protocol references removed in a later patch release."
+          for ver in 0.1.12 0.1.13 0.1.33; do
             echo "Yanking solem-blip-ble ${ver}..."
             curl -fsS -X POST \
               "https://pypi.org/manage/project/solem-blip-ble/release/${ver}/yank/" \

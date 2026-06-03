@@ -21,12 +21,13 @@ from .const import (
 )
 
 
-# Status byte 3: bit 0x02 = manual/station watering; bit 0x04 = program run (0x44 on HW).
+# Status byte 3 low bits describe the run origin/mode. Captures show byte 9
+# (current station) is the authoritative active-valve indicator.
 WATERING_STATUS_MASK = 0x06
 
 
 def is_watering_status(status_byte: int) -> bool:
-    """Return True when seq=0x02 status byte indicates active irrigation."""
+    """Return True when seq=0x02 status byte has manual/program activity bits."""
     return bool(status_byte & WATERING_STATUS_MASK)
 
 
@@ -237,8 +238,9 @@ def parse_status_notification(
     controller_off_mode, controller_off_days_remaining = parse_controller_off_state(
         data, is_controller_on=is_on
     )
-    is_watering = is_watering_status(status_byte)
+    has_activity_bits = is_watering_status(status_byte)
     station_num = data[9] if 1 <= data[9] <= max_station_num else None
+    is_watering = station_num is not None or has_activity_bits
 
     remaining_seconds = None
     if is_watering:
@@ -248,13 +250,11 @@ def parse_status_notification(
     active_program = parse_active_program(data, is_controller_on=is_on)
 
     watering_origin: str | None
-    if is_watering:
+    if is_watering or active_program is not None:
         if active_program is not None or bool(status_byte & 0x04):
             watering_origin = "program"
         else:
             watering_origin = parse_watering_origin(status_byte)
-    elif active_program is not None:
-        watering_origin = "program"
     else:
         watering_origin = None
 

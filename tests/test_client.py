@@ -162,6 +162,24 @@ class FakeCommandBleakClient(FakeBleakClient):
             )
 
 
+class FakeProgramStation5BleakClient(FakeBleakClient):
+    async def write_gatt_char(
+        self, _uuid: str, payload: bytes, *, response: bool
+    ) -> None:
+        self.writes.append(payload)
+        assert response is False
+        if payload == protocol.pack_commit():
+            assert self.handler is not None
+            self.handler(
+                1,
+                bytearray.fromhex("3c10024000aaaaaa02054f11100000100000"),
+            )
+            self.handler(
+                1,
+                bytearray.fromhex("3c10011000001000001005b6100000000000"),
+            )
+
+
 class CaptureFirmwareBleakClient(FakeBleakClient):
     async def write_gatt_char(
         self, _uuid: str, payload: bytes, *, response: bool
@@ -345,6 +363,25 @@ async def test_execute_command_waits_for_final_notification(monkeypatch):
     status = await task
     assert status is not None
     assert status["is_watering"] is True
+
+
+async def test_get_status_reads_program_station_remaining_from_capture(monkeypatch):
+    fake_client = FakeProgramStation5BleakClient()
+    client = SolemClient("C8:B9:61:D4:4D:C8", max_station_num=6)
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+
+    status = await client.get_status()
+
+    assert status["is_watering"] is True
+    assert status["watering_origin"] == "program"
+    assert status["active_program"] == 2
+    assert status["station_num"] == 5
+    assert status["remaining_seconds"] == 1462
 
 
 async def test_get_firmware_version_reads_identification_without_commit(monkeypatch):

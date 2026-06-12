@@ -2,11 +2,11 @@
 
 ## Overview
 
-This document captures the discovered BLE protocol for the Solem BL-IP irrigation controller based on protocol analysis and live hardware testing.
+This document captures the discovered BLE protocol for the Solem BL-IP irrigation controller based on protocol analysis, live V5 hardware testing, and capture-backed regression fixtures.
 
-**Device:** Solem BL-IP (4- and 6-station models tested)  
-**Controller Software Version:** 5.1.5  
-**MAC Address:** device-specific (pass on the CLI, e.g. `AA:BB:CC:DD:EE:FF`)
+- **Device:** Solem BL-IP V5 (6-station variant tested)
+- **Controller Software Version:** V5 firmware observed, including 5.1.5 and 5.1.7
+- **MAC Address:** device-specific (pass on the CLI, e.g. `AA:BB:CC:DD:EE:FF`)
 
 ---
 
@@ -531,7 +531,7 @@ Example from HCI capture while watering (`3210024200aaaaaa00014f0c10003c100000`)
 
 **Wrong offset:** Reading bytes 14–16 (`notification[14:16]`) picks up padding and reports bogus values (e.g. `0x3c10` → 15376 s).
 
-### HCI validation (firmware 5.1.5)
+### HCI validation (V5 firmware)
 
 Command: `3105120100003c` (station 1, 60 s) + commit `3b00`
 
@@ -543,7 +543,7 @@ Notification (seq `0x02`):
                            0x003c = 60 seconds at bytes 13-14
 ```
 
-Validated via Bluetooth HCI snoop capture on BL-IP firmware 5.1.5.
+Validated via Bluetooth HCI snoop capture on BL-IP V5 firmware.
 
 ---
 
@@ -574,8 +574,7 @@ The remaining time (bytes 13-14, big-endian) decrements as watering progresses. 
 
 1. **Spontaneous Notifications:** Unknown if device sends periodic status updates without a prior command
 2. **Error Codes:** Unknown status byte values for error conditions
-3. **Battery Level:** Not observed in notifications
-4. **Bytes 11–12:** Purpose not fully mapped; not required for status polling
+3. **Bytes 11–12:** Purpose not fully mapped; not required for status polling
 
 ---
 
@@ -619,7 +618,7 @@ async def get_status(self) -> dict:
 ## Test Results Summary
 
 ### Commands and status
-- ✅ Turn ON (`0x40`), station sprinkle (`0x42`), STOP, turn OFF (`0x00`)
+- ✅ Turn ON (`0x40`), station sprinkle (`0x42`), program watering with byte 9 active station, STOP, turn OFF (`0x00`)
 - ✅ Stations 1–6 on 6-station BL-IP
 - ✅ Remaining time at **bytes 13–14** (HCI + hardware + `scripts/validate_device.py`)
 - ✅ Battery voltage at **byte 10** (HCI capture `0x4f` → level 4)
@@ -639,8 +638,8 @@ async def get_status(self) -> dict:
 
 | Status byte | Controller | Watering |
 |-------------|------------|----------|
-| `0x40` | ON | idle |
-| `0x42` | ON | active |
+| `0x40` | ON | active when byte 9 is nonzero; otherwise idle |
+| `0x42` | ON | active manual/station command |
 | `0x02` | OFF | active (manual) |
 | `0x00` | OFF | idle |
 
@@ -663,5 +662,5 @@ Parse only notifications with `data[2] == 0x02`. Ignore `0x10` in byte 3 (interm
 ---
 
 *Document created: 2026-05-28*  
-*Last updated: 2026-05-29*  
-*Status: Commands validated against pcman75 reference; status notify protocol validated on BL-IP hardware and HCI capture (see `solem_blip_ble` implementation).*
+*Last updated: 2026-06-12*
+*Status: Commands validated against pcman75 reference; V5 status, metadata, station names, battery, and schedule readback validated on BL-IP hardware and capture-backed regression fixtures.*

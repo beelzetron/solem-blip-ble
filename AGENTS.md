@@ -53,9 +53,10 @@ Use the lightweight Git Flow policy in `docs/branching_and_release.md`.
 2. **Only parse seq `0x02` notifications:** Sequence `0x01` is intermediate, `0x00` is final/empty
 3. **Remaining time offset:** Bytes 13-14 (big-endian uint16), NOT 14-16 (padding)
 4. **Battery voltage:** Byte 10 (raw 9V reading, map to icon level 0-5)
-5. **Status byte (byte 3):**
-   - `0x40`: Controller ON, idle
-   - `0x42`: Controller ON, actively watering
+5. **Active station:** Byte 9 is the authoritative active station/valve indicator. `0x40` can still mean active program watering when byte 9 is nonzero.
+6. **Status byte (byte 3):**
+   - `0x40`: Controller ON; idle only when byte 9 is zero
+   - `0x42`: Controller ON, manual/station command activity
    - `0x02`: Controller OFF, manual watering active
    - `0x00`: Controller OFF, idle
 

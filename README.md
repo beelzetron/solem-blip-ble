@@ -7,7 +7,7 @@ Python library for the Solem BL-IP Bluetooth irrigation controller.
 | Layer | Source |
 |-------|--------|
 | **Commands** (turn on/off, sprinkle, stop, commit) | [pcman75/solem-blip-reverse-engineering](https://github.com/pcman75/solem-blip-reverse-engineering) — GATT write `108b0002-...`, frame `3105 …` + `3b00` |
-| **Status polling** (notify, seq `0x02`, station, remaining time) | Live testing on BL-IP hardware; see [docs/ble_protocol.md](docs/ble_protocol.md) |
+| **Status polling** (notify, seq `0x02`, active station, remaining time, battery) | Live BL-IP V5 hardware validation and capture-backed regression tests; see [docs/ble_protocol.md](docs/ble_protocol.md) |
 
 Turn-off-for-N-days is capped at **15 days** per the pcman75 documentation.
 
@@ -37,8 +37,8 @@ client = SolemClient("AA:BB:CC:DD:EE:FF", bluetooth_timeout=30)
 await client.connect()
 status = await client.get_status()
 await client.sprinkle_station_x_for_y_minutes(1, 5)
-await client.disconnect()
 await client.stop_manual_sprinkle()
+await client.disconnect()
 ```
 
 ## Documentation
@@ -55,6 +55,9 @@ validate-solem-blip AA:BB:CC:DD:EE:FF --capture --only status
 validate-solem-blip AA:BB:CC:DD:EE:FF --capture-off-days 3 --verbose
 validate-solem-blip AA:BB:CC:DD:EE:FF --replay btsnoop/captures/capture.jsonl
 ```
+
+Regression tests also replay public capture-backed fixtures for V5 firmware,
+station names, status, and persisted irrigation schedule parsing.
 
 ## Home Assistant
 

@@ -408,12 +408,12 @@ frames write the weekday mask directly in the program header frame.
 ### Notification Format (18 bytes)
 
 ```
-Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
-      ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
-      │ RT │ 10 │SEQ │STAT│    0xaa    │    ??    │    ??    │TIME│ pad│    0000    │
-      └────┴────┴────┴────┴────────────┴──────────┴──────────┴────┴────┴────────────┘
-                                                      ^^^^^^^^
-                                                   bytes 13-14 (BE uint16, seconds)
+Byte:  00   01   02   03   04   05   06   07   08   09   10   11   12   13   14   15   16   17
+Field: RT   10   SEQ  STAT OFF  SD0  SD1  SD2  PRG  STA  BAT  ??   R0   R1   R2   R3   R4   R5
+
+SD0-SD2: station data (`aa aa aa` when active)
+R0-R2:   primary 3-byte remaining-time slot (bytes 12-14)
+R3-R5:   station 2 remaining-time slot or padding (bytes 15-17)
 ```
 
 ### Field Definitions
@@ -429,9 +429,10 @@ Byte:  00  01  02  03  04  05  06  07  08  09  10  11  12  13  14  15  16  17
 | 8 | **Active program** | 1-based index while a program runs: `1` = A, `2` = B, `3` = C, `0` = none (station-only manual) |
 | 9 | **Station Number** | Current active station/valve (1-6), 0 when no station is active |
 | 10 | **Battery Voltage** | Raw 9 V reading (status notification, byte 10) |
-| 13-14 | **Remaining Time** | Big-endian uint16, seconds remaining (only meaningful when watering) |
-| 14-15 | Padding | Often `0x3c10` during watering; do not use for remaining time |
-| 16-17 | Padding | Always `0x0000` |
+| 11 | Unknown | Observed byte, not required for status polling |
+| 12-14 | **Remaining Time** | 3-byte big-endian seconds slot; byte 12 low nibble is used |
+| 13-14 | **Remaining Time fallback** | Legacy big-endian uint16 seconds view validated by earlier station 1 captures |
+| 15-17 | **Remaining Time / padding** | Station 2 may use this 3-byte slot; otherwise often padding |
 
 ### Status Byte (Byte 3)
 

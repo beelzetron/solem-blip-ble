@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -18,7 +18,7 @@ DEFAULT_CAPTURE_SECONDS = 5.0
 DEFAULT_SCHEDULE_CAPTURE_SECONDS = 15.0
 
 READ_SECTIONS = ("status", "firmware", "names", "schedule", "gatt")
-ACTION_SECTIONS = ("actions",)
+ACTION_SECTIONS = ("actions", "schedule_write")
 ALL_SECTIONS = READ_SECTIONS + ACTION_SECTIONS
 PROGRAM_LABELS = ("A", "B", "C")
 DEFAULT_ACTION_LISTEN_BUFFER_SECONDS = 5.0
@@ -126,6 +126,61 @@ def off_days_capture_writes(days: int) -> list[tuple[str, bytes]]:
     ]
 
 
+def schedule_write_capture_writes(
+    *,
+    program_index: int,
+    program_name: str,
+    station: int,
+    duration_seconds: int,
+    start_minutes: int | None,
+    max_stations: int,
+    today: date | None = None,
+) -> tuple[protocol.IrrigationProgram, list[tuple[str, bytes]]]:
+    """Return a small persisted schedule write and the expected normalized program."""
+    if not 0 <= program_index < len(PROGRAM_LABELS):
+        raise ValueError(f"program_index must be between 0 and {len(PROGRAM_LABELS) - 1}")
+    if not 1 <= station <= max_stations:
+        raise ValueError(f"station must be between 1 and {max_stations}")
+    if not 1 <= duration_seconds <= 0xFFFFFF:
+        raise ValueError("duration_seconds must be between 1 and 16777215")
+    if start_minutes is not None and not 0 <= start_minutes < protocol.DISABLED_START_TIME:
+        raise ValueError("start_minutes must be between 0 and 1439")
+
+    station_durations = [0] * max_stations
+    station_durations[station - 1] = duration_seconds
+    program: protocol.IrrigationProgram = {
+        "name": program_name,
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 1,
+        "synchro_day": 0,
+        "period_start_date": today or date.today(),
+        "start_times": [start_minutes, None, None, None, None, None, None, None],
+        "station_durations": station_durations,
+    }
+    expected = protocol.normalize_irrigation_program_for_write(
+        program,
+        today=today,
+        max_stations=max_stations,
+    )
+    label = PROGRAM_LABELS[program_index].lower()
+    writes = [
+        (f"set_program_{label}_frame_{frame_index}", frame)
+        for frame_index, frame in enumerate(
+            protocol.pack_set_irrigation_program(
+                program_index,
+                program,
+                today=today,
+                max_stations=max_stations,
+            )
+        )
+    ]
+    writes.append(("readback_irrigation_config", protocol.pack_get_irrigation_config()))
+    return expected, writes
+
+
 def action_listen_dwell_seconds(
     probe_name: str,
     *,
@@ -222,7 +277,7 @@ def load_capture_events(
     paths: list[Path],
     *,
     probe: str | None = None,
-    direction: str = "RX",
+    direction: str | None = "RX",
 ) -> tuple[list[dict[str, Any]], list[Path]]:
     events: list[dict[str, Any]] = []
     used_paths: list[Path] = []
@@ -234,7 +289,7 @@ def load_capture_events(
             if not line:
                 continue
             event = json.loads(line)
-            if event.get("direction") != direction:
+            if direction is not None and event.get("direction") != direction:
                 continue
             if probe is not None and event.get("probe") != probe:
                 continue

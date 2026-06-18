@@ -2,9 +2,10 @@
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -436,6 +437,66 @@ async def test_set_time_writes_without_commit(monkeypatch):
 
     assert fake_client.writes == [protocol.pack_set_time(moment)]
     assert all(write != protocol.pack_commit() for write in fake_client.writes)
+
+
+async def test_set_irrigation_program_writes_frames_and_verifies(monkeypatch):
+    fake_client = FakeWriteOnlyBleakClient()
+    client = SolemClient("AA:BB:CC:DD:EE:FF", max_station_num=2)
+    program: protocol.IrrigationProgram = {
+        "name": "Vasi",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 2,
+        "synchro_day": 0,
+        "period_start_date": date(2026, 6, 1),
+        "start_times": [270, None, None, None, None, None, None, None],
+        "station_durations": [0, 1500],
+    }
+    frames = protocol.pack_set_irrigation_program(1, program, max_stations=2)
+    expected = {
+        1: protocol.normalize_irrigation_program_for_write(
+            program,
+            max_stations=2,
+        )
+    }
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+    monkeypatch.setattr(client, "get_irrigation_config", AsyncMock(return_value=expected))
+
+    assert await client.set_irrigation_program(1, program) == expected
+    assert fake_client.writes == frames
+    assert protocol.pack_commit() not in fake_client.writes
+
+
+async def test_set_irrigation_program_fails_on_readback_mismatch(monkeypatch):
+    fake_client = FakeWriteOnlyBleakClient()
+    client = SolemClient("AA:BB:CC:DD:EE:FF", max_station_num=1)
+    program: protocol.IrrigationProgram = {
+        "name": "A",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 2,
+        "synchro_day": 0,
+        "period_start_date": date(2026, 6, 1),
+        "start_times": [270],
+        "station_durations": [60],
+    }
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+    monkeypatch.setattr(client, "get_irrigation_config", AsyncMock(return_value={}))
+
+    with pytest.raises(SolemConnectionError, match="verification"):
+        await client.set_irrigation_program(0, program)
 
 
 async def test_get_station_names_from_capture(monkeypatch):

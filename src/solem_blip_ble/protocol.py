@@ -401,6 +401,9 @@ IRRIGATION_PROGRAM_COUNT = 3
 IRRIGATION_LOGICAL_CHUNKS = 7
 IRRIGATION_CHUNK_MIN_LENGTHS = (20, 20, 11, 20, 19, 19, 10)
 DISABLED_START_TIME = 1440
+MAX_PROGRAM_NAME_BYTES = 31
+MAX_START_TIMES = 8
+MAX_PROGRAM_STATIONS = 12
 
 
 class IrrigationProgram(TypedDict):
@@ -422,6 +425,182 @@ class IrrigationConfigFragment(TypedDict):
     logical_chunk: int
 
 
+def _validate_u16(value: int, field: str) -> None:
+    if not 0 <= value <= 0xFFFF:
+        raise ValueError(f"{field} must be between 0 and 65535")
+
+
+def _validate_u8(value: int, field: str) -> None:
+    if not 0 <= value <= 0xFF:
+        raise ValueError(f"{field} must be between 0 and 255")
+
+
+def _validated_period_date(program: IrrigationProgram, today: date | None) -> date:
+    period_start_date = program.get("period_start_date")
+    if period_start_date is not None:
+        return period_start_date
+    return today or date.today()
+
+
+def _normalized_start_times(program: IrrigationProgram) -> list[int]:
+    start_times = list(program["start_times"])
+    if len(start_times) > MAX_START_TIMES:
+        raise ValueError("start_times must contain at most 8 entries")
+    start_times.extend([None] * (MAX_START_TIMES - len(start_times)))
+
+    normalized: list[int] = []
+    for minutes in start_times:
+        if minutes is None:
+            normalized.append(DISABLED_START_TIME)
+            continue
+        if not 0 <= minutes < DISABLED_START_TIME:
+            raise ValueError("start time minutes must be between 0 and 1439")
+        normalized.append(minutes)
+    return normalized
+
+
+def _normalized_station_durations(
+    program: IrrigationProgram, *, max_stations: int
+) -> list[int]:
+    if not 1 <= max_stations <= MAX_PROGRAM_STATIONS:
+        raise ValueError("max_stations must be between 1 and 12")
+    durations = list(program["station_durations"])
+    if len(durations) > max_stations:
+        raise ValueError(f"station_durations must contain at most {max_stations} entries")
+    durations.extend([0] * (MAX_PROGRAM_STATIONS - len(durations)))
+
+    normalized: list[int] = []
+    for seconds in durations:
+        if not 0 <= seconds <= 0xFFFFFF:
+            raise ValueError("station durations must be between 0 and 16777215 seconds")
+        normalized.append(seconds)
+    return normalized
+
+
+def normalize_irrigation_program_for_write(
+    program: IrrigationProgram,
+    *,
+    today: date | None = None,
+    max_stations: int = MAX_STATION_NUM,
+) -> IrrigationProgram:
+    """Return the program shape expected after a successful inferred V5 write."""
+    _validate_u16(program["inter_station_delay"], "inter_station_delay")
+    _validate_u16(program["water_budget"], "water_budget")
+    _validate_u8(program["cycle"], "cycle")
+    _validate_u8(program["week_days"], "week_days")
+    _validate_u8(program["period_length"], "period_length")
+    _validate_u8(program["synchro_day"], "synchro_day")
+
+    name = program["name"].encode("utf-8")[:MAX_PROGRAM_NAME_BYTES].decode(
+        "utf-8",
+        errors="replace",
+    )
+    start_times = [
+        None if minutes == DISABLED_START_TIME else minutes
+        for minutes in _normalized_start_times(program)
+    ]
+    station_durations = _normalized_station_durations(
+        program, max_stations=max_stations
+    )[:max_stations]
+
+    return {
+        "name": name,
+        "inter_station_delay": program["inter_station_delay"],
+        "water_budget": program["water_budget"],
+        "cycle": program["cycle"],
+        "week_days": program["week_days"],
+        "period_length": program["period_length"],
+        "synchro_day": program["synchro_day"],
+        "period_start_date": _validated_period_date(program, today),
+        "start_times": start_times,
+        "station_durations": station_durations,
+    }
+
+
+def pack_set_irrigation_program(
+    program_index: int,
+    program: IrrigationProgram,
+    *,
+    today: date | None = None,
+    max_stations: int = MAX_STATION_NUM,
+) -> list[bytes]:
+    """Pack inferred V5 frames for writing one persisted irrigation program.
+
+    This is the capture-inferred configuration path, not the manual-command
+    path, so callers must not append the manual ``3b00`` commit frame unless
+    hardware validation later proves it is required.
+    """
+    if not 0 <= program_index < IRRIGATION_PROGRAM_COUNT:
+        raise ValueError("program_index must be between 0 and 2")
+
+    normalized = normalize_irrigation_program_for_write(
+        program,
+        today=today,
+        max_stations=max_stations,
+    )
+
+    key = 0x10 | (program_index & 0x0F)
+    name = normalized["name"].encode("utf-8")[:MAX_PROGRAM_NAME_BYTES]
+    name = name.ljust(MAX_PROGRAM_NAME_BYTES, b"\x00")
+    period_start_date = normalized["period_start_date"]
+    assert period_start_date is not None
+    start_times = [
+        DISABLED_START_TIME if minutes is None else minutes
+        for minutes in normalized["start_times"]
+    ]
+    station_durations = normalized["station_durations"] + [0] * (
+        MAX_PROGRAM_STATIONS - len(normalized["station_durations"])
+    )
+
+    frames: list[bytes] = [
+        bytes([0x2F, 0x12, 0x00, key, *name[:16]]),
+        bytes([0x2F, 0x12, 0x01, key, *name[16:31], 0x00]),
+        bytes(
+            [
+                0x37,
+                0x0E,
+                0x00,
+                key,
+                (normalized["inter_station_delay"] >> 8) & 0xFF,
+                normalized["inter_station_delay"] & 0xFF,
+                (normalized["water_budget"] >> 8) & 0xFF,
+                normalized["water_budget"] & 0xFF,
+                normalized["cycle"] & 0xFF,
+                normalized["week_days"] & 0xFF,
+                normalized["period_length"] & 0xFF,
+                normalized["synchro_day"] & 0xFF,
+                period_start_date.day,
+                period_start_date.month,
+                (period_start_date.year >> 8) & 0xFF,
+                period_start_date.year & 0xFF,
+            ]
+        ),
+    ]
+
+    start_frame = bytearray([0x37, 0x12, 0x01, key, *([0] * 16)])
+    for slot, minutes in enumerate(start_times):
+        offset = 4 + slot * 2
+        start_frame[offset] = (minutes >> 8) & 0xFF
+        start_frame[offset + 1] = minutes & 0xFF
+    frames.append(bytes(start_frame))
+
+    for chunk_id, station_range, frame_len in (
+        (0x02, range(0, 5), 19),
+        (0x03, range(5, 10), 19),
+        (0x04, range(10, 12), 10),
+    ):
+        frame = bytearray([0x37, frame_len - 2, chunk_id, key, *([0] * (frame_len - 4))])
+        for slot, station_index in enumerate(station_range):
+            seconds = station_durations[station_index]
+            offset = 4 + slot * 3
+            frame[offset] = (seconds >> 16) & 0xFF
+            frame[offset + 1] = (seconds >> 8) & 0xFF
+            frame[offset + 2] = seconds & 0xFF
+        frames.append(bytes(frame))
+
+    return frames
+
+
 def pack_get_irrigation_config() -> bytes:
     """Pack a V5 request for persisted irrigation program configuration."""
     return bytes([0x39, 0x00])
@@ -430,16 +609,24 @@ def pack_get_irrigation_config() -> bytes:
 def normalize_config_notification(data: bytes | bytearray) -> bytes | None:
     """Normalize a V5 irrigation-config notification to canonical layout.
 
-    Accepts bare frames (command at byte 0), response-type offset (0x3a), and
-    hardware-wrapped frames (0x10 prefix).
+    Accepts bare read/write config frames (command at byte 0), response-type
+    offsets (0x30, 0x38, 0x3a), and hardware-wrapped frames (0x10 prefix).
     """
     if len(data) < 4:
         return None
 
-    if data[0] in (0x39, 0x3A):
+    if data[0] in (0x2F, 0x37, 0x39, 0x3A):
         return bytes(data)
-    if data[0] == 0x10 and len(data) >= 5 and data[1] in (0x39, 0x3A):
+    if data[0] == 0x30:
+        return bytes([0x2F, *data[1:]])
+    if data[0] == 0x38:
+        return bytes([0x37, *data[1:]])
+    if data[0] == 0x10 and len(data) >= 5 and data[1] in (0x2F, 0x37, 0x39, 0x3A):
         return bytes(data[1:])
+    if data[0] == 0x10 and len(data) >= 5 and data[1] == 0x30:
+        return bytes([0x2F, *data[2:]])
+    if data[0] == 0x10 and len(data) >= 5 and data[1] == 0x38:
+        return bytes([0x37, *data[2:]])
     return None
 
 

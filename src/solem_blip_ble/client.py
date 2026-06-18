@@ -770,6 +770,47 @@ class SolemClient:
 
         return await _attempt()
 
+    async def set_irrigation_program(
+        self,
+        program_index: int,
+        program: protocol.IrrigationProgram,
+    ) -> dict[int, protocol.IrrigationProgram]:
+        """Write one persisted V5 irrigation program and verify by reading it back."""
+        frames = protocol.pack_set_irrigation_program(
+            program_index,
+            program,
+            max_stations=self.max_station_num,
+        )
+        expected = protocol.normalize_irrigation_program_for_write(
+            program,
+            max_stations=self.max_station_num,
+        )
+
+        if self.mock:
+            programs = await self.get_irrigation_config()
+            programs[program_index] = expected
+            return programs
+
+        @retry(
+            stop=stop_after_attempt(REQUEST_MAX_ATTEMPTS),
+            wait=wait_fixed(REQUEST_RETRY_DELAY),
+            retry=retry_if_exception_type(SolemConnectionError),
+            reraise=True,
+        )
+        async def _attempt_write() -> None:
+            async def _op(client: BleakClient) -> None:
+                for frame in frames:
+                    await self._write(client, frame)
+
+            await self._run_with_client(_op)
+
+        await _attempt_write()
+        programs = await self.get_irrigation_config()
+        written = programs.get(program_index)
+        if written != expected:
+            raise SolemConnectionError("Irrigation program write verification failed")
+        return programs
+
     async def set_time(self, when: datetime | None = None) -> None:
         """Push local date/time to the device RTC (write-only, no commit)."""
         if self.mock:

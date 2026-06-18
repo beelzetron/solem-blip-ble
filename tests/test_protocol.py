@@ -1,6 +1,6 @@
 """Unit tests for Solem BL-IP protocol helpers."""
 
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 
@@ -65,6 +65,69 @@ def test_pack_commit():
 def test_pack_set_time():
     moment = datetime(2026, 5, 31, 22, 46, 14)
     assert protocol.pack_set_time(moment) == bytes.fromhex("0306007e051f162e0e")
+
+
+def test_pack_set_irrigation_program_inferred_v5_frames():
+    program: protocol.IrrigationProgram = {
+        "name": "Vasi",
+        "inter_station_delay": 3,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 2,
+        "synchro_day": 1,
+        "period_start_date": date(2026, 6, 1),
+        "start_times": [270, None, 600, None, None, None, None, None],
+        "station_durations": [0, 1500, 1800, 0, 0, 0],
+    }
+
+    frames = protocol.pack_set_irrigation_program(
+        1, program, today=date(2026, 5, 31), max_stations=6
+    )
+
+    assert frames == [
+        bytes.fromhex("2f12001156617369000000000000000000000000"),
+        bytes.fromhex("2f12011100000000000000000000000000000000"),
+        bytes.fromhex("370e001100030064047f0201010607ea"),
+        bytes.fromhex("37120111010e05a0025805a005a005a005a005a0"),
+        bytes.fromhex("371102110000000005dc000708000000000000"),
+        bytes.fromhex("37110311000000000000000000000000000000"),
+        bytes.fromhex("37080411000000000000"),
+    ]
+    assert protocol.normalize_irrigation_program_for_write(
+        program, today=date(2026, 5, 31), max_stations=6
+    ) == {
+        "name": "Vasi",
+        "inter_station_delay": 3,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 2,
+        "synchro_day": 1,
+        "period_start_date": date(2026, 6, 1),
+        "start_times": [270, None, 600, None, None, None, None, None],
+        "station_durations": [0, 1500, 1800, 0, 0, 0],
+    }
+
+
+def test_pack_set_irrigation_program_rejects_invalid_values():
+    program: protocol.IrrigationProgram = {
+        "name": "Too long",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 2,
+        "synchro_day": 0,
+        "period_start_date": None,
+        "start_times": [1440],
+        "station_durations": [0],
+    }
+
+    with pytest.raises(ValueError, match="start time"):
+        protocol.pack_set_irrigation_program(
+            0, program, today=date(2026, 6, 1), max_stations=1
+        )
 
 
 def test_parse_status_on_idle():

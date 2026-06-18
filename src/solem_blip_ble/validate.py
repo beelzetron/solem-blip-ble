@@ -8,11 +8,13 @@ import importlib.metadata
 import sys
 import time
 from collections.abc import Mapping
+from datetime import date
 from pathlib import Path
 from time import monotonic
 from typing import Any
 
 from bleak import BleakScanner
+from bleak.exc import BleakError
 
 from solem_blip_ble import (
     IrrigationProgram,
@@ -45,6 +47,7 @@ from solem_blip_ble.validate_common import (
     format_status,
     load_capture_events,
     off_days_capture_writes,
+    schedule_write_capture_writes,
     selected_sections,
     timestamp,
     write_capture_event,
@@ -63,6 +66,10 @@ ACTION_PROBE_PREFIXES = (
     "stop_after",
     "turn_on_",
     "turn_off_days_",
+)
+SCHEDULE_WRITE_PROBE_PREFIXES = (
+    "set_program_",
+    "readback_irrigation_config",
 )
 
 
@@ -169,6 +176,22 @@ async def _wait_for_program_watering(
 
 def _is_action_capture_probe(probe: str) -> bool:
     return any(probe.startswith(prefix) for prefix in ACTION_PROBE_PREFIXES)
+
+
+def _is_schedule_write_probe(probe: str) -> bool:
+    return any(probe.startswith(prefix) for prefix in SCHEDULE_WRITE_PROBE_PREFIXES)
+
+
+def _parse_hhmm(value: str) -> int:
+    try:
+        hour_text, minute_text = value.split(":", maxsplit=1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected HH:MM") from exc
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise argparse.ArgumentTypeError("expected HH:MM between 00:00 and 23:59")
+    return hour * 60 + minute
 
 
 async def _run_status_checks(
@@ -734,6 +757,191 @@ async def _capture_off_days(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _capture_schedule_write(args: argparse.Namespace) -> int:
+    try:
+        expected, writes = schedule_write_capture_writes(
+            program_index=args.write_schedule_program - 1,
+            program_name=args.write_schedule_name,
+            station=args.write_schedule_station,
+            duration_seconds=args.write_schedule_duration,
+            start_minutes=args.write_schedule_start,
+            max_stations=args.max_stations,
+            today=date.today(),
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    output_path = (
+        args.capture
+        if isinstance(args.capture, Path)
+        else default_capture_output(args.capture_prefix)
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    started = monotonic()
+    active_probe = "setup"
+    irrigation_first_fragments: dict[int, int] = {}
+    readback_payloads: list[bytes] = []
+
+    label = PROGRAM_LABELS[args.write_schedule_program - 1]
+    write_frames = [
+        (probe_name, payload)
+        for probe_name, payload in writes
+        if probe_name != "readback_irrigation_config"
+    ]
+    readback_frame = next(
+        payload
+        for probe_name, payload in writes
+        if probe_name == "readback_irrigation_config"
+    )
+
+    with output_path.open("w", encoding="utf-8") as output:
+        def record(direction: str, probe: str, payload: bytes, note: str = "") -> None:
+            write_capture_event(
+                output,
+                CaptureEvent(
+                    timestamp=timestamp(),
+                    elapsed_seconds=round(monotonic() - started, 6),
+                    direction=direction,
+                    probe=probe,
+                    payload_hex=payload.hex(),
+                    note=note,
+                ),
+                verbose=args.verbose,
+            )
+
+        def notification_handler(_sender: Any, data: bytearray) -> None:
+            payload = bytes(data)
+            if active_probe == "readback_irrigation_config":
+                readback_payloads.append(payload)
+            record(
+                "RX",
+                active_probe,
+                payload,
+                describe_notification(
+                    payload,
+                    probe=active_probe,
+                    irrigation_first_fragments=irrigation_first_fragments,
+                ),
+            )
+
+        async def write_frame_with_retry(
+            probe_name: str,
+            payload: bytes,
+            *,
+            dwell: float,
+        ) -> bool:
+            nonlocal active_probe
+            for attempt in range(1, args.write_schedule_frame_attempts + 1):
+                active_probe = probe_name
+                if attempt == 1:
+                    print(
+                        f"Write {probe_name}: {payload.hex()} "
+                        f"(listen {dwell:.0f}s)"
+                    )
+                else:
+                    print(
+                        f"Retry {probe_name} attempt {attempt}: {payload.hex()} "
+                        f"(listen {dwell:.0f}s)"
+                    )
+
+                try:
+                    device = await BleakScanner.find_device_by_address(
+                        args.mac, timeout=args.scan_timeout
+                    )
+                    if device is None:
+                        raise SolemConnectionError(f"Device not found: {args.mac}")
+
+                    client = SolemClient(
+                        args.mac,
+                        bluetooth_timeout=args.connect_timeout,
+                        ble_device=device,
+                    )
+                    async with client.raw_ble_session() as session:
+                        ble_client = session.client
+                        notify_char = session.notify_characteristic
+                        write_char = session.write_characteristic
+                        await ble_client.start_notify(
+                            notify_char,
+                            notification_handler,
+                        )
+                        await asyncio.sleep(args.settle_seconds)
+                        await ble_client.write_gatt_char(
+                            write_char,
+                            payload,
+                            response=False,
+                        )
+                        record("TX", probe_name, payload)
+                        await asyncio.sleep(dwell)
+                        active_probe = "teardown"
+                        await ble_client.stop_notify(notify_char)
+                    return True
+                except (BleakError, OSError, TimeoutError, SolemConnectionError) as exc:
+                    if attempt >= args.write_schedule_frame_attempts:
+                        print(
+                            f"Write {probe_name} failed after {attempt} attempt(s): "
+                            f"{exc}",
+                            file=sys.stderr,
+                        )
+                        return False
+                    print(
+                        f"Write {probe_name} attempt {attempt} failed: {exc}; "
+                        f"retrying after {args.write_schedule_reconnect_seconds:.1f}s",
+                        file=sys.stderr,
+                    )
+                    active_probe = "retry_wait"
+                    await asyncio.sleep(args.write_schedule_reconnect_seconds)
+            return False
+
+        print(
+            f"Schedule write capture: program {label}, "
+            f"station {args.write_schedule_station}, "
+            f"duration {args.write_schedule_duration}s"
+        )
+        for probe_name, payload in write_frames:
+            if not await write_frame_with_retry(
+                probe_name,
+                payload,
+                dwell=args.capture_seconds,
+            ):
+                print(f"Schedule write capture written to {output_path}")
+                return 1
+
+        print(
+            "Reconnecting for read-back "
+            f"(wait {args.write_schedule_reconnect_seconds:.0f}s)..."
+        )
+        await asyncio.sleep(args.write_schedule_reconnect_seconds)
+        if not await write_frame_with_retry(
+            "readback_irrigation_config",
+            readback_frame,
+            dwell=args.schedule_capture_seconds,
+        ):
+            print(f"Schedule write capture written to {output_path}")
+            return 1
+
+    programs = assemble_irrigation_programs(
+        readback_payloads,
+        max_stations=args.max_stations,
+    )
+    actual = programs.get(args.write_schedule_program - 1)
+    print(f"Schedule write capture written to {output_path}")
+    if actual == expected:
+        print("Read-back verification: PASS")
+        _print_program(args.write_schedule_program - 1, actual)
+        return 0
+
+    print("Read-back verification: FAIL")
+    print("Expected:")
+    _print_program(args.write_schedule_program - 1, expected)
+    if actual is None:
+        print(f"Program {label} was not present in read-back capture")
+    else:
+        print("Actual:")
+        _print_program(args.write_schedule_program - 1, actual)
+    return 1
+
+
 def _replay_status(events: list[dict[str, Any]], *, max_stations: int, verbose: bool) -> bool:
     payloads = [bytes.fromhex(event["payload_hex"]) for event in events]
     ok = False
@@ -828,10 +1036,53 @@ def _replay_actions(events: list[dict[str, Any]], *, max_stations: int, verbose:
     return ok
 
 
+def _replay_schedule_write(
+    events: list[dict[str, Any]], *, max_stations: int, verbose: bool
+) -> bool:
+    ok = False
+    readback_payloads: list[bytes] = []
+    first_fragments: dict[int, int] = {}
+    for event in events:
+        probe = event.get("probe", "")
+        if not _is_schedule_write_probe(probe):
+            continue
+        direction = event.get("direction")
+        payload = bytes.fromhex(event["payload_hex"])
+        if direction == "TX":
+            print(
+                f"tx {probe}: {event.get('payload_hex', '')} "
+                f"@ {event.get('elapsed_seconds', 0):.3f}s"
+            )
+            continue
+        if direction != "RX":
+            continue
+        if probe == "readback_irrigation_config":
+            readback_payloads.append(payload)
+        note = describe_notification(
+            payload,
+            probe=probe,
+            irrigation_first_fragments=first_fragments,
+        )
+        if verbose:
+            print(f"rx {probe}: {payload.hex()} | {note}")
+
+    if readback_payloads:
+        programs = assemble_irrigation_programs(
+            readback_payloads,
+            max_stations=max_stations,
+        )
+        if programs:
+            _print_programs(programs)
+            ok = irrigation_config_complete(readback_payloads)
+    return ok
+
+
 def _replay(args: argparse.Namespace) -> int:
-    include_actions = "actions" in (args.only or [])
+    include_actions = any(
+        section in (args.only or []) for section in ("actions", "schedule_write")
+    )
     sections = selected_sections(args.only, include_actions=include_actions)
-    events, used_paths = load_capture_events(args.replay)
+    events, used_paths = load_capture_events(args.replay, direction=None)
     if not events:
         paths = ", ".join(str(path) for path in args.replay)
         print(f"No capture events found in: {paths}", file=sys.stderr)
@@ -881,6 +1132,13 @@ def _replay(args: argparse.Namespace) -> int:
         )
         print()
 
+    if "schedule_write" in sections:
+        print("[schedule_write]")
+        section_ok["schedule_write"] = _replay_schedule_write(
+            events, max_stations=args.max_stations, verbose=args.verbose
+        )
+        print()
+
     print("-" * 60)
     failed = [name for name, ok in section_ok.items() if not ok]
     if failed:
@@ -903,11 +1161,13 @@ Sections (--only):
   schedule   Read persisted irrigation programs (3900)
   gatt       List GATT services and characteristics
   actions    Manual control writes (requires --actions)
+  schedule_write   Persist one test schedule, then read back
 
 Capture modes:
   --capture              Read probes only (status, firmware, names, schedule)
   --capture --actions    Action writes + notification capture (default: station 1, 1 min)
   --capture --actions --run-program 1   Program A run for --minutes, then stop
+  --capture --write-schedule 2          Write a small Program B schedule, then read back
   --capture-off-days 3   Turn off for 3 days, capture status, then turn back on
 
 Examples:
@@ -916,7 +1176,9 @@ Examples:
   validate-solem-blip AA:BB:CC:DD:EE:FF --only status --only firmware
   validate-solem-blip AA:BB:CC:DD:EE:FF --capture --verbose
   validate-solem-blip AA:BB:CC:DD:EE:FF --capture --actions --run-program 1 --minutes 1
+  validate-solem-blip AA:BB:CC:DD:EE:FF --capture --write-schedule 2 --write-schedule-station 5
   validate-solem-blip AA:BB:CC:DD:EE:FF --capture-off-days 3 --verbose
+  validate-solem-blip AA:BB:CC:DD:EE:FF --replay capture.jsonl --only schedule_write
   validate-solem-blip AA:BB:CC:DD:EE:FF --replay capture.jsonl --only actions
   validate-solem-blip AA:BB:CC:DD:EE:FF --actions --run-program 1 --minutes 1
 """.strip(),
@@ -958,6 +1220,50 @@ Examples:
         choices=range(1, 16),
         metavar="N",
         help="Capture turn-on, temporary off for N days, and turn-on recovery",
+    )
+    parser.add_argument(
+        "--write-schedule",
+        type=int,
+        choices=range(1, len(PROGRAM_LABELS) + 1),
+        metavar="N",
+        dest="write_schedule_program",
+        help="With --capture, write program N (1=A, 2=B, 3=C), then read back",
+    )
+    parser.add_argument(
+        "--write-schedule-name",
+        default="Codex Test",
+        help="Program name for --write-schedule (default: Codex Test)",
+    )
+    parser.add_argument(
+        "--write-schedule-start",
+        type=_parse_hhmm,
+        default=None,
+        metavar="HH:MM",
+        help="Optional start time for --write-schedule; omitted disables all starts",
+    )
+    parser.add_argument(
+        "--write-schedule-station",
+        type=int,
+        default=1,
+        help="Station enabled by --write-schedule (default: 1)",
+    )
+    parser.add_argument(
+        "--write-schedule-duration",
+        type=int,
+        default=60,
+        help="Station duration in seconds for --write-schedule (default: 60)",
+    )
+    parser.add_argument(
+        "--write-schedule-reconnect-seconds",
+        type=float,
+        default=3.0,
+        help="Delay before reconnecting for --write-schedule read-back (default: 3)",
+    )
+    parser.add_argument(
+        "--write-schedule-frame-attempts",
+        type=int,
+        default=3,
+        help="Attempts per --write-schedule frame after BLE reconnects (default: 3)",
     )
     parser.add_argument(
         "--run-program",
@@ -1040,6 +1346,18 @@ async def _async_main(args: argparse.Namespace) -> int:
     if args.run_program is not None and not args.actions:
         print("--run-program requires --actions", file=sys.stderr)
         return 2
+    if args.write_schedule_program is not None and not args.capture:
+        print("--write-schedule requires --capture", file=sys.stderr)
+        return 2
+    if args.write_schedule_program is not None and args.actions:
+        print("--write-schedule cannot be combined with --actions", file=sys.stderr)
+        return 2
+    if args.write_schedule_program is not None and args.capture_off_days is not None:
+        print("--write-schedule cannot be combined with --capture-off-days", file=sys.stderr)
+        return 2
+    if args.write_schedule_program is not None and args.replay:
+        print("--write-schedule cannot be combined with --replay", file=sys.stderr)
+        return 2
     if args.capture_off_days is not None and args.replay:
         print("--capture-off-days cannot be used with --replay", file=sys.stderr)
         return 2
@@ -1059,6 +1377,8 @@ async def _async_main(args: argparse.Namespace) -> int:
             args.capture = Path(args.capture)
         if args.actions:
             return await _capture_actions(args)
+        if args.write_schedule_program is not None:
+            return await _capture_schedule_write(args)
         return await _capture(args)
     if args.replay:
         return _replay(args)

@@ -517,6 +517,46 @@ def normalize_irrigation_program_for_write(
     }
 
 
+def irrigation_program_write_mismatches(
+    written: IrrigationProgram | None,
+    expected: IrrigationProgram,
+) -> dict[str, tuple[Any, Any]]:
+    """Return writable-field read-back mismatches as ``expected, actual`` pairs."""
+    if written is None:
+        return {"program": (expected, None)}
+
+    mismatches: dict[str, tuple[Any, Any]] = {}
+
+    if written["name"] != expected["name"]:
+        mismatches["name"] = (expected["name"], written["name"])
+    if written["inter_station_delay"] != expected["inter_station_delay"]:
+        mismatches["inter_station_delay"] = (
+            expected["inter_station_delay"],
+            written["inter_station_delay"],
+        )
+    if written["water_budget"] != expected["water_budget"]:
+        mismatches["water_budget"] = (expected["water_budget"], written["water_budget"])
+    if written["cycle"] != expected["cycle"]:
+        mismatches["cycle"] = (expected["cycle"], written["cycle"])
+    if written["week_days"] != expected["week_days"]:
+        mismatches["week_days"] = (expected["week_days"], written["week_days"])
+    if written["period_length"] != expected["period_length"]:
+        mismatches["period_length"] = (
+            expected["period_length"],
+            written["period_length"],
+        )
+    if written["synchro_day"] != expected["synchro_day"]:
+        mismatches["synchro_day"] = (expected["synchro_day"], written["synchro_day"])
+    if written["start_times"] != expected["start_times"]:
+        mismatches["start_times"] = (expected["start_times"], written["start_times"])
+    if written["station_durations"] != expected["station_durations"]:
+        mismatches["station_durations"] = (
+            expected["station_durations"],
+            written["station_durations"],
+        )
+    return mismatches
+
+
 def pack_set_irrigation_program(
     program_index: int,
     program: IrrigationProgram,

@@ -807,8 +807,15 @@ class SolemClient:
         await _attempt_write()
         programs = await self.get_irrigation_config()
         written = programs.get(program_index)
-        if written != expected:
-            raise SolemConnectionError("Irrigation program write verification failed")
+        mismatches = protocol.irrigation_program_write_mismatches(written, expected)
+        if mismatches:
+            details = ", ".join(
+                f"{field}: expected {expected_value!r}, got {actual_value!r}"
+                for field, (expected_value, actual_value) in mismatches.items()
+            )
+            raise SolemConnectionError(
+                f"Irrigation program write verification failed ({details})"
+            )
         return programs
 
     async def set_time(self, when: datetime | None = None) -> None:

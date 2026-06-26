@@ -473,6 +473,40 @@ async def test_set_irrigation_program_writes_frames_and_verifies(monkeypatch):
     assert protocol.pack_commit() not in fake_client.writes
 
 
+async def test_set_irrigation_program_accepts_period_start_readback_diff(monkeypatch):
+    fake_client = FakeWriteOnlyBleakClient()
+    client = SolemClient("AA:BB:CC:DD:EE:FF", max_station_num=3)
+    program: protocol.IrrigationProgram = {
+        "name": "Prato",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 2,
+        "synchro_day": 0,
+        "period_start_date": date(2026, 6, 24),
+        "start_times": [270, None, None, None, None, None, None, None],
+        "station_durations": [0, 1500, 1500],
+    }
+    expected = protocol.normalize_irrigation_program_for_write(
+        program,
+        max_stations=3,
+    )
+    readback = {2: {**expected, "period_start_date": date(2026, 6, 1)}}
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+    monkeypatch.setattr(
+        client,
+        "get_irrigation_config",
+        AsyncMock(return_value=readback),
+    )
+
+    assert await client.set_irrigation_program(2, program) == readback
+
+
 async def test_set_irrigation_program_fails_on_readback_mismatch(monkeypatch):
     fake_client = FakeWriteOnlyBleakClient()
     client = SolemClient("AA:BB:CC:DD:EE:FF", max_station_num=1)
@@ -495,7 +529,7 @@ async def test_set_irrigation_program_fails_on_readback_mismatch(monkeypatch):
     monkeypatch.setattr(client, "_run_with_client", run_with_client)
     monkeypatch.setattr(client, "get_irrigation_config", AsyncMock(return_value={}))
 
-    with pytest.raises(SolemConnectionError, match="verification"):
+    with pytest.raises(SolemConnectionError, match="program: expected"):
         await client.set_irrigation_program(0, program)
 
 

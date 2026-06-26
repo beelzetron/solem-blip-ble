@@ -110,6 +110,53 @@ def test_pack_set_irrigation_program_inferred_v5_frames():
     }
 
 
+def test_irrigation_program_write_mismatches_ignores_period_start_date():
+    expected: protocol.IrrigationProgram = {
+        "name": "Prato",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 2,
+        "synchro_day": 0,
+        "period_start_date": date(2026, 6, 24),
+        "start_times": [270, None, None, None, None, None, None, None],
+        "station_durations": [0, 1500, 1500],
+    }
+    written: protocol.IrrigationProgram = {
+        **expected,
+        "period_start_date": date(2026, 6, 1),
+    }
+
+    assert protocol.irrigation_program_write_mismatches(written, expected) == {}
+
+
+def test_irrigation_program_write_mismatches_reports_schedule_fields():
+    expected: protocol.IrrigationProgram = {
+        "name": "Prato",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 2,
+        "synchro_day": 0,
+        "period_start_date": date(2026, 6, 24),
+        "start_times": [270, None, None, None, None, None, None, None],
+        "station_durations": [0, 1500, 1500],
+    }
+    written: protocol.IrrigationProgram = {
+        **expected,
+        "start_times": [300, None, None, None, None, None, None, None],
+    }
+
+    assert protocol.irrigation_program_write_mismatches(written, expected) == {
+        "start_times": (
+            [270, None, None, None, None, None, None, None],
+            [300, None, None, None, None, None, None, None],
+        )
+    }
+
+
 def test_pack_set_irrigation_program_rejects_invalid_values():
     program: protocol.IrrigationProgram = {
         "name": "Too long",

@@ -13,19 +13,41 @@ Python BLE client library for Solem BL-IP Bluetooth irrigation controllers. Uses
 
 ## Developer Commands
 
+Dependencies are pinned by the committed `uv.lock` (hash-locked). Use `uv` so
+installs are reproducible and verified against the lock:
+
 ```bash
-# Install in editable mode with dev dependencies
-pip install -e ".[dev]"
+# Install locked dependencies (dev extra included); fail if the lock is stale
+uv sync --frozen
 
 # Run tests
-pytest -v
+uv run pytest -v
+
+# Run type checks
+uv run mypy src/solem_blip_ble
 
 # Build distributions
-python -m build
+uv build
 
-# Test on specific Python version
-python -m pytest -v tests/test_client.py
+# Test on a specific Python version
+UV_PYTHON=3.12 uv run pytest -v tests/test_client.py
+
+# Audit locked dependencies for known vulnerabilities
+uv export --frozen --no-emit-project -o /tmp/requirements.txt
+uvx pip-audit -r /tmp/requirements.txt --require-hashes --strict
 ```
+
+## Dependency hygiene (supply chain)
+
+- `uv.lock` is committed and hash-pinned. CI uses `uv sync --frozen` and fails if
+  the manifest and lock disagree.
+- After changing dependencies in `pyproject.toml`, refresh the lock and commit it
+  in the same PR: `uv lock && uv sync`. Review the lock diff.
+- Dependabot (`.github/dependabot.yml`) opens weekly PRs for pinned GitHub Actions
+  and for uv dependency updates (pyproject + uv.lock together).
+- CI runs `pip-audit` against the locked dependency set on every push/PR.
+- Never resolve floating versions into CI or the committed lock; change
+  `pyproject.toml` first, then `uv lock`.
 
 ## CI/CD Flow
 

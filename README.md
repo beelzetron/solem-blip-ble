@@ -17,8 +17,8 @@ Turn-off-for-N-days is capped at **15 days** per the pcman75 documentation.
 pip install solem-blip-ble
 # or from GitHub:
 pip install "solem-blip-ble @ git+https://github.com/beelzetron/solem-blip-ble.git@main"
-# or editable for development:
-pip install -e ".[dev]"
+# or editable for development (prefer uv; deps are hash-locked via uv.lock):
+uv sync --frozen
 ```
 
 ## CI/CD

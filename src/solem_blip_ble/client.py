@@ -40,6 +40,8 @@ from tenacity import (
 from .const import (
     COMMIT_COMMAND,
     DEFAULT_BLUETOOTH_TIMEOUT,
+    DISCONNECT_RETRY_ATTEMPTS,
+    DISCONNECT_RETRY_DELAY,
     DISCONNECT_TIMEOUT,
     IRRIGATION_CONFIG_IDLE_TIMEOUT,
     MAX_STATION_NUM,
@@ -128,6 +130,7 @@ class SolemClient:
         self._ble_device: BLEDevice | None = ble_device
         self._had_client = False
         self._session_generation = 0
+        self._cleanup_tasks: set[asyncio.Task[Any]] = set()
 
     async def _resolve_ble_device(self) -> BLEDevice:
         if self._ble_device is not None:
@@ -221,12 +224,55 @@ class SolemClient:
                 self.mac_address,
             )
             _cancel_task(disconnect_task)
+            self._schedule_disconnect_retry(client)
             return
 
         try:
             await disconnect_task
         except Exception:
             pass
+
+    def _schedule_disconnect_retry(self, client: BleakClient) -> None:
+        """Detach a bounded background retry for a resisted disconnect."""
+        task = asyncio.create_task(self._retry_disconnect(client))
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+        task.add_done_callback(_consume_task_exception)
+
+    async def _retry_disconnect(self, client: BleakClient) -> None:
+        """Retry a resisted disconnect so the stale link or slot frees early."""
+        for attempt in range(1, DISCONNECT_RETRY_ATTEMPTS + 1):
+            await asyncio.sleep(DISCONNECT_RETRY_DELAY)
+            if not client.is_connected:
+                _LOGGER.debug(
+                    "%s - Detached BLE client is no longer connected; "
+                    "background disconnect retry not needed",
+                    self.mac_address,
+                )
+                return
+            _LOGGER.debug(
+                "%s - Background disconnect retry attempt %d",
+                self.mac_address,
+                attempt,
+            )
+            try:
+                await asyncio.wait_for(
+                    client.disconnect(),
+                    timeout=DISCONNECT_TIMEOUT,
+                )
+            except Exception:
+                continue
+            _LOGGER.info(
+                "%s - Background disconnect retry succeeded on attempt %d",
+                self.mac_address,
+                attempt,
+            )
+            return
+        _LOGGER.warning(
+            "%s - Background disconnect retry gave up after %d attempts",
+            self.mac_address,
+            DISCONNECT_RETRY_ATTEMPTS,
+        )
 
     async def _invalidate_session(self) -> None:
         self._ble_device = None
@@ -258,16 +304,23 @@ class SolemClient:
         Session state is reset before awaiting anything, so an external
         cancellation (for example an integration-level disconnect timeout)
         can never leave a dead cached connection behind for the next
-        operation to reuse.
+        operation to reuse. A cancelled disconnect also schedules a
+        bounded background retry so the physical link or proxy slot is
+        not left to the lower layers to reap.
         """
         self._ble_device = None
         self._had_client = False
         self._session_generation += 1
         client = self._client
         self._client = None
-        async with self._operation_lock:
+        try:
+            async with self._operation_lock:
+                if client is not None:
+                    await self._disconnect_client(client)
+        except asyncio.CancelledError:
             if client is not None:
-                await self._disconnect_client(client)
+                self._schedule_disconnect_retry(client)
+            raise
 
     @asynccontextmanager
     async def raw_ble_session(self) -> AsyncIterator[SolemRawBleSession]:

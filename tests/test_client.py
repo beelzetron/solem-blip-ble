@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from solem_blip_ble.client import SolemClient
+from solem_blip_ble.const import DISCONNECT_RETRY_ATTEMPTS
 from solem_blip_ble import protocol
 from solem_blip_ble.exceptions import SolemConnectionError
 
@@ -773,6 +774,7 @@ async def test_operation_timeout_releases_lock_when_disconnect_resists_cancellat
     monkeypatch.setattr(client, "_get_connected_client", get_connected_client)
     monkeypatch.setattr("solem_blip_ble.client.OPERATION_TIMEOUT", 0.05)
     monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_TIMEOUT", 0.01)
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_RETRY_DELAY", 0.01)
 
     with pytest.raises(SolemConnectionError, match="timed out"):
         await client._run_with_client(hang)
@@ -780,6 +782,8 @@ async def test_operation_timeout_releases_lock_when_disconnect_resists_cancellat
     await disconnect_cancelled.wait()
     assert await client._run_with_client(ok) == "ok"
     release_disconnect.set()
+    for task in list(client._cleanup_tasks):
+        await task
 
 
 async def test_operation_timeout_releases_lock_when_operation_resists_cancellation(
@@ -887,6 +891,7 @@ async def test_external_cancellation_releases_lock_when_disconnect_hangs(
     client._client = fake_client
     monkeypatch.setattr(client, "_get_connected_client", get_connected_client)
     monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_TIMEOUT", 0.01)
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_RETRY_DELAY", 0.01)
 
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(client._run_with_client(hang), timeout=0.05)
@@ -894,6 +899,8 @@ async def test_external_cancellation_releases_lock_when_disconnect_hangs(
     await disconnect_cancelled.wait()
     assert await client._run_with_client(ok) == "ok"
     release_disconnect.set()
+    for task in list(client._cleanup_tasks):
+        await task
 
 
 async def test_external_cancellation_releases_lock_when_operation_hangs(
@@ -946,22 +953,29 @@ async def test_disconnect_is_bounded_when_cleanup_hangs(monkeypatch) -> None:
     fake_client.disconnect = disconnect
     client._client = fake_client
     monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_TIMEOUT", 0.01)
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_RETRY_DELAY", 0.01)
 
     await asyncio.wait_for(client.disconnect(), timeout=0.05)
 
     assert client._client is None
     release_disconnect.set()
+    for task in list(client._cleanup_tasks):
+        await task
 
 
-async def test_disconnect_resets_session_when_cancelled_waiting_for_operation() -> None:
+async def test_disconnect_resets_session_when_cancelled_waiting_for_operation(
+    monkeypatch,
+) -> None:
     """Cancelling a queued disconnect still resets the cached session state."""
     client = SolemClient("AA:BB:CC:DD:EE:FF")
     fake_client = FakeWriteOnlyBleakClient()
+    fake_client.is_connected = False
     fake_client.disconnect = AsyncMock()
     client._client = fake_client
     client._ble_device = object()
     client._had_client = True
     release_operation = asyncio.Event()
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_RETRY_DELAY", 0.01)
 
     async def hold_operation_lock() -> None:
         async with client._operation_lock:
@@ -980,13 +994,18 @@ async def test_disconnect_resets_session_when_cancelled_waiting_for_operation() 
     assert client._ble_device is None
     assert client._had_client is False
     assert client._session_generation == 1
+    assert len(client._cleanup_tasks) == 1
     assert fake_client.disconnect.await_count == 0
 
     release_operation.set()
     await holder
+    for task in list(client._cleanup_tasks):
+        await task
 
 
-async def test_disconnect_resets_session_when_cancelled_during_teardown() -> None:
+async def test_disconnect_resets_session_when_cancelled_during_teardown(
+    monkeypatch,
+) -> None:
     """Cancelling disconnect mid-teardown still leaves a fresh session."""
     client = SolemClient("AA:BB:CC:DD:EE:FF")
     fake_client = FakeWriteOnlyBleakClient()
@@ -1004,6 +1023,8 @@ async def test_disconnect_resets_session_when_cancelled_during_teardown() -> Non
     client._client = fake_client
     client._ble_device = object()
     client._had_client = True
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_TIMEOUT", 0.01)
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_RETRY_DELAY", 0.01)
 
     disconnect_task = asyncio.create_task(client.disconnect())
     await asyncio.sleep(0)
@@ -1018,7 +1039,8 @@ async def test_disconnect_resets_session_when_cancelled_during_teardown() -> Non
     assert client._session_generation == 1
 
     release_disconnect.set()
-    await asyncio.sleep(0)
+    for task in list(client._cleanup_tasks):
+        await task
 
 
 async def test_next_operation_after_cancelled_disconnect_uses_fresh_client(
@@ -1027,11 +1049,13 @@ async def test_next_operation_after_cancelled_disconnect_uses_fresh_client(
     """A cancelled disconnect cannot poison the next operation's connection."""
     client = SolemClient("AA:BB:CC:DD:EE:FF")
     stale_client = FakeWriteOnlyBleakClient()
+    stale_client.is_connected = False
     stale_client.disconnect = AsyncMock()
     client._client = stale_client
     client._ble_device = object()
     client._had_client = True
     release_operation = asyncio.Event()
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_RETRY_DELAY", 0.01)
 
     async def hold_operation_lock() -> None:
         async with client._operation_lock:
@@ -1065,6 +1089,114 @@ async def test_next_operation_after_cancelled_disconnect_uses_fresh_client(
     assert seen == [fresh_client]
     assert client._client is fresh_client
     assert stale_client.disconnect.await_count == 0
+    for task in list(client._cleanup_tasks):
+        await task
+
+
+async def test_timed_out_disconnect_retries_in_background(monkeypatch) -> None:
+    """A resisted disconnect is retried detached until the link frees."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+    disconnect_calls = 0
+    first_cancelled = asyncio.Event()
+    release_first = asyncio.Event()
+    retry_succeeded = asyncio.Event()
+
+    async def disconnect():
+        nonlocal disconnect_calls
+        disconnect_calls += 1
+        if disconnect_calls == 1:
+            try:
+                await asyncio.sleep(100)
+            except asyncio.CancelledError:
+                first_cancelled.set()
+                await release_first.wait()
+            return
+        retry_succeeded.set()
+
+    fake_client.disconnect = disconnect
+    client._client = fake_client
+    client._ble_device = object()
+    client._had_client = True
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_TIMEOUT", 0.01)
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_RETRY_DELAY", 0.01)
+
+    await asyncio.wait_for(client.disconnect(), timeout=0.2)
+
+    assert client._client is None
+    assert disconnect_calls == 1
+    assert len(client._cleanup_tasks) == 1
+
+    release_first.set()
+    for task in list(client._cleanup_tasks):
+        await task
+
+    assert disconnect_calls == 2
+    assert retry_succeeded.is_set()
+    assert not client._cleanup_tasks
+
+
+async def test_disconnect_retry_skips_when_link_already_gone(monkeypatch) -> None:
+    """The background retry does nothing once the detached link is gone."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+    disconnect_calls = 0
+
+    async def disconnect():
+        nonlocal disconnect_calls
+        disconnect_calls += 1
+        await asyncio.sleep(100)
+
+    fake_client.disconnect = disconnect
+    client._client = fake_client
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_TIMEOUT", 0.01)
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_RETRY_DELAY", 0.01)
+
+    await asyncio.wait_for(client.disconnect(), timeout=0.2)
+    fake_client.is_connected = False
+
+    for task in list(client._cleanup_tasks):
+        await task
+
+    assert disconnect_calls == 1
+    assert not client._cleanup_tasks
+
+
+async def test_disconnect_retry_gives_up_after_attempts(monkeypatch) -> None:
+    """The background retry stops after the configured attempt count."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+    disconnect_calls = 0
+
+    async def disconnect():
+        nonlocal disconnect_calls
+        disconnect_calls += 1
+        await asyncio.sleep(100)
+
+    fake_client.disconnect = disconnect
+    client._client = fake_client
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_TIMEOUT", 0.01)
+    monkeypatch.setattr("solem_blip_ble.client.DISCONNECT_RETRY_DELAY", 0.01)
+
+    await asyncio.wait_for(client.disconnect(), timeout=0.2)
+    for task in list(client._cleanup_tasks):
+        await task
+
+    assert disconnect_calls == 1 + DISCONNECT_RETRY_ATTEMPTS
+    assert not client._cleanup_tasks
+
+
+async def test_successful_disconnect_does_not_schedule_retry() -> None:
+    """A prompt disconnect never detaches a background retry."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+    fake_client.disconnect = AsyncMock()
+    client._client = fake_client
+
+    await client.disconnect()
+
+    assert fake_client.disconnect.await_count == 1
+    assert not client._cleanup_tasks
 
 
 async def test_raw_ble_session_resolves_characteristics_and_disconnects() -> None:

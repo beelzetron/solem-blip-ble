@@ -253,13 +253,21 @@ class SolemClient:
             return client
 
     async def disconnect(self) -> None:
-        """Close the persistent BLE session."""
+        """Close the persistent BLE session.
+
+        Session state is reset before awaiting anything, so an external
+        cancellation (for example an integration-level disconnect timeout)
+        can never leave a dead cached connection behind for the next
+        operation to reuse.
+        """
+        self._ble_device = None
+        self._had_client = False
+        self._session_generation += 1
+        client = self._client
+        self._client = None
         async with self._operation_lock:
-            async with self._conn_lock:
-                self._ble_device = None
-                self._had_client = False
-                self._session_generation += 1
-                await self._drop_client_unsafe()
+            if client is not None:
+                await self._disconnect_client(client)
 
     @asynccontextmanager
     async def raw_ble_session(self) -> AsyncIterator[SolemRawBleSession]:
@@ -277,8 +285,10 @@ class SolemClient:
                     write_characteristic=_find_characteristic(client, WRITE_CHAR_UUID),
                 )
             finally:
-                async with self._conn_lock:
-                    await self._drop_client_unsafe()
+                stale_client = self._client
+                self._client = None
+                if stale_client is not None:
+                    await self._disconnect_client(stale_client)
 
     async def _execute_locked_operation(
         self,

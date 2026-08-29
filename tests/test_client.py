@@ -953,6 +953,120 @@ async def test_disconnect_is_bounded_when_cleanup_hangs(monkeypatch) -> None:
     release_disconnect.set()
 
 
+async def test_disconnect_resets_session_when_cancelled_waiting_for_operation() -> None:
+    """Cancelling a queued disconnect still resets the cached session state."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+    fake_client.disconnect = AsyncMock()
+    client._client = fake_client
+    client._ble_device = object()
+    client._had_client = True
+    release_operation = asyncio.Event()
+
+    async def hold_operation_lock() -> None:
+        async with client._operation_lock:
+            await release_operation.wait()
+
+    holder = asyncio.create_task(hold_operation_lock())
+    await asyncio.sleep(0)
+    disconnect_task = asyncio.create_task(client.disconnect())
+    await asyncio.sleep(0)
+
+    disconnect_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await disconnect_task
+
+    assert client._client is None
+    assert client._ble_device is None
+    assert client._had_client is False
+    assert client._session_generation == 1
+    assert fake_client.disconnect.await_count == 0
+
+    release_operation.set()
+    await holder
+
+
+async def test_disconnect_resets_session_when_cancelled_during_teardown() -> None:
+    """Cancelling disconnect mid-teardown still leaves a fresh session."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    fake_client = FakeWriteOnlyBleakClient()
+    disconnect_cancelled = asyncio.Event()
+    release_disconnect = asyncio.Event()
+
+    async def disconnect():
+        try:
+            await asyncio.sleep(100)
+        except asyncio.CancelledError:
+            disconnect_cancelled.set()
+            await release_disconnect.wait()
+
+    fake_client.disconnect = disconnect
+    client._client = fake_client
+    client._ble_device = object()
+    client._had_client = True
+
+    disconnect_task = asyncio.create_task(client.disconnect())
+    await asyncio.sleep(0)
+    disconnect_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await disconnect_task
+    await disconnect_cancelled.wait()
+
+    assert client._client is None
+    assert client._ble_device is None
+    assert client._had_client is False
+    assert client._session_generation == 1
+
+    release_disconnect.set()
+    await asyncio.sleep(0)
+
+
+async def test_next_operation_after_cancelled_disconnect_uses_fresh_client(
+    monkeypatch,
+) -> None:
+    """A cancelled disconnect cannot poison the next operation's connection."""
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    stale_client = FakeWriteOnlyBleakClient()
+    stale_client.disconnect = AsyncMock()
+    client._client = stale_client
+    client._ble_device = object()
+    client._had_client = True
+    release_operation = asyncio.Event()
+
+    async def hold_operation_lock() -> None:
+        async with client._operation_lock:
+            await release_operation.wait()
+
+    holder = asyncio.create_task(hold_operation_lock())
+    await asyncio.sleep(0)
+    disconnect_task = asyncio.create_task(client.disconnect())
+    await asyncio.sleep(0)
+    disconnect_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await disconnect_task
+
+    release_operation.set()
+    await holder
+
+    fresh_client = FakeWriteOnlyBleakClient()
+    seen: list[FakeWriteOnlyBleakClient] = []
+
+    async def establish_ble_connection():
+        return fresh_client
+
+    async def operation(bleak_client):
+        seen.append(bleak_client)
+        return "ok"
+
+    monkeypatch.setattr(client, "_establish_ble_connection", establish_ble_connection)
+
+    assert await client._run_with_client(operation) == "ok"
+
+    assert seen == [fresh_client]
+    assert client._client is fresh_client
+    assert stale_client.disconnect.await_count == 0
+
+
 async def test_raw_ble_session_resolves_characteristics_and_disconnects() -> None:
     client = SolemClient("AA:BB:CC:DD:EE:FF")
     fake_client = FakeRawBleakClient()

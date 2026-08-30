@@ -20,9 +20,14 @@ try:
 except ImportError:  # bleak < 3.0 (Home Assistant core ships 2.x)
     BleakGATTProtocolError = BleakDBusError  # type: ignore[misc, assignment]
 
+# Backend timeout errors are treated like GATT protocol failures: some backends
+# (for example bleak-esphome) raise a bare TimeoutError after a GATT operation
+# times out. Mapping it here ensures the session is invalidated and the
+# operation can be retried on a fresh connection instead of failing the poll.
 _BLE_GATT_ERRORS: tuple[type[Exception], ...] = (
     BleakGATTProtocolError,
     BleakDBusError,
+    asyncio.TimeoutError,
 )
 from bleak_retry_connector import (
     BleakClientWithServiceCache,

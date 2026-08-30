@@ -13,20 +13,16 @@ from typing import Any, AsyncIterator, TypeVar
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
-from bleak.exc import BleakDBusError
+from bleak.exc import BleakError
 
-try:
-    from bleak.exc import BleakGATTProtocolError
-except ImportError:  # bleak < 3.0 (Home Assistant core ships 2.x)
-    BleakGATTProtocolError = BleakDBusError  # type: ignore[misc, assignment]
-
-# Backend timeout errors are treated like GATT protocol failures: some backends
-# (for example bleak-esphome) raise a bare TimeoutError after a GATT operation
-# times out. Mapping it here ensures the session is invalidated and the
-# operation can be retried on a fresh connection instead of failing the poll.
+# Backend-level errors are treated as session-level BLE errors. BleakError is
+# the base class every backend error family derives from: bleak-esphome wraps
+# connection-dropped / GATT / API failures (and some timeouts surface as bare
+# TimeoutError). Mapping the base here ensures the session is invalidated and
+# the operation can be retried on a fresh connection instead of failing the
+# poll, for every current and future backend error type.
 _BLE_GATT_ERRORS: tuple[type[Exception], ...] = (
-    BleakGATTProtocolError,
-    BleakDBusError,
+    BleakError,
     asyncio.TimeoutError,
 )
 from bleak_retry_connector import (
@@ -199,7 +195,7 @@ class SolemClient:
             raise SolemConnectionError(
                 "Bluetooth adapter/proxy out of connection slots or device busy"
             ) from exc
-        except (BleakDBusError, TimeoutError, OSError) as exc:
+        except (BleakError, TimeoutError, OSError) as exc:
             raise SolemConnectionError("Timeout connecting to device") from exc
         except Exception as exc:
             raise SolemConnectionError("Unexpected BLE connection error") from exc

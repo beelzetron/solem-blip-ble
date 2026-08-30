@@ -1237,3 +1237,92 @@ async def test_resolver_does_not_fall_back_to_standalone_scanner(monkeypatch):
         pass
     else:
         raise AssertionError("missing resolver device must fail")
+
+
+class FlakyStartNotifyBleakClient(FakeCommandBleakClient):
+    """Fail the first start_notify with a bare backend TimeoutError."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_notify_calls = 0
+
+    async def start_notify(self, _uuid: str, handler) -> None:
+        self.start_notify_calls += 1
+        if self.start_notify_calls == 1:
+            raise TimeoutError(
+                "Timeout waiting for BluetoothGATTWriteResponse, "
+                "BluetoothGATTErrorResponse, BluetoothDeviceConnectionResponse "
+                "after 30.0s"
+            )
+        await super().start_notify(_uuid, handler)
+
+
+class AlwaysTimeoutStartNotifyBleakClient(FakeBleakClient):
+    """Fail every start_notify with a bare backend TimeoutError."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_notify_calls = 0
+        self.disconnects = 0
+
+    async def start_notify(self, _uuid: str, handler) -> None:
+        self.start_notify_calls += 1
+        raise TimeoutError(
+            "Timeout waiting for BluetoothGATTWriteResponse, "
+            "BluetoothGATTErrorResponse, BluetoothDeviceConnectionResponse "
+            "after 30.0s"
+        )
+
+    async def disconnect(self) -> None:
+        self.disconnects += 1
+        self.is_connected = False
+
+
+async def test_start_notify_backend_timeout_is_retried_in_operation(monkeypatch):
+    """A bare backend TimeoutError on start_notify is retried on the same session."""
+    fake_client = FlakyStartNotifyBleakClient()
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    client._client = fake_client
+    generation_before = client._session_generation
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_PARTIAL_RETRY_DELAY", 0)
+
+    status = await client.get_status()
+
+    assert status["is_watering"] is True
+    assert fake_client.start_notify_calls == 2
+    assert client._client is fake_client
+    assert client._session_generation == generation_before
+
+
+async def test_status_backend_timeout_invalidates_session_and_retries(monkeypatch):
+    """A persistent backend TimeoutError fails over to a fresh connection in-poll."""
+    stale = AlwaysTimeoutStartNotifyBleakClient()
+    fresh = FakeCommandBleakClient()
+    clients = [fresh]
+
+    async def fake_establish_connection(*_args, **_kwargs):
+        return clients.pop(0)
+
+    async def fake_resolve_ble_device():
+        return object()
+
+    client = SolemClient("AA:BB:CC:DD:EE:FF")
+    client._client = stale
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_PARTIAL_RETRY_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client.REQUEST_RETRY_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client.RECONNECT_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client.OPERATION_TIMEOUT", 5.0)
+    monkeypatch.setattr(
+        "solem_blip_ble.client.establish_connection", fake_establish_connection
+    )
+    monkeypatch.setattr(client, "_resolve_ble_device", fake_resolve_ble_device)
+
+    status = await client.get_status()
+
+    assert status["is_watering"] is True
+    assert stale.start_notify_calls == 3
+    assert stale.disconnects == 1
+    assert client._client is fresh
+    assert client._session_generation == 1

@@ -215,6 +215,64 @@ async def test_link_drop_fails_operation_immediately(monkeypatch) -> None:
     assert state["fake"].disconnects == 1
 
 
+async def test_disconnect_callback_identity_gate() -> None:
+    """Only the current connection's callback may arm the drop latch.
+
+    BleakClientWithServiceCache delivers ``disconnected_callback`` from the
+    underlying transport client, so a stale connection's late callback can
+    arrive while a newer operation is in flight; it must be ignored.
+    """
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    stale_client = object()
+    current_client = object()
+    client._current_client = current_client  # type: ignore[assignment]
+
+    client._on_disconnected(stale_client)  # type: ignore[arg-type]
+    assert client._link_dropped is False
+    assert not client._drop_event.is_set()
+
+    client._on_disconnected(current_client)  # type: ignore[arg-type]
+    assert client._link_dropped is True
+    assert client._drop_event.is_set()
+
+
+async def test_teardown_clears_latch_before_disconnect_callback(
+    monkeypatch,
+) -> None:
+    """A disconnect callback firing during intentional teardown must not
+    leave the latch armed for the next operation."""
+    state: dict[str, Any] = {}
+
+    class CallbackDuringTeardownClient(FakeV2Client):
+        async def disconnect(self) -> None:
+            self.disconnects += 1
+            self.is_connected = False
+            # Backend delivers the disconnect callback while the client is
+            # being torn down; by then the operation has already succeeded
+            # and the latch must not arm for the next operation.
+            state["real"]._on_disconnected(self)
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        state["fake"] = CallbackDuringTeardownClient()
+        return state["fake"]
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+    monkeypatch.setattr("solem_blip_ble.client_v2.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client_v2.OPERATION_DEADLINE", 10.0)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    state["real"] = client
+    await asyncio.wait_for(client.get_status(), timeout=5.0)
+
+    assert client._link_dropped is False
+    assert not client._drop_event.is_set()
+    assert state["fake"].disconnects == 1
+
+
 async def test_ble_device_cache_expires(monkeypatch) -> None:
     """Resolve is skipped while the cache is fresh, and re-run after expiry."""
     fake_connect = asyncio.Event()

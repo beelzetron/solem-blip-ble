@@ -103,6 +103,7 @@ class StatelessSolemClient:
         self._ble_device_cached_at: float | None = None
         self._link_dropped = False
         self._drop_event = asyncio.Event()
+        self._current_client: BleakClient | None = None
 
     # -- device resolution -------------------------------------------------
 
@@ -159,8 +160,19 @@ class StatelessSolemClient:
 
     # -- connection core ---------------------------------------------------
 
-    def _on_disconnected(self, _client: BleakClient) -> None:
-        """Backend disconnect callback: arm the drop latch and event."""
+    def _on_disconnected(self, client: BleakClient) -> None:
+        """Backend disconnect callback: arm the drop latch and event.
+
+        Only latches when the callback belongs to the connection this
+        operation is actually using. BleakClientWithServiceCache delivers
+        ``disconnected_callback`` from its underlying transport client, so
+        a *stale* connection's callback can arrive while a newer operation
+        is already in flight — without the identity gate it would falsely
+        kill a healthy operation (observed as back-to-back reads failing
+        with "BLE link dropped during operation").
+        """
+        if client is not self._current_client:
+            return
         self._link_dropped = True
         self._drop_event.set()
 
@@ -243,6 +255,7 @@ class StatelessSolemClient:
                     client = await asyncio.wait_for(
                         self._connect(), timeout=remaining
                     )
+                    self._current_client = client
                     remaining = deadline_at - time.monotonic()
                     if remaining <= 0:
                         raise SolemDeadlineExceeded(
@@ -282,6 +295,10 @@ class StatelessSolemClient:
                     if drop_task is not None:
                         drop_task.cancel()
                     if client is not None:
+                        if self._current_client is client:
+                            self._current_client = None
+                            self._link_dropped = False
+                            self._drop_event.clear()
                         await self._disconnect_quietly(client)
 
                 if (

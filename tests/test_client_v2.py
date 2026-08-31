@@ -183,16 +183,24 @@ async def test_persistent_failure_raises_deadline(monkeypatch) -> None:
     assert connect_attempts == 3  # REQUEST_MAX_ATTEMPTS, flat loop only
 
 
-async def test_link_drop_fails_operation_immediately(monkeypatch) -> None:
-    """A mid-operation drop raises SolemConnectionError right away."""
+async def test_confirmed_drop_kills_attempt_then_recovers(monkeypatch) -> None:
+    """A confirmed mid-operation drop aborts the attempt immediately instead
+    of hanging, then the flat retry reconnects fresh and recovers.
+
+    Single-client devices can kill the new link when the previous
+    connection has not fully released; with per-attempt fresh connects and
+    the retry delay, a drop is recoverable within the deadline."""
     state: dict[str, Any] = {}
 
     class DropThenHangClient(FakeV2Client):
         async def start_notify(self, _uuid: str, handler) -> None:
-            # Backend fires the disconnect callback on the REAL client while
-            # start_notify is in flight, then the operation hangs on the
-            # dead link. The client itself confirms the drop via
-            # is_connected=False (the confirmation _check_drop requires).
+            # Attempt 1: the backend confirms a real drop while start_notify
+            # is in flight, then the operation would hang on the dead link.
+            # Attempt 2 (fresh client): healthy subscribe.
+            if state.get("dropped"):
+                self.handler = handler
+                return
+            state["dropped"] = True
             self.is_connected = False
             state["real"]._link_dropped = True
             state["real"]._drop_event.set()
@@ -202,20 +210,29 @@ async def test_link_drop_fails_operation_immediately(monkeypatch) -> None:
         return object()
 
     async def fake_connect(self):
-        state["fake"] = DropThenHangClient()
-        return state["fake"]
+        state["real"] = self
+        client = DropThenHangClient()
+        state.setdefault("clients", []).append(client)
+        return client
 
     monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
     monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
     monkeypatch.setattr("solem_blip_ble.client_v2.NOTIFY_SETTLE_DELAY", 0)
-    monkeypatch.setattr("solem_blip_ble.client_v2.OPERATION_DEADLINE", 10.0)
+    monkeypatch.setattr("solem_blip_ble.client_v2.OPERATION_DEADLINE", 20.0)
 
     client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
-    state["real"] = client
-    with pytest.raises(SolemConnectionError, match="link dropped"):
-        await asyncio.wait_for(client.get_status(), timeout=2.0)
 
-    assert state["fake"].disconnects == 1
+    start = time.monotonic()
+    status = await asyncio.wait_for(client.get_status(), timeout=15.0)
+    elapsed = time.monotonic() - start
+
+    assert status["is_watering"] is True
+    # Two fresh connects; the dropped first client was closed; the whole
+    # operation stayed well inside the 20 s deadline.
+    clients = state["clients"]
+    assert len(clients) == 2
+    assert clients[0].disconnects == 1
+    assert elapsed < 20.0
 
 
 async def test_drop_hint_requires_client_confirmation() -> None:

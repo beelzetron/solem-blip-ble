@@ -262,10 +262,10 @@ class StatelessSolemClient:
 
         The deadline covers the whole operation including all retries. In
         the stateless model every attempt starts from a fresh connection,
-        so the flat loop retries any failure and the deadline alone stops
-        it. A mid-operation link drop is the one fatal case: the retry
-        would race into the freshly-dropped link, so it surfaces as
-        ``SolemConnectionError`` immediately.
+        so the flat loop retries any failure — including a confirmed
+        mid-operation drop: single-client devices can kill a new link while
+        the previous connection is still releasing, and the retry delay
+        gives them that moment. Only the deadline ends the operation.
         """
         if self.mock:
             raise SolemConnectionError("mock client has no BLE operations")
@@ -276,80 +276,85 @@ class StatelessSolemClient:
         deadline_at = time.monotonic() + deadline
         last_error: Exception | None = None
 
-        try:
-            for attempt in range(1, REQUEST_MAX_ATTEMPTS + 1):
+        for attempt in range(1, REQUEST_MAX_ATTEMPTS + 1):
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0:
+                raise SolemDeadlineExceeded(
+                    f"Operation deadline exceeded after {attempt - 1} attempt(s)"
+                ) from last_error
+
+            client: BleakClient | None = None
+            op_task: asyncio.Task[_T] | None = None
+            drop_task: asyncio.Task[Any] | None = None
+            try:
+                client = await asyncio.wait_for(
+                    self._connect(), timeout=remaining
+                )
+                self._active_client = client
                 remaining = deadline_at - time.monotonic()
                 if remaining <= 0:
                     raise SolemDeadlineExceeded(
-                        f"Operation deadline exceeded after {attempt - 1} attempt(s)"
-                    ) from last_error
+                        "Operation deadline exhausted during connect"
+                    )
+                op_task = asyncio.create_task(
+                    _await_operation(operation(client))
+                )
+                drop_task = asyncio.create_task(self._watch_drop(client))
+                done, _ = await asyncio.wait(
+                    {op_task, drop_task},
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if drop_task in done:
+                    # Confirmed drop (client says it is disconnected): abort
+                    # the attempt immediately instead of hanging on the dead
+                    # link; the flat retry reconnects fresh.
+                    raise SolemConnectionError(
+                        "BLE link dropped during operation"
+                    )
+                if op_task not in done:
+                    raise asyncio.TimeoutError(
+                        f"Operation deadline exceeded during attempt {attempt}"
+                    )
+                return op_task.result()
+            except asyncio.CancelledError:
+                raise
+            except SolemDeadlineExceeded:
+                raise
+            except (
+                asyncio.TimeoutError,
+                BleakError,
+                OSError,
+                SolemConnectionError,
+            ) as exc:
+                last_error = exc
+                _LOGGER.debug(
+                    "%s - Attempt %d failed: %s",
+                    self.mac_address,
+                    attempt,
+                    exc,
+                )
+            finally:
+                if op_task is not None and not op_task.done():
+                    op_task.cancel()
+                if drop_task is not None:
+                    drop_task.cancel()
+                if client is not None:
+                    if self._active_client is client:
+                        self._active_client = None
+                    self._link_dropped = False
+                    self._drop_event.clear()
+                    await self._disconnect_quietly(client)
 
-                client: BleakClient | None = None
-                op_task: asyncio.Task[_T] | None = None
-                drop_task: asyncio.Task[Any] | None = None
-                try:
-                    client = await asyncio.wait_for(
-                        self._connect(), timeout=remaining
-                    )
-                    self._active_client = client
-                    remaining = deadline_at - time.monotonic()
-                    if remaining <= 0:
-                        raise SolemDeadlineExceeded(
-                            "Operation deadline exhausted during connect"
-                        )
-                    op_task = asyncio.create_task(
-                        _await_operation(operation(client))
-                    )
-                    drop_task = asyncio.create_task(self._watch_drop(client))
-                    done, _ = await asyncio.wait(
-                        {op_task, drop_task},
-                        timeout=remaining,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if drop_task in done:
-                        raise _DropDetected()
-                    if op_task not in done:
-                        raise asyncio.TimeoutError(
-                            f"Operation deadline exceeded during attempt {attempt}"
-                        )
-                    return op_task.result()
-                except asyncio.CancelledError:
-                    raise
-                except SolemDeadlineExceeded:
-                    raise
-                except (asyncio.TimeoutError, BleakError, OSError, SolemConnectionError) as exc:
-                    last_error = exc
-                    _LOGGER.debug(
-                        "%s - Attempt %d failed: %s",
-                        self.mac_address,
-                        attempt,
-                        exc,
-                    )
-                finally:
-                    if op_task is not None and not op_task.done():
-                        op_task.cancel()
-                    if drop_task is not None:
-                        drop_task.cancel()
-                    if client is not None:
-                        if self._active_client is client:
-                            self._active_client = None
-                        self._link_dropped = False
-                        self._drop_event.clear()
-                        await self._disconnect_quietly(client)
+            if (
+                time.monotonic() < deadline_at
+                and attempt < REQUEST_MAX_ATTEMPTS
+            ):
+                await asyncio.sleep(REQUEST_RETRY_DELAY)
 
-                if (
-                    time.monotonic() < deadline_at
-                    and attempt < REQUEST_MAX_ATTEMPTS
-                ):
-                    await asyncio.sleep(REQUEST_RETRY_DELAY)
-
-            raise SolemDeadlineExceeded(
-                f"Operation deadline exceeded after {REQUEST_MAX_ATTEMPTS} attempt(s)"
-            ) from last_error
-        except _DropDetected as exc:
-            raise SolemConnectionError(
-                "BLE link dropped during operation"
-            ) from exc
+        raise SolemDeadlineExceeded(
+            f"Operation deadline exceeded after {REQUEST_MAX_ATTEMPTS} attempt(s)"
+        ) from last_error
 
     # -- shared operation helpers ------------------------------------------
 

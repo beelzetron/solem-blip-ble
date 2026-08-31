@@ -215,23 +215,24 @@ async def test_link_drop_fails_operation_immediately(monkeypatch) -> None:
     assert state["fake"].disconnects == 1
 
 
-async def test_disconnect_callback_identity_gate() -> None:
+async def test_disconnect_callback_epoch_gate() -> None:
     """Only the current connection's callback may arm the drop latch.
 
-    BleakClientWithServiceCache delivers ``disconnected_callback`` from the
-    underlying transport client, so a stale connection's late callback can
-    arrive while a newer operation is in flight; it must be ignored.
+    Backends deliver ``disconnected_callback`` through wrapper objects whose
+    identity is not connection-unique, so callbacks are gated by a
+    per-connection epoch: a stale connection's late callback must be
+    ignored while a newer operation is in flight.
     """
     client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
-    stale_client = object()
-    current_client = object()
-    client._current_client = current_client  # type: ignore[assignment]
 
-    client._on_disconnected(stale_client)  # type: ignore[arg-type]
+    stale_cb = client._make_disconnect_callback()
+    current_cb = client._make_disconnect_callback()
+
+    stale_cb(object())  # type: ignore[arg-type]
     assert client._link_dropped is False
     assert not client._drop_event.is_set()
 
-    client._on_disconnected(current_client)  # type: ignore[arg-type]
+    current_cb(object())  # type: ignore[arg-type]
     assert client._link_dropped is True
     assert client._drop_event.is_set()
 
@@ -248,14 +249,16 @@ async def test_teardown_clears_latch_before_disconnect_callback(
             self.disconnects += 1
             self.is_connected = False
             # Backend delivers the disconnect callback while the client is
-            # being torn down; by then the operation has already succeeded
-            # and the latch must not arm for the next operation.
-            state["real"]._on_disconnected(self)
+            # being torn down; the operation has already succeeded and the
+            # epoch was retired before the close, so the latch must not arm
+            # for the next operation.
+            state["callback"](self)
 
     async def fake_resolve(self):
         return object()
 
     async def fake_connect(self):
+        state["callback"] = self._make_disconnect_callback()
         state["fake"] = CallbackDuringTeardownClient()
         return state["fake"]
 
@@ -265,7 +268,6 @@ async def test_teardown_clears_latch_before_disconnect_callback(
     monkeypatch.setattr("solem_blip_ble.client_v2.OPERATION_DEADLINE", 10.0)
 
     client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
-    state["real"] = client
     await asyncio.wait_for(client.get_status(), timeout=5.0)
 
     assert client._link_dropped is False

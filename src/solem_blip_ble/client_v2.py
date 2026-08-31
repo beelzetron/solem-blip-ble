@@ -103,7 +103,7 @@ class StatelessSolemClient:
         self._ble_device_cached_at: float | None = None
         self._link_dropped = False
         self._drop_event = asyncio.Event()
-        self._current_client: BleakClient | None = None
+        self._connection_epoch = 0
 
     # -- device resolution -------------------------------------------------
 
@@ -160,21 +160,27 @@ class StatelessSolemClient:
 
     # -- connection core ---------------------------------------------------
 
-    def _on_disconnected(self, client: BleakClient) -> None:
-        """Backend disconnect callback: arm the drop latch and event.
+    def _make_disconnect_callback(self) -> Callable[[BleakClient], None]:
+        """Build a disconnect callback bound to the new connection's epoch.
 
-        Only latches when the callback belongs to the connection this
-        operation is actually using. BleakClientWithServiceCache delivers
-        ``disconnected_callback`` from its underlying transport client, so
-        a *stale* connection's callback can arrive while a newer operation
-        is already in flight — without the identity gate it would falsely
-        kill a healthy operation (observed as back-to-back reads failing
-        with "BLE link dropped during operation").
+        Backends deliver ``disconnected_callback`` through wrapper objects
+        (service cache, ESPHome backend clients) whose identity is not
+        guaranteed to be connection-unique, so the callback is gated by a
+        per-connection epoch counter instead of client identity: without
+        gating, a *stale* connection's late callback would falsely kill a
+        healthy newer operation (observed on live hardware as back-to-back
+        reads failing with "BLE link dropped during operation").
         """
-        if client is not self._current_client:
-            return
-        self._link_dropped = True
-        self._drop_event.set()
+        self._connection_epoch += 1
+        epoch = self._connection_epoch
+
+        def _on_disconnected(_client: BleakClient) -> None:
+            if self._connection_epoch != epoch:
+                return
+            self._link_dropped = True
+            self._drop_event.set()
+
+        return _on_disconnected
 
     async def _connect(self) -> BleakClient:
         """Connect once, with the disconnect callback armed for short-circuiting."""
@@ -189,7 +195,7 @@ class StatelessSolemClient:
                 name=f"Solem - {self.mac_address}",
                 timeout=self.bluetooth_timeout,
                 max_attempts=3,
-                disconnected_callback=self._on_disconnected,
+                disconnected_callback=self._make_disconnect_callback(),
                 **connect_kwargs,
             )
         except BleakOutOfConnectionSlotsError as exc:
@@ -255,7 +261,7 @@ class StatelessSolemClient:
                     client = await asyncio.wait_for(
                         self._connect(), timeout=remaining
                     )
-                    self._current_client = client
+                    self._connection_epoch += 1
                     remaining = deadline_at - time.monotonic()
                     if remaining <= 0:
                         raise SolemDeadlineExceeded(
@@ -295,10 +301,14 @@ class StatelessSolemClient:
                     if drop_task is not None:
                         drop_task.cancel()
                     if client is not None:
-                        if self._current_client is client:
-                            self._current_client = None
-                            self._link_dropped = False
-                            self._drop_event.clear()
+                        # Retire this connection's epoch BEFORE awaiting the
+                        # intentional close: a disconnect callback firing
+                        # during teardown then targets a stale epoch and is
+                        # ignored, while callbacks from a superseded attempt
+                        # (retry already bumped the epoch) are ignored too.
+                        self._connection_epoch += 1
+                        self._link_dropped = False
+                        self._drop_event.clear()
                         await self._disconnect_quietly(client)
 
                 if (

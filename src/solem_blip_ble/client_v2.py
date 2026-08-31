@@ -326,6 +326,7 @@ class StatelessSolemClient:
                 BleakError,
                 OSError,
                 SolemConnectionError,
+                _DropDetected,
             ) as exc:
                 last_error = exc
                 _LOGGER.debug(

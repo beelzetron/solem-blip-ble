@@ -12,6 +12,13 @@ DEFAULT_MAX_STATION_NUM = MAX_STATION_NUM
 # BLE timing from observed controller behavior during hardware validation.
 DEFAULT_BLUETOOTH_TIMEOUT = 30.0
 OPERATION_TIMEOUT = 45.0
+# Hard bound on one full public operation (every internal retry attempt
+# included), so a dead link fails in bounded time no matter how the internal
+# stage timeouts stack up.
+OPERATION_DEADLINE = 30.0
+# A discovered BLEDevice is trusted for this long; after that the next
+# operation re-resolves it (stale results carry stale scanner-routing data).
+BLE_DEVICE_CACHE_TTL = 30.0
 DISCONNECT_TIMEOUT = 3.0
 DISCONNECT_RETRY_DELAY = 2.0
 DISCONNECT_RETRY_ATTEMPTS = 2

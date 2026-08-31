@@ -10,8 +10,9 @@ import pytest
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
-from solem_blip_ble.client_v2 import StatelessSolemClient
+from solem_blip_ble.client_v2 import StatelessSolemClient, _DropDetected
 from solem_blip_ble.exceptions import SolemConnectionError, SolemDeadlineExceeded
+from unittest.mock import MagicMock
 
 
 class FakeV2Client:
@@ -190,7 +191,9 @@ async def test_link_drop_fails_operation_immediately(monkeypatch) -> None:
         async def start_notify(self, _uuid: str, handler) -> None:
             # Backend fires the disconnect callback on the REAL client while
             # start_notify is in flight, then the operation hangs on the
-            # dead link.
+            # dead link. The client itself confirms the drop via
+            # is_connected=False (the confirmation _check_drop requires).
+            self.is_connected = False
             state["real"]._link_dropped = True
             state["real"]._drop_event.set()
             await asyncio.sleep(100)
@@ -215,52 +218,62 @@ async def test_link_drop_fails_operation_immediately(monkeypatch) -> None:
     assert state["fake"].disconnects == 1
 
 
-async def test_disconnect_callback_epoch_gate() -> None:
-    """Only the current connection's callback may arm the drop latch.
+async def test_drop_hint_requires_client_confirmation() -> None:
+    """A bare disconnect callback (hint) must not fail a healthy operation.
 
-    Backends deliver ``disconnected_callback`` through wrapper objects whose
-    identity is not connection-unique, so callbacks are gated by a
-    per-connection epoch: a stale connection's late callback must be
-    ignored while a newer operation is in flight.
+    Backends deliver the callback through wrapper objects whose identity is
+    not connection-unique, and establish_connection reuses one callback
+    across its internal attempts. The hint therefore only fails the
+    operation when the active client confirms it is actually disconnected;
+    a hint with a still-connected client is stale and gets cleared.
     """
     client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    active = MagicMock()
+    active.is_connected = True
+    client._active_client = active
 
-    stale_cb = client._make_disconnect_callback()
-    current_cb = client._make_disconnect_callback()
-
-    stale_cb(object())  # type: ignore[arg-type]
-    assert client._link_dropped is False
-    assert not client._drop_event.is_set()
-
-    current_cb(object())  # type: ignore[arg-type]
+    client._on_disconnected(object())  # type: ignore[arg-type]
     assert client._link_dropped is True
     assert client._drop_event.is_set()
 
+    # Confirmation fails (client still connected): hint is cleared, no raise.
+    client._check_drop()
+    assert client._link_dropped is False
+    assert not client._drop_event.is_set()
 
-async def test_teardown_clears_latch_before_disconnect_callback(
+    # Confirmation succeeds (client disconnected): the drop is fatal.
+    active.is_connected = False
+    client._on_disconnected(object())  # type: ignore[arg-type]
+    with pytest.raises(_DropDetected):
+        client._check_drop()
+
+
+async def test_teardown_hint_does_not_poison_next_operation(
     monkeypatch,
 ) -> None:
     """A disconnect callback firing during intentional teardown must not
-    leave the latch armed for the next operation."""
+    poison the next operation — the live-hardware failure chain (op N's
+    teardown hint killing op N+1) must stay impossible."""
     state: dict[str, Any] = {}
 
-    class CallbackDuringTeardownClient(FakeV2Client):
+    class HintDuringTeardownClient(FakeV2Client):
         async def disconnect(self) -> None:
             self.disconnects += 1
             self.is_connected = False
             # Backend delivers the disconnect callback while the client is
-            # being torn down; the operation has already succeeded and the
-            # epoch was retired before the close, so the latch must not arm
-            # for the next operation.
-            state["callback"](self)
+            # being torn down. Under confirmation semantics this leaves a
+            # hint behind, but the next operation must succeed anyway:
+            # _connect clears it and _check_drop only raises with
+            # client-confirmed disconnection.
+            state["real"]._on_disconnected(self)
 
     async def fake_resolve(self):
         return object()
 
     async def fake_connect(self):
-        state["callback"] = self._make_disconnect_callback()
-        state["fake"] = CallbackDuringTeardownClient()
-        return state["fake"]
+        c = HintDuringTeardownClient()
+        state.setdefault("clients", []).append(c)
+        return c
 
     monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
     monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
@@ -268,11 +281,15 @@ async def test_teardown_clears_latch_before_disconnect_callback(
     monkeypatch.setattr("solem_blip_ble.client_v2.OPERATION_DEADLINE", 10.0)
 
     client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    state["real"] = client
     await asyncio.wait_for(client.get_status(), timeout=5.0)
+    assert client._link_dropped is True  # hint left by teardown...
 
-    assert client._link_dropped is False
-    assert not client._drop_event.is_set()
-    assert state["fake"].disconnects == 1
+    # ...but the next operation is unaffected (the old bug killed this one).
+    await asyncio.wait_for(client.get_status(), timeout=5.0)
+    first, second = state["clients"]
+    assert first.disconnects == 1
+    assert second.disconnects == 1
 
 
 async def test_ble_device_cache_expires(monkeypatch) -> None:

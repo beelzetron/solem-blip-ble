@@ -117,6 +117,7 @@ def test_validate_capture_status_program_idle():
         "battery_voltage": 79,
         "battery_level": 4,
         "battery_low": False,
+        "time_alarm": False,
         "active_program": 2,
         "watering_origin": "program",
     }

@@ -41,6 +41,7 @@ class SolemStatus(TypedDict):
     battery_voltage: int | None
     battery_level: int | None
     battery_low: bool
+    time_alarm: bool
     active_program: int | None
     watering_origin: str | None
 
@@ -268,6 +269,7 @@ def parse_status_notification(
         "battery_voltage": battery_voltage,
         "battery_level": battery_level,
         "battery_low": battery_low,
+        "time_alarm": bool(status_byte & 0x20),
         "active_program": active_program,
         "watering_origin": watering_origin,
     }
@@ -289,6 +291,7 @@ def mock_status() -> dict[str, Any]:
         "battery_voltage": None,
         "battery_level": None,
         "battery_low": False,
+        "time_alarm": False,
         "active_program": None,
         "watering_origin": None,
     }

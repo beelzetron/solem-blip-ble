@@ -444,9 +444,11 @@ R3-R5:   station 2 remaining-time slot or padding (bytes 15-17)
 | `0x02` | `00000010` | OFF | manual/station | Controller OFF, manual watering active |
 | `0x00` | `00000000` | OFF | none | Controller OFF, no station active |
 | `0x10` | `00010000` | - | - | Intermediate response (no state) |
+| `0x60` | `01100000` | ON | time alarm | Controller ON with the clock alarm bit set (0x20 + 0x40) |
 
 **Bit Flags:**
 - **Bit 6 (0x40)**: Controller permanent state (ON/OFF)
+- **Bit 5 (0x20)**: Time alarm — controller reports its clock/time is not set or lost (surfaced by the official app as a blinking clock "heure" alarm; cleared after a successful time-set command)
 - **Bit 1 (0x02)**: Manual / station command activity bit
 - **Bit 2 (0x04)**: Program command activity bit (often `0x44` with controller ON)
 

@@ -195,6 +195,28 @@ def test_parse_status_on_idle():
     assert parsed["battery_low"] is False
 
 
+def test_parse_status_time_alarm_bit_set():
+    """Byte 3 bit 0x20 is the controller clock/time alarm."""
+    data = bytearray(18)
+    data[2] = 0x02
+    data[3] = 0x60  # ON + time alarm
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["controller_state"] == "On"
+    assert parsed["is_watering"] is False
+    assert parsed["time_alarm"] is True
+
+
+def test_parse_status_time_alarm_bit_clear():
+    """Without bit 0x20 the clock alarm is off."""
+    data = bytearray(18)
+    data[2] = 0x02
+    data[3] = 0x40
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["time_alarm"] is False
+
+
 def test_parse_status_off_for_days():
     data = bytearray(18)
     data[2] = 0x02

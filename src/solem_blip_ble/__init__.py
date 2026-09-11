@@ -1,6 +1,7 @@
 """BLE client for Solem BL-IP irrigation controllers."""
 
 from .client import SolemClient
+from .client_persistent import PersistentSolemClient
 from .const import DEFAULT_MAX_STATION_NUM, MAX_STATION_NUM
 from .exceptions import SolemConnectionError
 from .protocol import (
@@ -41,6 +42,7 @@ APIConnectionError = SolemConnectionError
 __all__ = [
     "DEFAULT_MAX_STATION_NUM",
     "MAX_STATION_NUM",
+    "PersistentSolemClient",
     "SolemClient",
     "SolemConnectionError",
     "APIConnectionError",

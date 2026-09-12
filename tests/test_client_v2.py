@@ -10,7 +10,11 @@ import pytest
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
-from solem_blip_ble.client_v2 import StatelessSolemClient, _DropDetected
+from solem_blip_ble.client_v2 import (
+    StatelessSolemClient,
+    _DropDetected,
+)
+from bleak_retry_connector import BleakClientWithServiceCache
 from solem_blip_ble.exceptions import SolemConnectionError, SolemDeadlineExceeded
 from unittest.mock import MagicMock
 
@@ -64,6 +68,101 @@ def established(monkeypatch):
     monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
     monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
     return created
+
+
+async def test_connect_passes_single_attempt_to_establish_connection(
+    monkeypatch,
+) -> None:
+    """establish_connection is called with max_attempts=1.
+
+    The controller is a single-connection device that stops advertising
+    during and for tens of seconds after a connect attempt, so an
+    immediate internal retry (bleak-retry-connector's default double-tap)
+    is guaranteed to fail and burns the operation deadline. Retries are
+    provided by the operation-level flat loop, spaced by
+    REQUEST_RETRY_DELAY.
+    """
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def fake_establish_connection(client_class, ble_device, **kwargs):
+        calls.append(((client_class, ble_device), kwargs))
+        return FakeV2Client()
+
+    monkeypatch.setattr(
+        "solem_blip_ble.client_v2.establish_connection",
+        fake_establish_connection,
+    )
+
+    async def fake_resolve(self):
+        return object()
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    fake = await client._connect()
+
+    assert isinstance(fake, FakeV2Client)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] is BleakClientWithServiceCache
+    assert kwargs["max_attempts"] == 1
+
+
+def test_request_retry_delay_is_eight_seconds() -> None:
+    """The operation-level retry spacing is 8 s: on a single-connection
+    controller an immediate retry is guaranteed to fail while the device
+    is still not advertising; isolated spaced attempts succeed."""
+    from solem_blip_ble import client_v2, const
+
+    assert const.REQUEST_RETRY_DELAY == 8.0
+    assert client_v2.REQUEST_RETRY_DELAY == 8.0
+
+
+async def test_retry_attempts_are_spaced_by_request_retry_delay(
+    monkeypatch,
+) -> None:
+    """Between flat-retry attempts the executor waits REQUEST_RETRY_DELAY
+    (8.0 s) — with the deadline still bounding the whole operation."""
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def recording_sleep(delay, *args, **kwargs):
+        sleeps.append(delay)
+        # Short-circuit real waiting while recording the requested delay.
+        await real_sleep(min(delay, 0.01))
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
+    monkeypatch.setattr("solem_blip_ble.client_v2.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client_v2.OPERATION_DEADLINE", 30.0)
+
+    attempts = 0
+
+    class FlakyClient(FakeV2Client):
+        async def write_gatt_char(
+            self, _uuid: str, payload: bytes, *, response: bool
+        ) -> None:
+            nonlocal attempts
+            if payload == bytes.fromhex("3b00"):
+                attempts += 1
+                if attempts == 1:
+                    raise BleakError("transient radio hiccup")
+            await super().write_gatt_char(_uuid, payload, response=response)
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        return FlakyClient()
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    status = await client.get_status()
+
+    assert status["is_watering"] is True
+    assert attempts == 2
+    assert sleeps.count(8.0) == 1
 
 
 async def test_status_roundtrip_single_connect(established) -> None:

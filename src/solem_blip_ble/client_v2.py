@@ -18,6 +18,14 @@ Guarantees, by construction rather than by patching:
 
 The public API mirrors the 0.1.x ``SolemClient`` so consumers migrate by
 changing the import, not the calls. ``protocol.py`` is reused unchanged.
+
+Single-connection device behavior: the BL-IP controller stops advertising
+during and for tens of seconds after any connection attempt. Therefore
+each ``establish_connection`` call makes exactly one attempt
+(``max_attempts=1``) — an immediate internal retry is guaranteed to fail
+while the device is not advertising — and operation-level retries are
+spaced by ``REQUEST_RETRY_DELAY`` so the device has time to start
+advertising again.
 """
 
 from __future__ import annotations
@@ -179,12 +187,14 @@ class StatelessSolemClient:
     async def _connect(self) -> BleakClient:
         """Connect once, with the disconnect-callback hint armed.
 
-        ``establish_connection`` reuses the registered callback across its
-        *internal* retry attempts, so the hint may already be armed when a
-        healthy client is returned (an internal attempt dropped and was
-        transparently retried). The hint is therefore cleared before
-        returning: the operation starts from a clean signal state and any
-        *new* hint that arrives is meaningful again.
+        ``establish_connection`` is called with ``max_attempts=1``: the
+        controller is a single-connection device that stops advertising
+        during and after a connect attempt, so an immediate internal retry
+        would be guaranteed to fail. Any retries happen at the
+        operation level, spaced by ``REQUEST_RETRY_DELAY``.
+
+        The hint is cleared before returning so the operation starts from
+        a clean signal state and any *new* hint that arrives is meaningful.
         """
         ble_device = await self._resolve_ble_device()
         connect_kwargs: dict[str, Any] = {}
@@ -196,7 +206,14 @@ class StatelessSolemClient:
                 ble_device,
                 name=f"Solem - {self.mac_address}",
                 timeout=self.bluetooth_timeout,
-                max_attempts=3,
+                # Single-connection device: the controller stops advertising during
+                # and for tens of seconds after any connection attempt, so an
+                # immediate internal retry (bleak-retry-connector's default
+                # double-tap) is guaranteed to fail and burns the operation
+                # deadline. One attempt per establish_connection call; retries are
+                # provided by the operation-level flat loop, spaced by
+                # REQUEST_RETRY_DELAY (see REQUEST_MAX_ATTEMPTS).
+                max_attempts=1,
                 disconnected_callback=self._on_disconnected,
                 **connect_kwargs,
             )

@@ -24,6 +24,13 @@ guarantee:
   released after that much idle time, and the timer is rescheduled by
   activity.
 
+Single-connection device behavior: the BL-IP controller stops advertising
+during and for tens of seconds after a connect attempt, so connect-phase
+failures are **not** retried inside the same operation — the operation
+fails immediately and the next poll reconnects. Operation-phase failures
+(link drop mid-operation, write failure, notify timeout) keep the flat
+retry, spaced by ``REQUEST_RETRY_DELAY``.
+
 Reuse: all operation closures are inherited from
 :class:`StatelessSolemClient` unchanged — they pass their work through
 ``self._run_operation``; overriding only :meth:`_run_operation` (plus the
@@ -196,6 +203,15 @@ class PersistentSolemClient(StatelessSolemClient):
         is reused by the next operation. On failure the session is
         invalidated (synchronously, then bounded background teardown) so
         the next attempt inside the same operation reconnects fresh.
+
+        Single-connection devices: the controller stops advertising during
+        and for tens of seconds after a connect attempt. A connect-phase
+        failure (timeout, connection error) is therefore **not** retried
+        within the operation — the operation raises immediately and the
+        next poll reconnects. Operation-phase failures (link drop
+        mid-operation, write failure, notify timeout) keep the flat retry
+        with the spaced delay: those are worth retrying on a fresh
+        session.
         """
         if self.mock:
             raise SolemConnectionError("mock client has no BLE operations")
@@ -224,6 +240,7 @@ class PersistentSolemClient(StatelessSolemClient):
                 )
                 op_task: asyncio.Task[_T] | None = None
                 drop_task: asyncio.Task[None] | None = None
+                connect_succeeded = False
                 try:
                     if reused:
                         client = self._active_client
@@ -253,6 +270,7 @@ class PersistentSolemClient(StatelessSolemClient):
                             self._connect(), timeout=remaining
                         )
                         self._active_client = client
+                    connect_succeeded = True
                     remaining = deadline_at - time.monotonic()
                     if remaining <= 0:
                         raise SolemDeadlineExceeded(
@@ -303,6 +321,20 @@ class PersistentSolemClient(StatelessSolemClient):
                         attempt,
                         exc,
                     )
+                    if not connect_succeeded:
+                        # Connect-phase failure (timeout waiting for the
+                        # device or 'Failed connecting to device'): on a
+                        # single-connection controller the device stops
+                        # advertising during and for tens of seconds after
+                        # a connect attempt, so an immediate retry within
+                        # this operation is guaranteed to fail. Give up
+                        # this operation; the next poll reconnects.
+                        self._reset_session_state()
+                        self._schedule_idle_release()
+                        raise SolemDeadlineExceeded(
+                            "Connect phase failed within operation deadline"
+                            "; deferring retry to the next operation"
+                        ) from exc
                 finally:
                     if op_task is not None and not op_task.done():
                         op_task.cancel()

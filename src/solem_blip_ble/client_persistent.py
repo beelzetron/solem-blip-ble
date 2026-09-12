@@ -31,6 +31,18 @@ fails immediately and the next poll reconnects. Operation-phase failures
 (link drop mid-operation, write failure, notify timeout) keep the flat
 retry, spaced by ``REQUEST_RETRY_DELAY``.
 
+Connect-phase failure signatures (visible in the ``Attempt N failed:``
+debug log, which previously logged an empty reason for the bare
+``asyncio.TimeoutError`` raised by ``wait_for``):
+
+- ``Connect phase timed out after Ns (device not advertising, out of
+  range, or refusing connections)`` — the whole-operation deadline
+  expired before the connect attempt returned
+  (:class:`solem_blip_ble.client_v2._ConnectTimedOut`).
+- ``Failed connecting to device`` — the backend connect attempt itself
+  failed (BleakError/TimeoutError/OSError from
+  ``establish_connection``).
+
 Reuse: all operation closures are inherited from
 :class:`StatelessSolemClient` unchanged — they pass their work through
 ``self._run_operation``; overriding only :meth:`_run_operation` (plus the
@@ -51,6 +63,7 @@ from bleak.backends.device import BLEDevice
 from .client_v2 import (
     _BACKEND_ERRORS,
     _await_operation,
+    _ConnectTimedOut,
     _DropDetected,
     StatelessSolemClient,
 )
@@ -266,9 +279,7 @@ class PersistentSolemClient(StatelessSolemClient):
                             )
                             self._reset_session_state()
                             self._schedule_background_disconnect(stale)
-                        client = await asyncio.wait_for(
-                            self._connect(), timeout=remaining
-                        )
+                        client = await self._connect_within(remaining)
                         self._active_client = client
                     connect_succeeded = True
                     remaining = deadline_at - time.monotonic()
@@ -322,8 +333,10 @@ class PersistentSolemClient(StatelessSolemClient):
                         exc,
                     )
                     if not connect_succeeded:
-                        # Connect-phase failure (timeout waiting for the
-                        # device or 'Failed connecting to device'): on a
+                        # Connect-phase failure: either _ConnectTimedOut
+                        # ('Connect phase timed out after Ns ...') or the
+                        # 'Failed connecting to device' wrapper (or a bare
+                        # TimeoutError from other backends). On a
                         # single-connection controller the device stops
                         # advertising during and for tens of seconds after
                         # a connect attempt, so an immediate retry within

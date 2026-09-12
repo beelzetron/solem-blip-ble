@@ -26,6 +26,18 @@ each ``establish_connection`` call makes exactly one attempt
 while the device is not advertising — and operation-level retries are
 spaced by ``REQUEST_RETRY_DELAY`` so the device has time to start
 advertising again.
+
+Connect-phase failure signatures (visible in the ``Attempt N failed:``
+debug log, which previously logged an empty reason for the bare
+``asyncio.TimeoutError`` raised by ``wait_for``):
+
+- ``Connect phase timed out after Ns (device not advertising, out of
+  range, or refusing connections)`` — the whole-operation deadline
+  expired before the connect attempt returned
+  (:class:`_ConnectTimedOut`).
+- ``Failed connecting to device`` — the backend connect attempt itself
+  failed (BleakError/TimeoutError/OSError from
+  ``establish_connection``).
 """
 
 from __future__ import annotations
@@ -75,6 +87,19 @@ DISCONNECT_CLEANUP_TIMEOUT = 3.0
 # family (BleakDBusError, BleakGATTProtocolError, bleak-esphome wrappers), so
 # catching the base covers all current and future backend error types.
 _BACKEND_ERRORS = (BleakError, TimeoutError, OSError)
+
+
+class _ConnectTimedOut(asyncio.TimeoutError):
+    """Internal: the whole-operation deadline expired during the connect phase.
+
+    Subclasses ``asyncio.TimeoutError`` so every existing except clause that
+    matches the bare timeout keeps matching, while carrying a human-readable
+    reason — a bare ``asyncio.TimeoutError`` has an empty ``str()`` and made
+    the ``Attempt N failed:`` log line useless for triage.
+
+    Message format: ``Connect phase timed out after Ns (device not
+    advertising, out of range, or refusing connections)``.
+    """
 
 
 class _DropDetected(Exception):
@@ -229,6 +254,27 @@ class StatelessSolemClient:
         self._drop_event.clear()
         return client
 
+    async def _connect_within(self, remaining: float) -> BleakClient:
+        """Wait for :meth:`_connect` within the remaining operation budget.
+
+        ``asyncio.wait_for`` raises a *bare* TimeoutError whose ``str()``
+        is empty, which made the ``Attempt N failed:`` log line carry no
+        reason and cost live triage time. The timeout is re-raised as
+        :class:`_ConnectTimedOut` — a subclass of ``asyncio.TimeoutError``
+        with the connect-phase context baked in — so every existing except
+        clause that matches the bare timeout keeps matching.
+        """
+        try:
+            return await asyncio.wait_for(self._connect(), timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            if isinstance(exc, _ConnectTimedOut):
+                raise
+            raise _ConnectTimedOut(
+                f"Connect phase timed out after {remaining:.0f}s "
+                "(device not advertising, out of range, or refusing "
+                "connections)"
+            ) from exc
+
     # -- the stateless executor --------------------------------------------
 
     async def _watch_drop(self, client: BleakClient) -> None:
@@ -304,9 +350,7 @@ class StatelessSolemClient:
             op_task: asyncio.Task[_T] | None = None
             drop_task: asyncio.Task[Any] | None = None
             try:
-                client = await asyncio.wait_for(
-                    self._connect(), timeout=remaining
-                )
+                client = await self._connect_within(remaining)
                 self._active_client = client
                 remaining = deadline_at - time.monotonic()
                 if remaining <= 0:

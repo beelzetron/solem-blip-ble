@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from bleak.exc import BleakError
+from bleak_retry_connector import BleakClientWithServiceCache
 
 from solem_blip_ble.client_persistent import PersistentSolemClient
 from solem_blip_ble.client_v2 import StatelessSolemClient
@@ -75,6 +76,189 @@ def established(monkeypatch):
 def no_settle(monkeypatch):
     """Trim protocol settle delays so tests run fast."""
     monkeypatch.setattr("solem_blip_ble.client_v2.NOTIFY_SETTLE_DELAY", 0)
+
+
+async def test_connect_passes_single_attempt_to_establish_connection(
+    monkeypatch,
+) -> None:
+    """establish_connection is called with max_attempts=1.
+
+    The controller is a single-connection device that stops advertising
+    during and for tens of seconds after a connect attempt, so an
+    immediate internal retry (bleak-retry-connector's default double-tap)
+    is guaranteed to fail and burns the operation deadline. Retries are
+    provided by the operation-level flat loop, spaced by
+    REQUEST_RETRY_DELAY.
+    """
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def fake_establish_connection(client_class, ble_device, **kwargs):
+        calls.append(((client_class, ble_device), kwargs))
+        return FakeV2Client()
+
+    monkeypatch.setattr(
+        "solem_blip_ble.client_v2.establish_connection",
+        fake_establish_connection,
+    )
+
+    async def fake_resolve(self):
+        return object()
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    fake = await client._connect()
+
+    assert isinstance(fake, FakeV2Client)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] is BleakClientWithServiceCache
+    assert kwargs["max_attempts"] == 1
+
+
+def test_request_retry_delay_is_eight_seconds() -> None:
+    """The operation-level retry spacing is 8 s: on a single-connection
+    controller an immediate retry is guaranteed to fail while the device
+    is still not advertising; isolated spaced attempts succeed."""
+    from solem_blip_ble import client_v2, const
+
+    assert const.REQUEST_RETRY_DELAY == 8.0
+    assert client_v2.REQUEST_RETRY_DELAY == 8.0
+
+
+async def test_connect_phase_timeout_single_attempt_then_next_operation_reconnects(
+    monkeypatch,
+) -> None:
+    """Connect-phase timeout: the persistent client makes exactly one
+    connect attempt, raises immediately (no same-operation retry), and the
+    next operation reconnects."""
+    connect_calls = 0
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def recording_sleep(delay, *args, **kwargs):
+        sleeps.append(delay)
+        # Short-circuit real waiting (e.g. the 8 s retry spacing) while
+        # recording what delay the code asked for.
+        await real_sleep(min(delay, 0.01))
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
+    monkeypatch.setattr("solem_blip_ble.client_v2.NOTIFY_SETTLE_DELAY", 0)
+
+    created: list[FakeV2Client] = []
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls == 1:
+            # As if establish_connection timed out waiting for the device.
+            raise asyncio.TimeoutError()
+        fake = FakeV2Client()
+        created.append(fake)
+        return fake
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF")
+    with pytest.raises(SolemDeadlineExceeded, match="Connect phase"):
+        await client.get_status()
+
+    # Exactly one connect attempt: no same-operation retry.
+    assert connect_calls == 1
+    # No retry spacing was applied (give-up was immediate).
+    assert 8.0 not in sleeps
+    # Session invalidated.
+    assert client._active_client is None
+    assert client._link_dropped is False
+    assert not client._drop_event.is_set()
+
+    # The next operation reconnects and succeeds.
+    status = await client.get_status()
+    assert status["is_watering"] is True
+    assert connect_calls == 2
+    assert client._active_client is created[0]
+    await drain_background_disconnects()
+    assert created[0].disconnects == 0
+
+
+async def test_connect_phase_connection_error_single_attempt(monkeypatch) -> None:
+    """The 'Failed connecting to device' wrapper is also a connect-phase
+    failure: single attempt, immediate deadline-style failure."""
+    connect_calls = 0
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        nonlocal connect_calls
+        connect_calls += 1
+        raise SolemConnectionError("Failed connecting to device")
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF")
+    with pytest.raises(SolemDeadlineExceeded, match="Connect phase"):
+        await client.get_status()
+
+    assert connect_calls == 1
+    assert client._active_client is None
+
+
+async def test_operation_phase_failure_retries_with_eight_second_spacing(
+    monkeypatch,
+) -> None:
+    """A failure after the connect succeeded (write failure on a live link)
+    keeps the flat retry, with REQUEST_RETRY_DELAY (8.0) spacing between
+    attempts."""
+    created: list[FakeV2Client] = []
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def recording_sleep(delay, *args, **kwargs):
+        sleeps.append(delay)
+        # Short-circuit real waiting while recording the requested delay.
+        await real_sleep(min(delay, 0.01))
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
+    monkeypatch.setattr("solem_blip_ble.client_v2.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client_persistent.OPERATION_DEADLINE", 20.0)
+
+    class FailOnceWriteClient(FakeV2Client):
+        async def write_gatt_char(
+            self, _uuid: str, payload: bytes, *, response: bool
+        ) -> None:
+            if len(created) == 1 and payload == bytes.fromhex("3b00"):
+                raise BleakError("link hiccup mid-operation")
+            await super().write_gatt_char(_uuid, payload, response=response)
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        fake = FailOnceWriteClient()
+        created.append(fake)
+        return fake
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF")
+    status = await client.get_status()
+
+    assert status["is_watering"] is True
+    # The operation-phase failure was retried on a fresh session...
+    assert len(created) == 2
+    # ...spaced by REQUEST_RETRY_DELAY = 8.0.
+    assert 8.0 in sleeps
+    assert client._active_client is created[1]
+    await drain_background_disconnects()
+    assert created[0].disconnects == 1
+    assert created[1].disconnects == 0
 
 
 async def test_reuses_one_connection_across_operations(

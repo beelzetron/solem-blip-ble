@@ -27,7 +27,11 @@ SCAN_PAUSE = 1.0
 SCAN_MAX_ROUNDS = 3
 RECONNECT_DELAY = 2.0
 STATUS_NOTIFY_TIMEOUT = 30.0
-REQUEST_RETRY_DELAY = 3.0
+# Spacing between operation-level retry attempts. On a single-connection
+# controller (stops advertising during and for tens of seconds after a
+# connect attempt) an immediate retry is guaranteed to fail; isolated
+# attempts succeed consistently once spaced by this delay.
+REQUEST_RETRY_DELAY = 8.0
 REQUEST_MAX_ATTEMPTS = 3
 NOTIFY_SETTLE_DELAY = 0.5
 NOTIFY_PARTIAL_RETRY_DELAY = 2.0

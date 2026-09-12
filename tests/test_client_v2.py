@@ -12,6 +12,7 @@ from bleak.exc import BleakError
 
 from solem_blip_ble.client_v2 import (
     StatelessSolemClient,
+    _ConnectTimedOut,
     _DropDetected,
 )
 from bleak_retry_connector import BleakClientWithServiceCache
@@ -218,6 +219,96 @@ async def test_deadline_bounds_repeated_connect_hangs(monkeypatch) -> None:
         await client.get_status()
 
     assert connect_calls <= 2
+
+
+async def test_connect_phase_timeout_carries_reason_in_log_and_chain(
+    monkeypatch, caplog
+) -> None:
+    """A connect-phase wait_for timeout logs a NON-empty reason.
+
+    asyncio.wait_for raises a bare TimeoutError whose str() is empty, which
+    made the 'Attempt N failed:' debug line useless for triage (the live
+    5-day outage: 'Attempt 1 failed: ' with no reason). The connect-phase
+    timeout is now re-raised as _ConnectTimedOut carrying the phase, the
+    budget, and the likely causes.
+    """
+    import logging as _logging
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        await asyncio.sleep(100)
+        raise AssertionError("should be cancelled before returning")  # pragma: no cover
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+    monkeypatch.setattr("solem_blip_ble.client_v2.OPERATION_DEADLINE", 0.3)
+    monkeypatch.setattr("solem_blip_ble.client_v2.REQUEST_RETRY_DELAY", 0)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    with caplog.at_level(_logging.DEBUG, logger="solem_blip_ble.client_v2"):
+        with pytest.raises(SolemDeadlineExceeded) as excinfo:
+            await client.get_status()
+
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, _ConnectTimedOut)
+    # It is still an asyncio.TimeoutError: existing except tuples match.
+    assert isinstance(cause, asyncio.TimeoutError)
+    assert "Connect phase timed out after" in str(cause)
+    assert "refusing connections" in str(cause)
+    assert cause.args[0].endswith("connections)")
+
+    failure_lines = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "Attempt 1 failed:" in rec.getMessage()
+    ]
+    assert failure_lines, "the attempt-failure debug line must still be logged"
+    for line in failure_lines:
+        assert "Connect phase timed out after 0s" in line
+        assert "refusing connections" in line
+        assert line.rstrip().endswith("failed: ") is False or "refusing" in line
+
+
+async def test_connect_timed_out_is_caught_by_same_except_tuple(monkeypatch) -> None:
+    """_ConnectTimedOut raised mid-attempt is caught by the existing
+    except tuple in _run_operation (it is an asyncio.TimeoutError
+    subclass), so the flat retry still applies — proven via the
+    retry count."""
+    connect_calls = 0
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def recording_sleep(delay, *args, **kwargs):
+        sleeps.append(delay)
+        await real_sleep(min(delay, 0.01))
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
+    monkeypatch.setattr("solem_blip_ble.client_v2.OPERATION_DEADLINE", 60.0)
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        nonlocal connect_calls
+        connect_calls += 1
+        raise _ConnectTimedOut(
+            "Connect phase timed out after 23s (device not advertising, "
+            "out of range, or refusing connections)"
+        )
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    with pytest.raises(SolemDeadlineExceeded, match="3 attempt"):
+        await client.get_status()
+
+    # Caught and retried every time by the same except tuple as the bare
+    # TimeoutError: REQUEST_MAX_ATTEMPTS (3) attempts, spaced 8 s apart.
+    assert connect_calls == 3
+    assert sleeps.count(8.0) == 2
 
 
 async def test_transient_error_retries_then_succeeds(monkeypatch) -> None:

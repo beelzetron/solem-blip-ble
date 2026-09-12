@@ -11,7 +11,7 @@ from bleak.exc import BleakError
 from bleak_retry_connector import BleakClientWithServiceCache
 
 from solem_blip_ble.client_persistent import PersistentSolemClient
-from solem_blip_ble.client_v2 import StatelessSolemClient
+from solem_blip_ble.client_v2 import StatelessSolemClient, _ConnectTimedOut
 from solem_blip_ble.exceptions import SolemConnectionError, SolemDeadlineExceeded
 
 
@@ -206,6 +206,89 @@ async def test_connect_phase_connection_error_single_attempt(monkeypatch) -> Non
         await client.get_status()
 
     assert connect_calls == 1
+    assert client._active_client is None
+
+
+async def test_connect_timed_out_exception_defers_to_next_operation(
+    monkeypatch,
+) -> None:
+    """A _ConnectTimedOut (the reason-carrying connect-phase timeout from
+    client_v2) is treated as a connect-phase failure: single attempt, no
+    same-operation retry, immediate deadline-style raise."""
+    connect_calls = 0
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def recording_sleep(delay, *args, **kwargs):
+        sleeps.append(delay)
+        await real_sleep(min(delay, 0.01))
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
+    monkeypatch.setattr("solem_blip_ble.client_persistent.OPERATION_DEADLINE", 20.0)
+
+    async def fake_resolve(self):
+        return object()
+
+    created: list[FakeV2Client] = []
+
+    async def fake_connect(self):
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls == 1:
+            raise _ConnectTimedOut(
+                "Connect phase timed out after 23s (device not advertising, "
+                "out of range, or refusing connections)"
+            )
+        fake = FakeV2Client()
+        created.append(fake)
+        return fake
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF")
+    with pytest.raises(SolemDeadlineExceeded, match="Connect phase") as excinfo:
+        await client.get_status()
+
+    # The reason-carrying exception is the direct cause.
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, _ConnectTimedOut)
+    assert "Connect phase timed out after 23s" in str(cause)
+
+    # Exactly one connect attempt: no same-operation retry, no spacing.
+    assert connect_calls == 1
+    assert 8.0 not in sleeps
+    # Session invalidated; the next operation reconnects.
+    assert client._active_client is None
+
+    status = await client.get_status()
+    assert status["is_watering"] is True
+    assert connect_calls == 2
+
+
+async def test_bare_connect_timeout_is_wrapped_and_deferred(monkeypatch) -> None:
+    """A bare asyncio.TimeoutError escaping _connect (other backends) is
+    still wrapped into _ConnectTimedOut by _connect_within and still
+    detected as a connect-phase failure via the connect_succeeded flag."""
+    connect_calls = 0
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        nonlocal connect_calls
+        connect_calls += 1
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF")
+    with pytest.raises(SolemDeadlineExceeded, match="Connect phase") as excinfo:
+        await client.get_status()
+
+    assert connect_calls == 1
+    assert isinstance(excinfo.value.__cause__, _ConnectTimedOut)
     assert client._active_client is None
 
 

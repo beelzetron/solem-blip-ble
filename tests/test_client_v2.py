@@ -568,9 +568,8 @@ async def test_mock_mode_stays_off_ble(monkeypatch) -> None:
     }
 
 
-async def test_write_irrigation_program_skips_readback(established, monkeypatch) -> None:
-    """The write-only primitive sends V5 frames and does not read schedules back."""
-    monkeypatch.setattr("solem_blip_ble.client_v2.REQUEST_RETRY_DELAY", 0)
+async def test_write_irrigation_program_skips_readback(monkeypatch) -> None:
+    """The write-only primitive sends each V5 frame in its own operation."""
     client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=2)
     program = {
         "name": "Programme B",
@@ -584,6 +583,14 @@ async def test_write_irrigation_program_skips_readback(established, monkeypatch)
         "start_times": [360, None, None, None, None, None, None, None],
         "station_durations": [600, 600],
     }
+    operation_writes: list[list[bytes]] = []
+
+    async def run_operation(operation, *, deadline=None):
+        fake = FakeV2Client()
+        await operation(fake)
+        operation_writes.append(fake.writes)
+
+    monkeypatch.setattr(client, "_run_operation", run_operation)
 
     await client.write_irrigation_program(1, program)
 
@@ -592,10 +599,7 @@ async def test_write_irrigation_program_skips_readback(established, monkeypatch)
         program,
         max_stations=2,
     )
-    assert len(established) == len(frames)
-    assert [ble_client.writes for ble_client in established] == [
-        [frame] for frame in frames
-    ]
+    assert operation_writes == [[frame] for frame in frames]
 
 
 async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> None:

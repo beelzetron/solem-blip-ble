@@ -564,3 +564,62 @@ async def test_mock_mode_stays_off_ble(monkeypatch) -> None:
         "patch": 0,
         "raw_hex": "5.0.0",
     }
+
+
+async def test_write_irrigation_program_skips_readback(established, monkeypatch) -> None:
+    """The write-only primitive sends V5 frames and does not read schedules back."""
+    monkeypatch.setattr("solem_blip_ble.client_v2.REQUEST_RETRY_DELAY", 0)
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=2)
+    program = {
+        "name": "Programme B",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 3,
+        "synchro_day": 1,
+        "period_start_date": None,
+        "start_times": [360, None, None, None, None, None, None, None],
+        "station_durations": [600, 600],
+    }
+
+    await client.write_irrigation_program(1, program)
+
+    assert len(established) == 1
+    assert established[0].writes == protocol.pack_set_irrigation_program(
+        1,
+        program,
+        max_stations=2,
+    )
+
+
+async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> None:
+    """Verified writes delegate the BLE write phase to the write-only primitive."""
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", mock=True, max_station_num=2)
+    program = {
+        "name": "Programme B",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 3,
+        "synchro_day": 1,
+        "period_start_date": None,
+        "start_times": [360, None, None, None, None, None, None, None],
+        "station_durations": [600, 600],
+    }
+    expected = protocol.normalize_irrigation_program_for_write(
+        program,
+        max_stations=2,
+    )
+    write = AsyncMock()
+    readback = AsyncMock(return_value={1: expected})
+    monkeypatch.setattr(client, "write_irrigation_program", write)
+    monkeypatch.setattr(client, "get_irrigation_config", readback)
+    client.mock = False
+
+    result = await client.set_irrigation_program(1, program)
+
+    write.assert_awaited_once_with(1, program)
+    readback.assert_awaited_once()
+    assert result == {1: expected}

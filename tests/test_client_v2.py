@@ -587,12 +587,15 @@ async def test_write_irrigation_program_skips_readback(established, monkeypatch)
 
     await client.write_irrigation_program(1, program)
 
-    assert len(established) == 1
-    assert established[0].writes == protocol.pack_set_irrigation_program(
+    frames = protocol.pack_set_irrigation_program(
         1,
         program,
         max_stations=2,
     )
+    assert len(established) == len(frames)
+    assert [ble_client.writes for ble_client in established] == [
+        [frame] for frame in frames
+    ]
 
 
 async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> None:

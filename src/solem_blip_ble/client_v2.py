@@ -818,25 +818,15 @@ class StatelessSolemClient:
         if self.mock:
             return
 
-        # Keep the useful part of the hardware-validation writer: one fresh
-        # BLE session per frame with notifications active around the write.
-        # The historical capture helper then listened for 5 s because it was
-        # recording protocol traffic; this write-only path does not consume
-        # those notifications, so holding every frame open for that dwell only
-        # increases BLE/proxy pressure.
+        # Use the smallest possible write path: one fresh BLE session per
+        # frame, with no notification subscription or readback. Notifications
+        # are not consumed by this primitive and can make proxy links fail
+        # before the frame itself is written.
         for frame_number, frame in enumerate(frames, start=1):
             async def _op(client: BleakClient, payload: bytes = frame) -> None:
-                def _notification_handler(_sender: Any, _data: bytearray) -> None:
-                    return
-
-                await self._start_notify(client, _notification_handler)
-                try:
-                    await asyncio.sleep(NOTIFY_SETTLE_DELAY)
-                    self._check_drop()
-                    await self._write(client, payload)
-                    self._check_drop()
-                finally:
-                    await self._stop_notify(client)
+                self._check_drop()
+                await self._write(client, payload)
+                self._check_drop()
 
             _LOGGER.debug(
                 "%s - Writing irrigation program %d frame %d/%d",
@@ -845,7 +835,17 @@ class StatelessSolemClient:
                 frame_number,
                 len(frames),
             )
-            await self._run_operation(_op)
+            try:
+                await self._run_operation(_op)
+            except Exception:
+                _LOGGER.warning(
+                    "%s - Irrigation program %d frame %d/%d failed",
+                    self.mac_address,
+                    program_index,
+                    frame_number,
+                    len(frames),
+                )
+                raise
 
     async def set_irrigation_program(
         self,

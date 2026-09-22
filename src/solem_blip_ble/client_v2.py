@@ -818,11 +818,13 @@ class StatelessSolemClient:
         if self.mock:
             return
 
-        # Match the hardware-validation writer that established this inferred
-        # V5 schedule path: one BLE session per frame, notifications enabled,
-        # 0.5 s settle before the write, then a 5 s dwell while still connected
-        # and listening before notifications are stopped and the session closes.
-        for frame in frames:
+        # Keep the useful part of the hardware-validation writer: one fresh
+        # BLE session per frame with notifications active around the write.
+        # The historical capture helper then listened for 5 s because it was
+        # recording protocol traffic; this write-only path does not consume
+        # those notifications, so holding every frame open for that dwell only
+        # increases BLE/proxy pressure.
+        for frame_number, frame in enumerate(frames, start=1):
             async def _op(client: BleakClient, payload: bytes = frame) -> None:
                 def _notification_handler(_sender: Any, _data: bytearray) -> None:
                     return
@@ -832,11 +834,17 @@ class StatelessSolemClient:
                     await asyncio.sleep(NOTIFY_SETTLE_DELAY)
                     self._check_drop()
                     await self._write(client, payload)
-                    await asyncio.sleep(5.0)
                     self._check_drop()
                 finally:
                     await self._stop_notify(client)
 
+            _LOGGER.debug(
+                "%s - Writing irrigation program %d frame %d/%d",
+                self.mac_address,
+                program_index,
+                frame_number,
+                len(frames),
+            )
             await self._run_operation(_op)
 
     async def set_irrigation_program(

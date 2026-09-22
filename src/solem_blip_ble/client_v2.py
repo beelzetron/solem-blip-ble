@@ -796,17 +796,41 @@ class StatelessSolemClient:
 
         return await self._run_operation(_op)
 
+    async def write_irrigation_program(
+        self,
+        program_index: int,
+        program: protocol.IrrigationProgram,
+    ) -> None:
+        """Write one persisted V5 irrigation program without reading it back.
+
+        This low-level write primitive is intended for callers that need to
+        batch multiple program writes and perform one independent verification
+        after the controller has had time to settle. It deliberately sends the
+        exact same capture-inferred V5 frames as :meth:`set_irrigation_program`
+        and does not append the manual-command commit frame.
+        """
+        frames = protocol.pack_set_irrigation_program(
+            program_index,
+            program,
+            max_stations=self.max_station_num,
+        )
+
+        if self.mock:
+            return
+
+        async def _op(client: BleakClient) -> None:
+            for frame in frames:
+                self._check_drop()
+                await self._write(client, frame)
+
+        await self._run_operation(_op)
+
     async def set_irrigation_program(
         self,
         program_index: int,
         program: protocol.IrrigationProgram,
     ) -> dict[int, protocol.IrrigationProgram]:
         """Write one persisted V5 irrigation program and verify by reading it back."""
-        frames = protocol.pack_set_irrigation_program(
-            program_index,
-            program,
-            max_stations=self.max_station_num,
-        )
         expected = protocol.normalize_irrigation_program_for_write(
             program,
             max_stations=self.max_station_num,
@@ -817,12 +841,7 @@ class StatelessSolemClient:
             programs[program_index] = expected
             return programs
 
-        async def _op(client: BleakClient) -> None:
-            for frame in frames:
-                self._check_drop()
-                await self._write(client, frame)
-
-        await self._run_operation(_op)
+        await self.write_irrigation_program(program_index, program)
         programs = await self.get_irrigation_config()
         written = programs.get(program_index)
         mismatches = protocol.irrigation_program_write_mismatches(written, expected)

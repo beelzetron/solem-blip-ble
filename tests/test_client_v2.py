@@ -569,7 +569,7 @@ async def test_mock_mode_stays_off_ble(monkeypatch) -> None:
 
 
 async def test_write_irrigation_program_skips_readback(monkeypatch) -> None:
-    """Write-only schedule frames use the validated notify/settle/dwell sequence."""
+    """Write-only schedule frames notify, settle, write, and close each session."""
     client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=2)
     program = {
         "name": "Programme B",
@@ -608,7 +608,7 @@ async def test_write_irrigation_program_skips_readback(monkeypatch) -> None:
     )
     assert operation_writes == [[frame] for frame in frames]
     assert notify_states == [(True, True)] * len(frames)
-    assert sleeps == [0, 0, 5.0] * len(frames)
+    assert sleeps == [0, 0] * len(frames)
 
 
 async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> None:

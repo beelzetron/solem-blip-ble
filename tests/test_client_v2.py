@@ -608,7 +608,7 @@ async def test_write_irrigation_program_skips_readback(monkeypatch) -> None:
     )
     assert operation_writes == [[frame] for frame in frames]
     assert notify_states == [(True, True)] * len(frames)
-    assert sleeps == [0.5, 0.5, 5.0] * len(frames)
+    assert sleeps == [0, 0, 5.0] * len(frames)
 
 
 async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> None:

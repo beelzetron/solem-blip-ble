@@ -569,7 +569,7 @@ async def test_mock_mode_stays_off_ble(monkeypatch) -> None:
 
 
 async def test_write_irrigation_program_skips_readback(monkeypatch) -> None:
-    """The write-only primitive sends each V5 frame in its own operation."""
+    """Write-only schedule frames use the validated notify/settle/dwell sequence."""
     client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=2)
     program = {
         "name": "Programme B",
@@ -584,13 +584,20 @@ async def test_write_irrigation_program_skips_readback(monkeypatch) -> None:
         "station_durations": [600, 600],
     }
     operation_writes: list[list[bytes]] = []
+    notify_states: list[tuple[bool, bool]] = []
+    sleeps: list[float] = []
 
     async def run_operation(operation, *, deadline=None):
         fake = FakeV2Client()
         await operation(fake)
         operation_writes.append(fake.writes)
+        notify_states.append((fake.handler is None, fake.disconnects == 0))
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
 
     monkeypatch.setattr(client, "_run_operation", run_operation)
+    monkeypatch.setattr("solem_blip_ble.client_v2.asyncio.sleep", fake_sleep)
 
     await client.write_irrigation_program(1, program)
 
@@ -600,6 +607,8 @@ async def test_write_irrigation_program_skips_readback(monkeypatch) -> None:
         max_stations=2,
     )
     assert operation_writes == [[frame] for frame in frames]
+    assert notify_states == [(True, True)] * len(frames)
+    assert sleeps == [0.5, 0.5, 5.0] * len(frames)
 
 
 async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> None:

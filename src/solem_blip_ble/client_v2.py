@@ -818,15 +818,24 @@ class StatelessSolemClient:
         if self.mock:
             return
 
-        # The hardware-validation writer that established this inferred V5
-        # schedule path used one BLE session per frame. Keep the same session
-        # boundary here: the BL-IP is a single-client device and consecutive
-        # configuration frames in one connection have proven unreliable on
-        # hardware.
+        # Match the hardware-validation writer that established this inferred
+        # V5 schedule path: one BLE session per frame, notifications enabled,
+        # 0.5 s settle before the write, then a 5 s dwell while still connected
+        # and listening before notifications are stopped and the session closes.
         for frame in frames:
             async def _op(client: BleakClient, payload: bytes = frame) -> None:
-                self._check_drop()
-                await self._write(client, payload)
+                def _notification_handler(_sender: Any, _data: bytearray) -> None:
+                    return
+
+                await self._start_notify(client, _notification_handler)
+                try:
+                    await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+                    self._check_drop()
+                    await self._write(client, payload)
+                    await asyncio.sleep(5.0)
+                    self._check_drop()
+                finally:
+                    await self._stop_notify(client)
 
             await self._run_operation(_op)
 

@@ -7,6 +7,8 @@ import time
 from typing import Any
 
 import pytest
+
+from solem_blip_ble import protocol
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
@@ -17,7 +19,7 @@ from solem_blip_ble.client_v2 import (
 )
 from bleak_retry_connector import BleakClientWithServiceCache
 from solem_blip_ble.exceptions import SolemConnectionError, SolemDeadlineExceeded
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 
 class FakeV2Client:

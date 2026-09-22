@@ -818,12 +818,17 @@ class StatelessSolemClient:
         if self.mock:
             return
 
-        async def _op(client: BleakClient) -> None:
-            for frame in frames:
+        # The hardware-validation writer that established this inferred V5
+        # schedule path used one BLE session per frame. Keep the same session
+        # boundary here: the BL-IP is a single-client device and consecutive
+        # configuration frames in one connection have proven unreliable on
+        # hardware.
+        for frame in frames:
+            async def _op(client: BleakClient, payload: bytes = frame) -> None:
                 self._check_drop()
-                await self._write(client, frame)
+                await self._write(client, payload)
 
-        await self._run_operation(_op)
+            await self._run_operation(_op)
 
     async def set_irrigation_program(
         self,

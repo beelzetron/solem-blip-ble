@@ -2,7 +2,10 @@
 
 from datetime import date
 
+import pytest
+
 from solem_blip_ble import protocol
+from solem_blip_ble.exceptions import InvalidSnapshot
 from solem_blip_ble.snapshot import ProgramSnapshot
 
 
@@ -55,3 +58,48 @@ def test_snapshot_revision_covers_hidden_slots() -> None:
     after = ProgramSnapshot.from_frames(tuple(changed))
 
     assert before.revision != after.revision
+
+
+def test_expected_write_is_tied_to_preflight_snapshot() -> None:
+    frames = tuple(
+        frame for index in range(12) for frame in _program_frames(index)
+    )
+    current = ProgramSnapshot.from_frames(frames)
+    writes, expected = current.patch(
+        2, {"station_durations": {6: 900}}, physical_stations=12
+    )
+
+    current.validate_expected_write(writes, expected)
+
+    unrelated_frames = list(expected.frames)
+    hidden = next(
+        i
+        for i, frame in enumerate(unrelated_frames)
+        if (frame[3] & 0x0F) == 11
+    )
+    unrelated_frames[hidden] = (
+        unrelated_frames[hidden][:-1]
+        + bytes([unrelated_frames[hidden][-1] ^ 1])
+    )
+    unrelated = ProgramSnapshot.from_frames(tuple(unrelated_frames))
+    with pytest.raises(
+        InvalidSnapshot, match="not covered by write frames"
+    ):
+        current.validate_expected_write(writes, unrelated)
+
+
+def test_expected_write_rejects_payload_not_matching_write_frames() -> None:
+    frames = tuple(
+        frame for index in range(12) for frame in _program_frames(index)
+    )
+    current = ProgramSnapshot.from_frames(frames)
+    writes, expected = current.patch(
+        2, {"station_durations": {6: 900}}, physical_stations=12
+    )
+    tampered = list(writes)
+    tampered[0] = tampered[0][:-1] + bytes([tampered[0][-1] ^ 1])
+
+    with pytest.raises(
+        InvalidSnapshot, match="does not match requested write frames"
+    ):
+        current.validate_expected_write(tampered, expected)

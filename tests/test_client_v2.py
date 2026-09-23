@@ -18,7 +18,11 @@ from solem_blip_ble.client_v2 import (
     _DropDetected,
 )
 from bleak_retry_connector import BleakClientWithServiceCache
-from solem_blip_ble.exceptions import SolemConnectionError, SolemDeadlineExceeded
+from solem_blip_ble.exceptions import (
+    SolemConnectionError,
+    SolemDeadlineExceeded,
+    UncertainWrite,
+)
 from unittest.mock import AsyncMock, MagicMock
 
 
@@ -633,6 +637,85 @@ async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> 
     write.assert_awaited_once_with(1, program)
     readback.assert_awaited_once()
     assert result == {1: expected}
+
+
+async def test_program_write_preflight_uses_retry_safe_snapshot(monkeypatch) -> None:
+    """Program restore preflight is a separate retry-safe read operation."""
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    before = MagicMock()
+    before.revision = "same"
+    expected = MagicMock()
+    expected.revision = "same"
+    snapshot = MagicMock()
+    snapshot.revision = "same"
+
+    preflight = AsyncMock(return_value=snapshot)
+    monkeypatch.setattr(client, "get_program_snapshot", preflight)
+
+    retry_flags: list[bool] = []
+
+    async def run_operation(operation, *, deadline=None, retry_safe=True):
+        retry_flags.append(retry_safe)
+        raise SolemConnectionError("mutation connection failed")
+
+    monkeypatch.setattr(client, "_run_operation", run_operation)
+
+    with pytest.raises(SolemConnectionError, match="mutation connection failed"):
+        await client.write_program_frames([], expected, before.revision)
+
+    preflight.assert_awaited_once_with()
+    assert retry_flags == [False]
+    assert client.program_write_diagnostics == {
+        "phase": "preflight",
+        "acknowledged_blocks": 0,
+    }
+
+
+async def test_program_write_transport_failure_after_mutation_is_uncertain_no_replay(
+    monkeypatch,
+) -> None:
+    """A failure after the first program frame is sent is never replayed."""
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    before = MagicMock()
+    before.revision = "same"
+    expected = MagicMock()
+    expected.revision = "expected"
+    snapshot = MagicMock()
+    snapshot.revision = "same"
+    monkeypatch.setattr(
+        client,
+        "get_program_snapshot",
+        AsyncMock(return_value=snapshot),
+    )
+    monkeypatch.setattr("solem_blip_ble.client_v2.NOTIFY_SETTLE_DELAY", 0)
+
+    frame = bytes.fromhex("3912451250726f6772616d6d6520430000000000")
+    operation_calls = 0
+
+    async def run_operation(operation, *, deadline=None, retry_safe=True):
+        nonlocal operation_calls
+        operation_calls += 1
+        assert retry_safe is False
+
+        class DropOnProgramWrite(FakeV2Client):
+            async def write_gatt_char(
+                self, _uuid: str, payload: bytes, *, response: bool
+            ) -> None:
+                self.writes.append(payload)
+                if payload == frame:
+                    raise SolemConnectionError("link dropped after mutation")
+                await super().write_gatt_char(_uuid, payload, response=response)
+
+        await operation(DropOnProgramWrite())
+
+    monkeypatch.setattr(client, "_run_operation", run_operation)
+
+    with pytest.raises(UncertainWrite, match="outcome is uncertain"):
+        await client.write_program_frames([frame], expected, before.revision)
+
+    assert operation_calls == 1
+    assert client.program_write_diagnostics["phase"] == "await_ack"
+    assert client.program_write_diagnostics["acknowledged_blocks"] == 0
 
 
 async def test_run_operation_no_replay_after_mutation_error(monkeypatch) -> None:

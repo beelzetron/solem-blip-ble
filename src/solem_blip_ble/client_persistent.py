@@ -207,6 +207,7 @@ class PersistentSolemClient(StatelessSolemClient):
         operation: Callable[[BleakClient], Awaitable[_T]],
         *,
         deadline: float | None = None,
+        retry_safe: bool = True,
     ) -> _T:
         """Run one operation over a held connection, keeping it on success.
 
@@ -332,6 +333,10 @@ class PersistentSolemClient(StatelessSolemClient):
                         attempt,
                         exc,
                     )
+                    if not retry_safe:
+                        self._reset_session_state()
+                        self._schedule_idle_release()
+                        raise
                     if not connect_succeeded:
                         # Connect-phase failure: either _ConnectTimedOut
                         # ('Connect phase timed out after Ns ...') or the

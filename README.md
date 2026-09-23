@@ -66,3 +66,36 @@ Used by the [Solem BL-IP for Home Assistant](https://github.com/beelzetron/solem
 ## Credits
 
 Thanks to [pcman75](https://github.com/pcman75) for the original Solem BL-IP command reverse engineering.
+
+
+## Firmware 5 program snapshots and transactional restore
+
+Firmware-5 BL-IP program configuration is represented as a complete raw snapshot
+of **12 program slots / 84 frames**. The public snapshot helpers preserve the raw
+frames and expose a revision fingerprint so callers can detect stale state before
+a mutation. Home Assistant currently edits/restores A/B/C while preserving the
+nine additional slots byte-for-byte.
+
+`write_program_frames()` is deliberately conservative:
+
+1. It performs a retry-safe fresh snapshot preflight and checks the caller's
+   expected pre-write revision.
+2. It then opens the non-retryable mutation transaction, enables notifications,
+   writes the requested program blocks and waits for their acknowledgements.
+3. After mutation starts, transport failures are reported as `UncertainWrite`;
+   the library does **not** automatically replay writes.
+4. A complete program readback is performed on the mutation connection and must
+   match the caller-provided expected snapshot before the operation is confirmed.
+
+The revision preflight currently occurs on a **separate BLE connection** before
+the mutation transaction. It is therefore a stale-state guard, not an atomic
+same-connection compare-and-swap; callers should keep their own durable journal
+when they need crash/transport recovery semantics.
+
+The original BL-IP firmware may normalize controller-owned date metadata while
+programs are written. Applications that build an expected snapshot should avoid
+replaying stale controller-owned date values and should reconcile only explicitly
+understood normalization differences.
+
+These write APIs target the original BL-IP running firmware **5.x**. BL-IP V2 /
+firmware 6.x is not supported by this protocol implementation.

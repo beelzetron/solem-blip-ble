@@ -334,8 +334,10 @@ class PersistentSolemClient(StatelessSolemClient):
                         exc,
                     )
                     if not retry_safe:
+                        client_to_release = self._active_client
                         self._reset_session_state()
-                        self._schedule_idle_release()
+                        if client_to_release is not None:
+                            self._schedule_background_disconnect(client_to_release)
                         raise
                     if not connect_succeeded:
                         # Connect-phase failure: either _ConnectTimedOut

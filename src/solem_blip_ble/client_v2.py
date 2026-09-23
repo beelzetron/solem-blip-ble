@@ -77,6 +77,7 @@ from .const import (
 )
 from .exceptions import (
     InvalidSnapshot,
+    ProgramWriteRejected,
     SolemConnectionError,
     SolemDeadlineExceeded,
     StaleProgram,
@@ -844,6 +845,9 @@ class StatelessSolemClient:
             raise StaleProgram(
                 "Programs changed before restore; refresh before writing"
             )
+        # Tie the expected result to this exact fresh preflight state and the
+        # frames about to be sent before entering the no-replay mutation phase.
+        current.validate_expected_write(frames, expected)
         _LOGGER.debug(
             "%s - Program preflight verified on retry-safe read; "
             "opening no-replay mutation transaction (%d block(s))",
@@ -963,7 +967,7 @@ class StatelessSolemClient:
                         f"program block {block} acknowledgement",
                     )
                     if rejected:
-                        raise UncertainWrite("Controller rejected the program block")
+                        raise ProgramWriteRejected("Controller rejected the program block")
                     self.program_write_diagnostics["acknowledged_blocks"] = block + 1
                 actual = await read_snapshot("readback")
                 self.last_snapshot = actual

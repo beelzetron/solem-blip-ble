@@ -75,7 +75,15 @@ from .const import (
     STATUS_NOTIFY_TIMEOUT,
     WRITE_CHAR_UUID,
 )
-from .exceptions import SolemConnectionError, SolemDeadlineExceeded
+from .exceptions import (
+    InvalidSnapshot,
+    ProgramWriteRejected,
+    SolemConnectionError,
+    SolemDeadlineExceeded,
+    StaleProgram,
+    UncertainWrite,
+)
+from .snapshot import ProgramSnapshot
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -137,6 +145,8 @@ class StatelessSolemClient:
         self._link_dropped = False
         self._drop_event = asyncio.Event()
         self._active_client: BleakClient | None = None
+        self.last_snapshot: ProgramSnapshot | None = None
+        self.program_write_diagnostics: dict[str, Any] = {}
 
     # -- device resolution -------------------------------------------------
 
@@ -320,6 +330,7 @@ class StatelessSolemClient:
         operation: Callable[[BleakClient], Awaitable[_T]],
         *,
         deadline: float | None = None,
+        retry_safe: bool = True,
     ) -> _T:
         """Resolve, connect, run, close. Bounded, flat-retried, stateless.
 
@@ -396,6 +407,8 @@ class StatelessSolemClient:
                     attempt,
                     exc,
                 )
+                if not retry_safe:
+                    raise
             finally:
                 if op_task is not None and not op_task.done():
                     op_task.cancel()
@@ -746,15 +759,14 @@ class StatelessSolemClient:
                     and normalized[3] >> 4 == protocol.IRRIGATION_PROGRAM_CLASS
                 ):
                     last_fragment_at = time.monotonic()
-                parsed = protocol.parse_irrigation_config_fragment(payload)
-                if parsed is None:
+                if normalized is None or normalized[3] >> 4 != protocol.IRRIGATION_PROGRAM_CLASS:
                     return
                 payloads.append(payload)
                 _LOGGER.debug(
                     "%s - Irrigation config fragment (program=%s, fragment=%s): %s",
                     self.mac_address,
-                    parsed["program_index"],
-                    parsed["fragment_id"],
+                    (normalized[3] & 0x0F),
+                    normalized[2],
                     payload.hex(),
                 )
 
@@ -783,18 +795,249 @@ class StatelessSolemClient:
             try:
                 await self._write(client, request)
                 await _wait_for_irrigation_config()
-                programs = protocol.assemble_irrigation_programs(
-                    payloads, max_stations=self.max_station_num
-                )
                 if not protocol.irrigation_config_complete(payloads):
                     raise SolemConnectionError(
                         "Incomplete irrigation config response"
                     )
-                return programs
+                snapshot = ProgramSnapshot.from_frames(tuple(payloads))
+                self.last_snapshot = snapshot
+                return snapshot.programs
             finally:
                 await self._stop_notify(client)
 
         return await self._run_operation(_op)
+
+    async def get_program_snapshot(self) -> ProgramSnapshot:
+        """Read and return the complete byte-preserving V5 program snapshot."""
+        await self.get_irrigation_config()
+        if self.last_snapshot is None:
+            raise InvalidSnapshot("No complete program snapshot available")
+        return self.last_snapshot
+
+    async def write_program_frames(
+        self,
+        frames: list[bytes],
+        expected: ProgramSnapshot,
+        before_revision: str,
+    ) -> ProgramSnapshot:
+        """Preflight safely, then write once and verify without replay.
+
+        The fresh revision preflight is a separate read-only, retry-safe
+        operation. The subsequent mutation and full readback use one BLE
+        connection; once that phase starts it is never replayed automatically.
+        Transport failures after the first program frame are surfaced as
+        UncertainWrite.
+        """
+        if self.mock:
+            self.last_snapshot = expected
+            return expected
+
+        # Preflight is read-only and therefore retry-safe. Perform it as a
+        # normal snapshot operation before opening the no-replay mutation
+        # connection. A transient BLE drop during this safety read may retry;
+        # once a program frame is sent, the transaction below never replays.
+        current = await self.get_program_snapshot()
+        self.program_write_diagnostics = {
+            "phase": "preflight",
+            "acknowledged_blocks": 0,
+        }
+        if current.revision != before_revision:
+            raise StaleProgram(
+                "Programs changed before restore; refresh before writing"
+            )
+        # Tie the expected result to this exact fresh preflight state and the
+        # frames about to be sent before entering the no-replay mutation phase.
+        current.validate_expected_write(frames, expected)
+        _LOGGER.debug(
+            "%s - Program preflight verified on retry-safe read; "
+            "opening no-replay mutation transaction (%d block(s))",
+            self.mac_address,
+            len(frames),
+        )
+
+        request = protocol.pack_get_irrigation_config()
+        mutation_started = False
+        _LOGGER.debug(
+            "%s - Starting transactional program write (%s, %d block(s))",
+            self.mac_address,
+            type(self).__name__,
+            len(frames),
+        )
+
+        async def _op(client: BleakClient) -> ProgramSnapshot:
+            nonlocal mutation_started
+            payloads: list[bytes] = []
+            acknowledged = asyncio.Event()
+            expected_header = b""
+            expected_length = 0
+            rejected = False
+            self.program_write_diagnostics = {
+                "phase": "subscribe",
+                "acknowledged_blocks": 0,
+            }
+
+            def notification_handler(_sender: int, data: bytearray) -> None:
+                nonlocal rejected
+                diagnostic = self.program_write_diagnostics
+                if diagnostic["phase"] in ("preflight", "readback"):
+                    normalized = protocol.normalize_config_notification(data)
+                    if normalized is not None and normalized[3] >> 4 == protocol.IRRIGATION_PROGRAM_CLASS:
+                        payloads.append(bytes(data))
+                    return
+                diagnostic["last_reply_header"] = bytes(data[:4]).hex()
+                diagnostic["last_reply_length"] = len(data)
+                if not data or not expected_header or data[0] != expected_header[0]:
+                    return
+                if len(data) >= 3 and (data[2] == 0xF0 or (len(data) > 3 and data[3] == 0xF0)):
+                    rejected = True
+                    acknowledged.set()
+                elif bytes(data) == expected_header[:1] + b"\x00":
+                    acknowledged.set()
+                elif len(data) == expected_length and bytes(data[:4]) == expected_header:
+                    acknowledged.set()
+
+            async def read_snapshot(label: str) -> ProgramSnapshot:
+                self.program_write_diagnostics["phase"] = label
+                payloads.clear()
+                started_at = time.monotonic()
+                _LOGGER.debug(
+                    "%s - Program transaction %s read started (%s)",
+                    self.mac_address,
+                    label,
+                    type(self).__name__,
+                )
+                await self._write(client, request)
+                deadline = time.monotonic() + STATUS_NOTIFY_TIMEOUT
+                previous_count = -1
+                last_fragment_at = time.monotonic()
+                while True:
+                    now = time.monotonic()
+                    if len(payloads) != previous_count:
+                        previous_count = len(payloads)
+                        last_fragment_at = now
+                    if protocol.irrigation_config_complete(payloads) and now - last_fragment_at >= IRRIGATION_CONFIG_IDLE_TIMEOUT:
+                        _LOGGER.debug(
+                            "%s - Program transaction %s read complete: %d fragment(s) in %.2fs",
+                            self.mac_address,
+                            label,
+                            len(payloads),
+                            now - started_at,
+                        )
+                        return ProgramSnapshot.from_frames(tuple(payloads))
+                    if now >= deadline:
+                        if protocol.irrigation_config_complete(payloads):
+                            _LOGGER.debug(
+                                "%s - Program transaction %s read complete at deadline: %d fragment(s) in %.2fs",
+                                self.mac_address,
+                                label,
+                                len(payloads),
+                                now - started_at,
+                            )
+                            return ProgramSnapshot.from_frames(tuple(payloads))
+                        _LOGGER.debug(
+                            "%s - Program transaction %s read timed out: %d fragment(s) in %.2fs",
+                            self.mac_address,
+                            label,
+                            len(payloads),
+                            now - started_at,
+                        )
+                        raise SolemConnectionError("Timeout waiting for irrigation config")
+                    self._check_drop()
+                    await asyncio.sleep(0.05)
+
+            await self._start_notify(client, notification_handler)
+            try:
+                await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+                _LOGGER.debug(
+                    "%s - Program mutation connection ready; starting %d block(s)",
+                    self.mac_address,
+                    len(frames),
+                )
+                for block, frame in enumerate(frames):
+                    expected_header = bytes([frame[0] + 1]) + frame[1:4]
+                    expected_length = len(frame)
+                    acknowledged.clear()
+                    rejected = False
+                    self.program_write_diagnostics.update(phase="await_ack", block=block)
+                    mutation_started = True
+                    await self._write(client, frame)
+                    await self._wait_for_event(
+                        acknowledged,
+                        STATUS_NOTIFY_TIMEOUT,
+                        f"program block {block} acknowledgement",
+                    )
+                    if rejected:
+                        raise ProgramWriteRejected("Controller rejected the program block")
+                    self.program_write_diagnostics["acknowledged_blocks"] = block + 1
+                actual = await read_snapshot("readback")
+                self.last_snapshot = actual
+                if actual.revision != expected.revision:
+                    self.program_write_diagnostics["phase"] = "readback_mismatch"
+                    raise UncertainWrite("Program verification failed; refresh and review the controller")
+                self.program_write_diagnostics["phase"] = "verified"
+                return actual
+            finally:
+                await self._stop_notify(client)
+
+        try:
+            return await self._run_operation(_op, retry_safe=False)
+        except UncertainWrite:
+            raise
+        except Exception as exc:
+            if mutation_started:
+                raise UncertainWrite("Program write outcome is uncertain; refresh before retrying") from exc
+            raise
+
+    async def write_irrigation_program(
+        self,
+        program_index: int,
+        program: protocol.IrrigationProgram,
+    ) -> None:
+        """Write one persisted V5 irrigation program without reading it back.
+
+        This low-level write primitive is intended for callers that need to
+        batch multiple program writes and perform one independent verification
+        after the controller has had time to settle. It deliberately sends the
+        exact same capture-inferred V5 frames as :meth:`set_irrigation_program`
+        and does not append the manual-command commit frame.
+        """
+        frames = protocol.pack_set_irrigation_program(
+            program_index,
+            program,
+            max_stations=self.max_station_num,
+        )
+
+        if self.mock:
+            return
+
+        # Use the smallest possible write path: one fresh BLE session per
+        # frame, with no notification subscription or readback. Notifications
+        # are not consumed by this primitive and can make proxy links fail
+        # before the frame itself is written.
+        for frame_number, frame in enumerate(frames, start=1):
+            async def _op(client: BleakClient, payload: bytes = frame) -> None:
+                self._check_drop()
+                await self._write(client, payload)
+                self._check_drop()
+
+            _LOGGER.debug(
+                "%s - Writing irrigation program %d frame %d/%d",
+                self.mac_address,
+                program_index,
+                frame_number,
+                len(frames),
+            )
+            try:
+                await self._run_operation(_op)
+            except Exception:
+                _LOGGER.warning(
+                    "%s - Irrigation program %d frame %d/%d failed",
+                    self.mac_address,
+                    program_index,
+                    frame_number,
+                    len(frames),
+                )
+                raise
 
     async def set_irrigation_program(
         self,
@@ -802,11 +1045,6 @@ class StatelessSolemClient:
         program: protocol.IrrigationProgram,
     ) -> dict[int, protocol.IrrigationProgram]:
         """Write one persisted V5 irrigation program and verify by reading it back."""
-        frames = protocol.pack_set_irrigation_program(
-            program_index,
-            program,
-            max_stations=self.max_station_num,
-        )
         expected = protocol.normalize_irrigation_program_for_write(
             program,
             max_stations=self.max_station_num,
@@ -817,12 +1055,7 @@ class StatelessSolemClient:
             programs[program_index] = expected
             return programs
 
-        async def _op(client: BleakClient) -> None:
-            for frame in frames:
-                self._check_drop()
-                await self._write(client, frame)
-
-        await self._run_operation(_op)
+        await self.write_irrigation_program(program_index, program)
         programs = await self.get_irrigation_config()
         written = programs.get(program_index)
         mismatches = protocol.irrigation_program_write_mismatches(written, expected)

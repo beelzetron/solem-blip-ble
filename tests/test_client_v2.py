@@ -5,19 +5,25 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
+from bleak_retry_connector import BleakClientWithServiceCache
 
+from solem_blip_ble import protocol
 from solem_blip_ble.client_v2 import (
     StatelessSolemClient,
     _ConnectTimedOut,
     _DropDetected,
 )
-from bleak_retry_connector import BleakClientWithServiceCache
-from solem_blip_ble.exceptions import SolemConnectionError, SolemDeadlineExceeded
-from unittest.mock import MagicMock
+from solem_blip_ble.exceptions import (
+    ProgramWriteRejected,
+    SolemConnectionError,
+    SolemDeadlineExceeded,
+    UncertainWrite,
+)
 
 
 class FakeV2Client:
@@ -564,3 +570,180 @@ async def test_mock_mode_stays_off_ble(monkeypatch) -> None:
         "patch": 0,
         "raw_hex": "5.0.0",
     }
+
+
+async def test_write_irrigation_program_skips_readback(monkeypatch) -> None:
+    """Write-only schedule frames use one minimal BLE operation per frame."""
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=2)
+    program = {
+        "name": "Programme B",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 3,
+        "synchro_day": 1,
+        "period_start_date": None,
+        "start_times": [360, None, None, None, None, None, None, None],
+        "station_durations": [600, 600],
+    }
+    operation_writes: list[list[bytes]] = []
+
+    async def run_operation(operation, *, deadline=None):
+        fake = FakeV2Client()
+        await operation(fake)
+        operation_writes.append(fake.writes)
+        assert fake.handler is None
+
+    monkeypatch.setattr(client, "_run_operation", run_operation)
+
+    await client.write_irrigation_program(1, program)
+
+    frames = protocol.pack_set_irrigation_program(
+        1,
+        program,
+        max_stations=2,
+    )
+    assert operation_writes == [[frame] for frame in frames]
+
+
+async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> None:
+    """Verified writes delegate the BLE write phase to the write-only primitive."""
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", mock=True, max_station_num=2)
+    program = {
+        "name": "Programme B",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 3,
+        "synchro_day": 1,
+        "period_start_date": None,
+        "start_times": [360, None, None, None, None, None, None, None],
+        "station_durations": [600, 600],
+    }
+    expected = protocol.normalize_irrigation_program_for_write(
+        program,
+        max_stations=2,
+    )
+    write = AsyncMock()
+    readback = AsyncMock(return_value={1: expected})
+    monkeypatch.setattr(client, "write_irrigation_program", write)
+    monkeypatch.setattr(client, "get_irrigation_config", readback)
+    client.mock = False
+
+    result = await client.set_irrigation_program(1, program)
+
+    write.assert_awaited_once_with(1, program)
+    readback.assert_awaited_once()
+    assert result == {1: expected}
+
+
+async def test_program_write_preflight_uses_retry_safe_snapshot(monkeypatch) -> None:
+    """Program restore preflight is a separate retry-safe read operation."""
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    before = MagicMock()
+    before.revision = "same"
+    expected = MagicMock()
+    expected.revision = "same"
+    snapshot = MagicMock()
+    snapshot.revision = "same"
+
+    preflight = AsyncMock(return_value=snapshot)
+    monkeypatch.setattr(client, "get_program_snapshot", preflight)
+
+    retry_flags: list[bool] = []
+
+    async def run_operation(operation, *, deadline=None, retry_safe=True):
+        retry_flags.append(retry_safe)
+        raise SolemConnectionError("mutation connection failed")
+
+    monkeypatch.setattr(client, "_run_operation", run_operation)
+
+    with pytest.raises(SolemConnectionError, match="mutation connection failed"):
+        await client.write_program_frames([], expected, before.revision)
+
+    preflight.assert_awaited_once_with()
+    assert retry_flags == [False]
+    assert client.program_write_diagnostics == {
+        "phase": "preflight",
+        "acknowledged_blocks": 0,
+    }
+
+
+async def test_program_write_transport_failure_after_mutation_is_uncertain_no_replay(
+    monkeypatch,
+) -> None:
+    """A failure after the first program frame is sent is never replayed."""
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    before = MagicMock()
+    before.revision = "same"
+    expected = MagicMock()
+    expected.revision = "expected"
+    snapshot = MagicMock()
+    snapshot.revision = "same"
+    monkeypatch.setattr(
+        client,
+        "get_program_snapshot",
+        AsyncMock(return_value=snapshot),
+    )
+    monkeypatch.setattr("solem_blip_ble.client_v2.NOTIFY_SETTLE_DELAY", 0)
+
+    frame = bytes.fromhex("3912451250726f6772616d6d6520430000000000")
+    operation_calls = 0
+
+    async def run_operation(operation, *, deadline=None, retry_safe=True):
+        nonlocal operation_calls
+        operation_calls += 1
+        assert retry_safe is False
+
+        class DropOnProgramWrite(FakeV2Client):
+            async def write_gatt_char(
+                self, _uuid: str, payload: bytes, *, response: bool
+            ) -> None:
+                self.writes.append(payload)
+                if payload == frame:
+                    raise SolemConnectionError("link dropped after mutation")
+                await super().write_gatt_char(_uuid, payload, response=response)
+
+        await operation(DropOnProgramWrite())
+
+    monkeypatch.setattr(client, "_run_operation", run_operation)
+
+    with pytest.raises(UncertainWrite, match="outcome is uncertain"):
+        await client.write_program_frames([frame], expected, before.revision)
+
+    assert operation_calls == 1
+    assert client.program_write_diagnostics["phase"] == "await_ack"
+    assert client.program_write_diagnostics["acknowledged_blocks"] == 0
+
+
+async def test_run_operation_no_replay_after_mutation_error(monkeypatch) -> None:
+    """retry_safe=False surfaces the first transport failure without replay."""
+    attempts = 0
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        return FakeV2Client()
+
+    async def operation(_client):
+        nonlocal attempts
+        attempts += 1
+        raise SolemConnectionError("uncertain mutation")
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+    monkeypatch.setattr("solem_blip_ble.client_v2.REQUEST_RETRY_DELAY", 0)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    with pytest.raises(SolemConnectionError, match="uncertain mutation"):
+        await client._run_operation(operation, retry_safe=False)
+
+    assert attempts == 1
+
+
+def test_program_write_rejected_remains_conservative_uncertain_write() -> None:
+    """Explicit rejection is distinguishable without weakening old handling."""
+    assert issubclass(ProgramWriteRejected, UncertainWrite)

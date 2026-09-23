@@ -645,3 +645,35 @@ async def test_no_stale_client_reuse_after_release(monkeypatch) -> None:
     assert len(created) == 2
     assert created[1] is not held
     assert client._active_client is created[1]
+
+
+async def test_persistent_no_replay_invalidates_session(monkeypatch) -> None:
+    """retry_safe=False never replays and drops the held session on failure."""
+    attempts = 0
+    created: list[FakeV2Client] = []
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        fake = FakeV2Client()
+        created.append(fake)
+        return fake
+
+    async def operation(_client):
+        nonlocal attempts
+        attempts += 1
+        raise SolemConnectionError("uncertain mutation")
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF")
+    with pytest.raises(SolemConnectionError, match="uncertain mutation"):
+        await client._run_operation(operation, retry_safe=False)
+
+    assert attempts == 1
+    assert len(created) == 1
+    assert client._active_client is None
+    await drain_background_disconnects()
+    assert created[0].disconnects == 1

@@ -633,3 +633,29 @@ async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> 
     write.assert_awaited_once_with(1, program)
     readback.assert_awaited_once()
     assert result == {1: expected}
+
+
+async def test_run_operation_no_replay_after_mutation_error(monkeypatch) -> None:
+    """retry_safe=False surfaces the first transport failure without replay."""
+    attempts = 0
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        return FakeV2Client()
+
+    async def operation(_client):
+        nonlocal attempts
+        attempts += 1
+        raise SolemConnectionError("uncertain mutation")
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+    monkeypatch.setattr("solem_blip_ble.client_v2.REQUEST_RETRY_DELAY", 0)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    with pytest.raises(SolemConnectionError, match="uncertain mutation"):
+        await client._run_operation(operation, retry_safe=False)
+
+    assert attempts == 1

@@ -85,6 +85,34 @@ class ProgramSnapshot:
             programs[index] = protocol.assemble_irrigation_programs(remapped, max_stations=12)[0]
         return programs
 
+    def write_frames(self) -> list[bytes]:
+        """Return a full byte-preserving write sequence for every stored slot."""
+        self.require_known_programs()
+        grouped: dict[int, list[bytes]] = {
+            index: list(self.blocks[index]) for index in range(3)
+        }
+        for frame in self.extras:
+            if frame[3] >> 4 == 1:
+                grouped.setdefault(frame[3] & 15, []).append(frame)
+
+        writes: list[bytes] = []
+        for index in range(12):
+            group = grouped.get(index)
+            if group is None or len(group) != 7:
+                raise InvalidSnapshot("Complete twelve-slot program snapshot required")
+            ordered = sorted(group, key=lambda frame: frame[2], reverse=True)
+            expected_lengths = (20, 20, 16, 20, 19, 19, 10)
+            if tuple(map(len, ordered)) != expected_lengths:
+                raise InvalidSnapshot("Unknown program fragment layout")
+            for chunk, frame in enumerate(ordered):
+                command = 0x2F if chunk < 2 else 0x37
+                chunk_id = chunk if chunk < 2 else chunk - 2
+                writes.append(
+                    bytes([command, len(frame) - 2, chunk_id, frame[3]])
+                    + bytes(frame[4:])
+                )
+        return writes
+
     def patch(
         self, index: int, changes: dict[str, Any], physical_stations: int
     ) -> tuple[list[bytes], ProgramSnapshot]:

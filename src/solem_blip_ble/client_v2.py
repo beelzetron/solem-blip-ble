@@ -819,15 +819,37 @@ class StatelessSolemClient:
         expected: ProgramSnapshot,
         before_revision: str,
     ) -> ProgramSnapshot:
-        """Write program blocks once, acknowledge each, then verify full readback.
+        """Preflight safely, then write once and verify without replay.
 
-        The complete transaction uses one BLE connection. Once the first
-        mutation is sent, transport failures are surfaced as UncertainWrite and
-        are never replayed automatically.
+        The fresh revision preflight is a separate read-only, retry-safe
+        operation. The subsequent mutation and full readback use one BLE
+        connection; once that phase starts it is never replayed automatically.
+        Transport failures after the first program frame are surfaced as
+        UncertainWrite.
         """
         if self.mock:
             self.last_snapshot = expected
             return expected
+
+        # Preflight is read-only and therefore retry-safe. Perform it as a
+        # normal snapshot operation before opening the no-replay mutation
+        # connection. A transient BLE drop during this safety read may retry;
+        # once a program frame is sent, the transaction below never replays.
+        current = await self.get_program_snapshot()
+        self.program_write_diagnostics = {
+            "phase": "preflight",
+            "acknowledged_blocks": 0,
+        }
+        if current.revision != before_revision:
+            raise StaleProgram(
+                "Programs changed before restore; refresh before writing"
+            )
+        _LOGGER.debug(
+            "%s - Program preflight verified on retry-safe read; "
+            "opening no-replay mutation transaction (%d block(s))",
+            self.mac_address,
+            len(frames),
+        )
 
         request = protocol.pack_get_irrigation_config()
         mutation_started = False
@@ -922,13 +944,8 @@ class StatelessSolemClient:
             await self._start_notify(client, notification_handler)
             try:
                 await asyncio.sleep(NOTIFY_SETTLE_DELAY)
-                current = await read_snapshot("preflight")
-                if current.revision != before_revision:
-                    raise StaleProgram(
-                        "Programs changed before restore; refresh before writing"
-                    )
                 _LOGGER.debug(
-                    "%s - Program preflight verified; starting %d mutation block(s)",
+                    "%s - Program mutation connection ready; starting %d block(s)",
                     self.mac_address,
                     len(frames),
                 )

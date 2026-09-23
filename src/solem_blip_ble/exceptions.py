@@ -12,3 +12,15 @@ class SolemDeadlineExceeded(Exception):
     retry SolemConnectionError, so a deadline breach surfaces to the caller
     instead of re-entering the retry loop that just consumed its budget.
     """
+
+
+class InvalidSnapshot(SolemConnectionError):
+    """The configuration cannot be safely interpreted or edited."""
+
+
+class StaleProgram(SolemConnectionError):
+    """The controller changed since the draft was opened."""
+
+
+class UncertainWrite(SolemConnectionError):
+    """A mutation may have reached the controller; never replay it."""

@@ -87,6 +87,19 @@ nine additional slots byte-for-byte.
 4. A complete program readback is performed on the mutation connection and must
    match the caller-provided expected snapshot before the operation is confirmed.
 
+The existing single-program write path (`write_irrigation_program()`, used by
+`set_irrigation_program()`) now sends each of the seven V5 frames in its own
+fresh BLE session, without a notification subscription. This deliberately keeps
+that low-level path minimal for Bluetooth-proxy links, but it changes its
+transport profile from the previous one-session frame sequence and can therefore
+be slower on a single-connection controller.
+
+An explicit controller rejection is reported as `ProgramWriteRejected`, a
+subclass of `UncertainWrite`. Callers can distinguish the rejection from an
+unknown transport outcome and refresh/reconcile accordingly; the subtype remains
+conservative because earlier blocks in a multi-block transaction may already
+have been acknowledged.
+
 The revision preflight currently occurs on a **separate BLE connection** before
 the mutation transaction. It is therefore a stale-state guard, not an atomic
 same-connection compare-and-swap; callers should keep their own durable journal

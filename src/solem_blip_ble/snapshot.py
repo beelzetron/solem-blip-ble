@@ -11,6 +11,9 @@ from . import protocol
 from .exceptions import InvalidSnapshot
 
 
+_FRAGMENT_LENGTHS = (20, 20, 16, 20, 19, 19, 10)
+
+
 @dataclass(frozen=True)
 class ProgramSnapshot:
     """Keep all raw bytes, including fields not displayed in Home Assistant."""
@@ -79,7 +82,7 @@ class ProgramSnapshot:
             ordered = sorted(group, key=lambda frame: frame[2], reverse=True)
             if (len(ordered) != 7 or ordered[0][2] - ordered[-1][2] != 6
                 or len({frame[2] for frame in ordered}) != 7
-                or tuple(map(len, ordered)) != (20, 20, 16, 20, 19, 19, 10)):
+                or tuple(map(len, ordered)) != _FRAGMENT_LENGTHS):
                 raise InvalidSnapshot("Unknown additional program fragment layout")
             remapped = [frame[:3] + b"\x10" + frame[4:] for frame in ordered]
             programs[index] = protocol.assemble_irrigation_programs(remapped, max_stations=12)[0]
@@ -106,8 +109,7 @@ class ProgramSnapshot:
             ordered = group if index < 3 else sorted(
                 group, key=lambda frame: frame[2], reverse=True
             )
-            expected_lengths = (20, 20, 16, 20, 19, 19, 10)
-            if tuple(map(len, ordered)) != expected_lengths:
+            if tuple(map(len, ordered)) != _FRAGMENT_LENGTHS:
                 raise InvalidSnapshot("Unknown program fragment layout")
             for chunk, frame in enumerate(ordered):
                 command = 0x2F if chunk < 2 else 0x37
@@ -117,6 +119,59 @@ class ProgramSnapshot:
                     + bytes(frame[4:])
                 )
         return writes
+
+    def validate_expected_write(
+        self, frames: list[bytes], expected: ProgramSnapshot
+    ) -> None:
+        """Require expected to be exactly this snapshot plus the write frames.
+
+        This ties the caller-provided expected snapshot to the same fresh state
+        used by the revision preflight, so a stale or unrelated expectation is
+        rejected before mutation rather than only during readback.
+        """
+        current_by_key = {
+            (frame[3] & 0x0F, chunk): frame
+            for index in range(3)
+            for chunk, frame in enumerate(self.blocks[index])
+        }
+        for frame in self.extras:
+            if frame[3] >> 4 == protocol.IRRIGATION_PROGRAM_CLASS:
+                current_by_key[(frame[3] & 0x0F, 6 - frame[2])] = frame
+
+        expected_by_key = {
+            (frame[3] & 0x0F, chunk): frame
+            for index in range(3)
+            for chunk, frame in enumerate(expected.blocks[index])
+        }
+        for frame in expected.extras:
+            if frame[3] >> 4 == protocol.IRRIGATION_PROGRAM_CLASS:
+                expected_by_key[(frame[3] & 0x0F, 6 - frame[2])] = frame
+
+        if set(current_by_key) != set(expected_by_key):
+            raise InvalidSnapshot("Expected snapshot does not match preflight layout")
+
+        written: dict[tuple[int, int], bytes] = {}
+        for frame in frames:
+            if len(frame) < 4 or frame[0] not in (0x2F, 0x37):
+                raise InvalidSnapshot("Unknown program write frame")
+            chunk = frame[2] if frame[0] == 0x2F else frame[2] + 2
+            key = (frame[3] & 0x0F, chunk)
+            if key not in current_by_key or chunk not in range(7):
+                raise InvalidSnapshot("Program write does not match preflight layout")
+            written[key] = frame[4:]
+
+        for key, current_frame in current_by_key.items():
+            expected_frame = expected_by_key[key]
+            payload = written.get(key)
+            if payload is None:
+                if expected_frame != current_frame:
+                    raise InvalidSnapshot(
+                        "Expected snapshot changes data not covered by write frames"
+                    )
+            elif expected_frame[4:] != payload:
+                raise InvalidSnapshot(
+                    "Expected snapshot does not match requested write frames"
+                )
 
     def patch(
         self, index: int, changes: dict[str, Any], physical_stations: int
@@ -134,8 +189,7 @@ class ProgramSnapshot:
         if self.programs[index]["cycle"] not in range(5):
             raise InvalidSnapshot("Unsupported cycle mode")
         # Settings without a complete date must remain byte-for-byte intact.
-        expected_lengths = (20, 20, 16, 20, 19, 19, 10)
-        if any(len(frame) != length for frame, length in zip(blocks, expected_lengths)):
+        if any(len(frame) != length for frame, length in zip(blocks, _FRAGMENT_LENGTHS)):
             raise InvalidSnapshot("Unsupported program block lengths")
 
         def integer(value: Any, maximum: int, minimum: int = 0) -> int:

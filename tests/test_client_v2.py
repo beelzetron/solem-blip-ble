@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from bleak.backends.device import BLEDevice
@@ -23,7 +24,6 @@ from solem_blip_ble.exceptions import (
     SolemDeadlineExceeded,
     UncertainWrite,
 )
-from unittest.mock import AsyncMock, MagicMock
 
 
 class FakeV2Client:

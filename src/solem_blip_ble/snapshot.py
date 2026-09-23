@@ -100,7 +100,12 @@ class ProgramSnapshot:
             group = grouped.get(index)
             if group is None or len(group) != 7:
                 raise InvalidSnapshot("Complete twelve-slot program snapshot required")
-            ordered = sorted(group, key=lambda frame: frame[2], reverse=True)
+            # A/B/C blocks are already canonical logical chunk order (0..6).
+            # Hidden slots retain their device fragment IDs and are ordered
+            # from the first/highest fragment down to the final fragment.
+            ordered = group if index < 3 else sorted(
+                group, key=lambda frame: frame[2], reverse=True
+            )
             expected_lengths = (20, 20, 16, 20, 19, 19, 10)
             if tuple(map(len, ordered)) != expected_lengths:
                 raise InvalidSnapshot("Unknown program fragment layout")

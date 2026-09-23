@@ -7,21 +7,20 @@ import time
 from typing import Any
 
 import pytest
-
-from solem_blip_ble import protocol
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
+from bleak_retry_connector import BleakClientWithServiceCache
 
+from solem_blip_ble import protocol
 from solem_blip_ble.client_v2 import (
     StatelessSolemClient,
     _ConnectTimedOut,
     _DropDetected,
 )
-from bleak_retry_connector import BleakClientWithServiceCache
 from solem_blip_ble.exceptions import (
+    ProgramWriteRejected,
     SolemConnectionError,
     SolemDeadlineExceeded,
-    ProgramWriteRejected,
     UncertainWrite,
 )
 from unittest.mock import AsyncMock, MagicMock

@@ -21,6 +21,7 @@ from bleak_retry_connector import BleakClientWithServiceCache
 from solem_blip_ble.exceptions import (
     SolemConnectionError,
     SolemDeadlineExceeded,
+    ProgramWriteRejected,
     UncertainWrite,
 )
 from unittest.mock import AsyncMock, MagicMock
@@ -742,3 +743,8 @@ async def test_run_operation_no_replay_after_mutation_error(monkeypatch) -> None
         await client._run_operation(operation, retry_safe=False)
 
     assert attempts == 1
+
+
+def test_program_write_rejected_remains_conservative_uncertain_write() -> None:
+    """Explicit rejection is distinguishable without weakening old handling."""
+    assert issubclass(ProgramWriteRejected, UncertainWrite)

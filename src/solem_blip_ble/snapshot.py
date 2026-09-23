@@ -134,18 +134,30 @@ class ProgramSnapshot:
             for index in range(3)
             for chunk, frame in enumerate(self.blocks[index])
         }
+        current_extra_groups: dict[int, list[bytes]] = {}
         for frame in self.extras:
             if frame[3] >> 4 == protocol.IRRIGATION_PROGRAM_CLASS:
-                current_by_key[(frame[3] & 0x0F, 6 - frame[2])] = frame
+                current_extra_groups.setdefault(frame[3] & 0x0F, []).append(frame)
+        for index, group in current_extra_groups.items():
+            for chunk, frame in enumerate(
+                sorted(group, key=lambda item: item[2], reverse=True)
+            ):
+                current_by_key[(index, chunk)] = frame
 
         expected_by_key = {
             (frame[3] & 0x0F, chunk): frame
             for index in range(3)
             for chunk, frame in enumerate(expected.blocks[index])
         }
+        expected_extra_groups: dict[int, list[bytes]] = {}
         for frame in expected.extras:
             if frame[3] >> 4 == protocol.IRRIGATION_PROGRAM_CLASS:
-                expected_by_key[(frame[3] & 0x0F, 6 - frame[2])] = frame
+                expected_extra_groups.setdefault(frame[3] & 0x0F, []).append(frame)
+        for index, group in expected_extra_groups.items():
+            for chunk, frame in enumerate(
+                sorted(group, key=lambda item: item[2], reverse=True)
+            ):
+                expected_by_key[(index, chunk)] = frame
 
         if set(current_by_key) != set(expected_by_key):
             raise InvalidSnapshot("Expected snapshot does not match preflight layout")

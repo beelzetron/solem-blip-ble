@@ -75,7 +75,13 @@ from .const import (
     STATUS_NOTIFY_TIMEOUT,
     WRITE_CHAR_UUID,
 )
-from .exceptions import InvalidSnapshot, SolemConnectionError, SolemDeadlineExceeded, UncertainWrite
+from .exceptions import (
+    InvalidSnapshot,
+    SolemConnectionError,
+    SolemDeadlineExceeded,
+    StaleProgram,
+    UncertainWrite,
+)
 from .snapshot import ProgramSnapshot
 
 _LOGGER = logging.getLogger(__name__)
@@ -825,6 +831,12 @@ class StatelessSolemClient:
 
         request = protocol.pack_get_irrigation_config()
         mutation_started = False
+        _LOGGER.debug(
+            "%s - Starting transactional program write (%s, %d block(s))",
+            self.mac_address,
+            type(self).__name__,
+            len(frames),
+        )
 
         async def _op(client: BleakClient) -> ProgramSnapshot:
             nonlocal mutation_started
@@ -861,6 +873,13 @@ class StatelessSolemClient:
             async def read_snapshot(label: str) -> ProgramSnapshot:
                 self.program_write_diagnostics["phase"] = label
                 payloads.clear()
+                started_at = time.monotonic()
+                _LOGGER.debug(
+                    "%s - Program transaction %s read started (%s)",
+                    self.mac_address,
+                    label,
+                    type(self).__name__,
+                )
                 await self._write(client, request)
                 deadline = time.monotonic() + STATUS_NOTIFY_TIMEOUT
                 previous_count = -1
@@ -871,10 +890,31 @@ class StatelessSolemClient:
                         previous_count = len(payloads)
                         last_fragment_at = now
                     if protocol.irrigation_config_complete(payloads) and now - last_fragment_at >= IRRIGATION_CONFIG_IDLE_TIMEOUT:
+                        _LOGGER.debug(
+                            "%s - Program transaction %s read complete: %d fragment(s) in %.2fs",
+                            self.mac_address,
+                            label,
+                            len(payloads),
+                            now - started_at,
+                        )
                         return ProgramSnapshot.from_frames(tuple(payloads))
                     if now >= deadline:
                         if protocol.irrigation_config_complete(payloads):
+                            _LOGGER.debug(
+                                "%s - Program transaction %s read complete at deadline: %d fragment(s) in %.2fs",
+                                self.mac_address,
+                                label,
+                                len(payloads),
+                                now - started_at,
+                            )
                             return ProgramSnapshot.from_frames(tuple(payloads))
+                        _LOGGER.debug(
+                            "%s - Program transaction %s read timed out: %d fragment(s) in %.2fs",
+                            self.mac_address,
+                            label,
+                            len(payloads),
+                            now - started_at,
+                        )
                         raise SolemConnectionError("Timeout waiting for irrigation config")
                     self._check_drop()
                     await asyncio.sleep(0.05)
@@ -884,7 +924,14 @@ class StatelessSolemClient:
                 await asyncio.sleep(NOTIFY_SETTLE_DELAY)
                 current = await read_snapshot("preflight")
                 if current.revision != before_revision:
-                    raise UncertainWrite("Programs changed before restore; refresh before writing")
+                    raise StaleProgram(
+                        "Programs changed before restore; refresh before writing"
+                    )
+                _LOGGER.debug(
+                    "%s - Program preflight verified; starting %d mutation block(s)",
+                    self.mac_address,
+                    len(frames),
+                )
                 for block, frame in enumerate(frames):
                     expected_header = bytes([frame[0] + 1]) + frame[1:4]
                     expected_length = len(frame)

@@ -8,19 +8,7 @@ import hashlib
 from typing import Any
 
 from . import protocol
-from .exceptions import SolemConnectionError
-
-
-class InvalidSnapshot(SolemConnectionError):
-    """The configuration cannot be safely interpreted or edited."""
-
-
-class StaleProgram(SolemConnectionError):
-    """The controller changed since the draft was opened."""
-
-
-class UncertainWrite(SolemConnectionError):
-    """A mutation may have reached the controller; never replay it."""
+from .exceptions import InvalidSnapshot
 
 
 @dataclass(frozen=True)

@@ -24,3 +24,13 @@ class StaleProgram(SolemConnectionError):
 
 class UncertainWrite(SolemConnectionError):
     """A mutation may have reached the controller; never replay it."""
+
+
+class ProgramWriteRejected(UncertainWrite):
+    """The controller explicitly rejected a program block.
+
+    This is distinct from an unknown transport outcome so callers can choose
+    to refresh and reconcile deliberately. It remains an ``UncertainWrite``
+    subtype because earlier blocks in the same multi-block transaction may
+    already have been acknowledged and applied.
+    """

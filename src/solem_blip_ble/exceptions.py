@@ -34,3 +34,17 @@ class ProgramWriteRejected(UncertainWrite):
     subtype because earlier blocks in the same multi-block transaction may
     already have been acknowledged and applied.
     """
+
+
+class SolemTimeSyncBusy(SolemConnectionError):
+    """A time sync was deferred: the controller is busy (watering or an
+    active program) and must not be disturbed."""
+
+
+class SolemTimeSyncRejected(SolemTimeSyncBusy):
+    """The controller explicitly rejected a time update."""
+
+
+class SolemTimeSyncVerificationFailed(SolemTimeSyncBusy):
+    """A time update was acknowledged but the follow-up status read did not
+    confirm it, so the sync is not reported as done."""

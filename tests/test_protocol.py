@@ -67,6 +67,73 @@ def test_pack_set_time():
     assert protocol.pack_set_time(moment) == bytes.fromhex("0306007e051f162e0e")
 
 
+def test_parse_set_time_reply_ack():
+    assert protocol.parse_set_time_reply(bytes.fromhex("0400")) is True
+
+
+def test_parse_set_time_reply_ack_prefixed_status_noise():
+    # Capture-validated replies observed on firmware-5 hardware are short
+    # 0x04 frames; longer 0x04 frames are still valid replies.
+    assert protocol.parse_set_time_reply(bytes.fromhex("040001020304")) is True
+
+
+def test_parse_set_time_reply_rejection_at_offset_2():
+    assert protocol.parse_set_time_reply(bytes.fromhex("0402f014")) is False
+
+
+def test_parse_set_time_reply_rejection_at_offset_3():
+    assert protocol.parse_set_time_reply(bytes.fromhex("040000f0")) is False
+
+
+def test_parse_set_time_reply_f0_at_seq_offset_is_ack():
+    # 0xF0 at offset 1 is the sequence-byte position, which is not part of
+    # the rejection check (only offsets 2 and 3 carry the status marker).
+    assert protocol.parse_set_time_reply(bytes.fromhex("04f0")) is True
+
+
+def test_parse_set_time_reply_status_frame_returns_none():
+    # Common status notification (0x32 0x10) is not a set-time reply.
+    assert protocol.parse_set_time_reply(bytes.fromhex("32100260000000000000")) is None
+
+
+def test_parse_set_time_reply_commit_frame_returns_none():
+    assert protocol.parse_set_time_reply(bytes.fromhex("3b00")) is None
+
+
+def test_parse_set_time_reply_wrong_seq_byte_returns_none():
+    # 0x05 prefix is not a set-time reply.
+    assert protocol.parse_set_time_reply(bytes.fromhex("0500")) is None
+
+
+def test_parse_set_time_reply_short_input_returns_none():
+    assert protocol.parse_set_time_reply(bytes.fromhex("04")) is None
+
+
+def test_parse_set_time_reply_empty_input_returns_none():
+    assert protocol.parse_set_time_reply(b"") is None
+
+
+def test_parse_set_time_reply_garbage_input_returns_none():
+    assert protocol.parse_set_time_reply(b"\xff\xff\xff\xff") is None
+
+
+def test_parse_set_time_reply_accepts_bytearray():
+    assert protocol.parse_set_time_reply(bytearray.fromhex("0400")) is True
+    assert protocol.parse_set_time_reply(bytearray.fromhex("0402f014")) is False
+
+
+def test_parse_set_time_reply_ignores_f0_beyond_offset_3():
+    # A long 0x04-prefixed ack with 0xF0 only in trailing status bytes
+    # (offset >= 4) is still an acknowledgement: observed rejections place
+    # 0xF0 exclusively at offset 2 or 3.
+    assert protocol.parse_set_time_reply(bytes.fromhex("0400010200f0")) is True
+
+
+def test_parse_set_time_reply_accepts_memoryview():
+    assert protocol.parse_set_time_reply(memoryview(bytes.fromhex("0400"))) is True
+    assert protocol.parse_set_time_reply(memoryview(bytes.fromhex("0402f014"))) is False
+
+
 def test_pack_set_irrigation_program_inferred_v5_frames():
     program: protocol.IrrigationProgram = {
         "name": "Vasi",

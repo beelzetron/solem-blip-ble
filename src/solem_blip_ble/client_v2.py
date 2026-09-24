@@ -81,6 +81,9 @@ from .exceptions import (
     ProgramWriteRejected,
     SolemConnectionError,
     SolemDeadlineExceeded,
+    SolemTimeSyncBusy,
+    SolemTimeSyncRejected,
+    SolemTimeSyncVerificationFailed,
     StaleProgram,
     UncertainWrite,
 )
@@ -1086,16 +1089,93 @@ class StatelessSolemClient:
         return programs
 
     async def set_time(self, when: datetime | None = None) -> None:
-        """Push local date/time to the device RTC (write-only, no commit)."""
+        """Push local date/time to the device RTC as a verified transaction.
+
+        The exchange is deferred when the controller is busy (watering or an
+        active program), sent without the commit suffix, and only reported
+        as done after the controller's set-time reply is acknowledged and a
+        follow-up status read confirms the time alarm bit has cleared.
+        Non-retryable: the set-time write is never replayed automatically.
+        Raises ``SolemTimeSyncBusy`` when deferred (safe to retry later);
+        ``SolemTimeSyncRejected`` and ``SolemTimeSyncVerificationFailed``
+        are terminal outcomes — both are ``SolemTimeSyncError`` subtypes,
+        but unlike ``SolemTimeSyncBusy`` they do not mean "retry later".
+        """
         if self.mock:
             return
 
         payload = protocol.pack_set_time(when)
 
         async def _op(client: BleakClient) -> None:
-            await self._write(client, payload)
+            status_result: dict[str, Any] = {}
+            status_event = asyncio.Event()
+            reply_event = asyncio.Event()
+            reply_acknowledged: bool | None = None
 
-        await self._run_operation(_op)
+            def notification_handler(_sender: int, data: bytearray) -> None:
+                nonlocal reply_acknowledged
+                parsed = protocol.parse_status_notification(
+                    data, max_station_num=self.max_station_num
+                )
+                if parsed is not None:
+                    status_result.update(parsed)
+                    status_event.set()
+                    return
+                reply = protocol.parse_set_time_reply(data)
+                if reply is None:
+                    return
+                _LOGGER.debug(
+                    "%s - Set-time reply notification: %s",
+                    self.mac_address,
+                    bytes(data).hex(),
+                )
+                reply_acknowledged = reply
+                reply_event.set()
+
+            async def read_status() -> dict[str, Any]:
+                status_result.clear()
+                status_event.clear()
+                await self._write(client, COMMIT_COMMAND)
+                await self._wait_for_event(
+                    status_event, STATUS_NOTIFY_TIMEOUT, "status notification"
+                )
+                if not status_result:
+                    raise SolemConnectionError("Empty status notification")
+                return dict(status_result)
+
+            await self._start_notify(client, notification_handler)
+            await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+            self._ensure_client(client, phase="set-time transaction")
+            try:
+                status = await read_status()
+                if status.get("is_watering"):
+                    raise SolemTimeSyncBusy(
+                        "Time sync deferred: controller is watering"
+                    )
+                if status.get("active_program") is not None:
+                    raise SolemTimeSyncBusy(
+                        "Time sync deferred: controller has an active program"
+                    )
+
+                await self._write(client, payload)
+                await self._wait_for_event(
+                    reply_event, STATUS_NOTIFY_TIMEOUT, "set-time reply"
+                )
+                if reply_acknowledged is False:
+                    raise SolemTimeSyncRejected(
+                        "Controller rejected the time update"
+                    )
+
+                status = await read_status()
+                if status.get("time_alarm"):
+                    raise SolemTimeSyncVerificationFailed(
+                        "Time sync not verified: time alarm still set after "
+                        "acknowledged update"
+                    )
+            finally:
+                await self._stop_notify(client)
+
+        await self._run_operation(_op, retry_safe=False)
 
     async def _execute_command(
         self,

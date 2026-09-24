@@ -367,6 +367,34 @@ def pack_set_time(when: datetime | None = None) -> bytes:
     )
 
 
+def parse_set_time_reply(data: bytes | bytearray) -> bool | None:
+    """Parse the reply notification to a V5 set-time command.
+
+    After the controller receives the set-time frame (``03 06 00 YY MM DD
+    hh mm ss``, see :func:`pack_set_time`) it answers with a notification
+    whose layout is protocol-observed as::
+
+        04 [seq] [status bytes ...]
+
+    - Byte 0 ``0x04``: reply marker for the set-time command.
+    - ``0xF0`` anywhere in the frame signals an explicit controller
+      rejection of the time update. Validated against physical firmware-5
+      hardware in the community fork; observed rejections place ``0xF0``
+      at byte offset 2 or 3, so the check conservatively scans the whole
+      frame.
+
+    Returns ``True`` on acknowledgement (0x04-prefixed, no ``0xF0``),
+    ``False`` on explicit rejection (0x04-prefixed with ``0xF0``), and
+    ``None`` when *data* is not a set-time reply (wrong prefix, too
+    short, or empty) so callers can ignore unrelated notifications.
+    Never raises on malformed input.
+    """
+    frame = bytes(data)
+    if len(frame) < 2 or frame[0] != 0x04:
+        return None
+    return 0xF0 not in frame
+
+
 def parse_firmware_version_response(data: bytes | bytearray) -> FirmwareVersion | None:
     """Parse a V5 identification response to extract firmware version.
 

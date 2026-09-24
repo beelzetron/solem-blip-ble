@@ -85,10 +85,10 @@ def test_parse_set_time_reply_rejection_at_offset_3():
     assert protocol.parse_set_time_reply(bytes.fromhex("040000f0")) is False
 
 
-def test_parse_set_time_reply_rejection_anywhere_in_short_frame():
-    # A 0x04-prefixed frame carrying 0xF0 is an explicit controller rejection
-    # regardless of where the byte sits.
-    assert protocol.parse_set_time_reply(bytes.fromhex("04f0")) is False
+def test_parse_set_time_reply_f0_at_seq_offset_is_ack():
+    # 0xF0 at offset 1 is the sequence-byte position, which is not part of
+    # the rejection check (only offsets 2 and 3 carry the status marker).
+    assert protocol.parse_set_time_reply(bytes.fromhex("04f0")) is True
 
 
 def test_parse_set_time_reply_status_frame_returns_none():
@@ -120,6 +120,18 @@ def test_parse_set_time_reply_garbage_input_returns_none():
 def test_parse_set_time_reply_accepts_bytearray():
     assert protocol.parse_set_time_reply(bytearray.fromhex("0400")) is True
     assert protocol.parse_set_time_reply(bytearray.fromhex("0402f014")) is False
+
+
+def test_parse_set_time_reply_ignores_f0_beyond_offset_3():
+    # A long 0x04-prefixed ack with 0xF0 only in trailing status bytes
+    # (offset >= 4) is still an acknowledgement: observed rejections place
+    # 0xF0 exclusively at offset 2 or 3.
+    assert protocol.parse_set_time_reply(bytes.fromhex("0400010200f0")) is True
+
+
+def test_parse_set_time_reply_accepts_memoryview():
+    assert protocol.parse_set_time_reply(memoryview(bytes.fromhex("0400"))) is True
+    assert protocol.parse_set_time_reply(memoryview(bytes.fromhex("0402f014"))) is False
 
 
 def test_pack_set_irrigation_program_inferred_v5_frames():

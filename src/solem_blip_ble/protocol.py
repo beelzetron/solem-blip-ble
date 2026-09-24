@@ -367,7 +367,7 @@ def pack_set_time(when: datetime | None = None) -> bytes:
     )
 
 
-def parse_set_time_reply(data: bytes | bytearray) -> bool | None:
+def parse_set_time_reply(data: bytes | bytearray | memoryview) -> bool | None:
     """Parse the reply notification to a V5 set-time command.
 
     After the controller receives the set-time frame (``03 06 00 YY MM DD
@@ -377,14 +377,16 @@ def parse_set_time_reply(data: bytes | bytearray) -> bool | None:
         04 [seq] [status bytes ...]
 
     - Byte 0 ``0x04``: reply marker for the set-time command.
-    - ``0xF0`` anywhere in the frame signals an explicit controller
-      rejection of the time update. Validated against physical firmware-5
-      hardware in the community fork; observed rejections place ``0xF0``
-      at byte offset 2 or 3, so the check conservatively scans the whole
-      frame.
+    - ``0xF0`` at byte offset 2 or 3 signals an explicit controller
+      rejection of the time update. Validated against physical
+      firmware-5 hardware in the community fork; observed rejections
+      place ``0xF0`` only at offset 2 or 3, so the check is limited to
+      those positions (when present). The sequence byte at offset 1 is
+      not validated.
 
-    Returns ``True`` on acknowledgement (0x04-prefixed, no ``0xF0``),
-    ``False`` on explicit rejection (0x04-prefixed with ``0xF0``), and
+    Returns ``True`` on acknowledgement (0x04-prefixed, no ``0xF0`` at
+    offset 2 or 3), ``False`` on explicit rejection (0x04-prefixed with
+    ``0xF0`` at offset 2 or 3), and
     ``None`` when *data* is not a set-time reply (wrong prefix, too
     short, or empty) so callers can ignore unrelated notifications.
     Never raises on malformed input.
@@ -392,7 +394,10 @@ def parse_set_time_reply(data: bytes | bytearray) -> bool | None:
     frame = bytes(data)
     if len(frame) < 2 or frame[0] != 0x04:
         return None
-    return 0xF0 not in frame
+    rejected = len(frame) > 2 and frame[2] == 0xF0 or (
+        len(frame) > 3 and frame[3] == 0xF0
+    )
+    return not rejected
 
 
 def parse_firmware_version_response(data: bytes | bytearray) -> FirmwareVersion | None:

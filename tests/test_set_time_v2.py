@@ -27,10 +27,11 @@ from solem_blip_ble.client_v2 import StatelessSolemClient
 from solem_blip_ble.exceptions import (
     SolemConnectionError,
     SolemTimeSyncBusy,
+    SolemTimeSyncError,
     SolemTimeSyncRejected,
     SolemTimeSyncVerificationFailed,
 )
-from test_client_v2 import FakeV2Client, established  # noqa: F401
+from test_client_v2 import FakeV2Client
 
 SET_TIME_PAYLOAD = protocol.pack_set_time(datetime(2026, 9, 24, 12, 0, 0))
 COMMIT = bytes.fromhex("3b00")
@@ -259,3 +260,44 @@ async def test_set_time_mock_short_circuit() -> None:
     client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", mock=True)
 
     assert await client.set_time() is None
+
+
+def test_time_sync_exception_hierarchy() -> None:
+    """Terminal outcomes must not inherit the busy "retry later" contract:
+    Rejected and VerificationFailed are siblings of Busy under the neutral
+    SolemTimeSyncError base."""
+    assert issubclass(SolemTimeSyncError, SolemConnectionError)
+    for exc_type in (
+        SolemTimeSyncBusy,
+        SolemTimeSyncRejected,
+        SolemTimeSyncVerificationFailed,
+    ):
+        assert issubclass(exc_type, SolemTimeSyncError)
+        assert issubclass(exc_type, SolemConnectionError)
+
+    for terminal in (SolemTimeSyncRejected, SolemTimeSyncVerificationFailed):
+        assert not issubclass(terminal, SolemTimeSyncBusy)
+        with pytest.raises(SolemTimeSyncError):
+            raise terminal("boom")
+
+
+async def test_set_time_rejection_stops_notifications(monkeypatch) -> None:
+    """Even on the rejection failure path the notify session is torn down:
+    _stop_notify runs in the transaction's finally block."""
+    rejection = _frame("0402f014")
+    fake = SetTimeScriptedClient(
+        status_frames=[bytes(IDLE_STATUS)],
+        post_write_replies=[bytes(rejection)],
+    )
+    stop_calls: list[FakeV2Client] = []
+
+    async def fake_stop_notify(_self: StatelessSolemClient, _client: FakeV2Client) -> None:
+        stop_calls.append(fake)
+
+    monkeypatch.setattr(StatelessSolemClient, "_stop_notify", fake_stop_notify)
+    client = _client(monkeypatch, fake)
+
+    with pytest.raises(SolemTimeSyncRejected, match="rejected"):
+        await client.set_time(datetime(2026, 9, 24, 12, 0, 0))
+
+    assert stop_calls == [fake]

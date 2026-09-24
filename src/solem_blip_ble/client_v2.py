@@ -1096,6 +1096,10 @@ class StatelessSolemClient:
         as done after the controller's set-time reply is acknowledged and a
         follow-up status read confirms the time alarm bit has cleared.
         Non-retryable: the set-time write is never replayed automatically.
+        Raises ``SolemTimeSyncBusy`` when deferred (safe to retry later);
+        ``SolemTimeSyncRejected`` and ``SolemTimeSyncVerificationFailed``
+        are terminal outcomes — both are ``SolemTimeSyncError`` subtypes,
+        but unlike ``SolemTimeSyncBusy`` they do not mean "retry later".
         """
         if self.mock:
             return

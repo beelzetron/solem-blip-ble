@@ -36,15 +36,19 @@ class ProgramWriteRejected(UncertainWrite):
     """
 
 
-class SolemTimeSyncBusy(SolemConnectionError):
+class SolemTimeSyncError(SolemConnectionError):
+    """The verified time-sync transaction did not complete."""
+
+
+class SolemTimeSyncBusy(SolemTimeSyncError):
     """A time sync was deferred: the controller is busy (watering or an
     active program) and must not be disturbed."""
 
 
-class SolemTimeSyncRejected(SolemTimeSyncBusy):
+class SolemTimeSyncRejected(SolemTimeSyncError):
     """The controller explicitly rejected a time update."""
 
 
-class SolemTimeSyncVerificationFailed(SolemTimeSyncBusy):
+class SolemTimeSyncVerificationFailed(SolemTimeSyncError):
     """A time update was acknowledged but the follow-up status read did not
     confirm it, so the sync is not reported as done."""

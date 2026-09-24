@@ -196,9 +196,13 @@ class SolemClient:
                 "Bluetooth adapter/proxy out of connection slots or device busy"
             ) from exc
         except (BleakError, TimeoutError, OSError) as exc:
-            raise SolemConnectionError("Timeout connecting to device") from exc
+            raise SolemConnectionError(
+                f"Timeout connecting to device: {exc}"
+            ) from exc
         except Exception as exc:
-            raise SolemConnectionError("Unexpected BLE connection error") from exc
+            raise SolemConnectionError(
+                f"Unexpected BLE connection error: {exc}"
+            ) from exc
 
     async def _drop_client_unsafe(self) -> None:
         client = self._client

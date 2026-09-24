@@ -39,9 +39,10 @@ debug log, which previously logged an empty reason for the bare
   range, or refusing connections)`` — the whole-operation deadline
   expired before the connect attempt returned
   (:class:`solem_blip_ble.client_v2._ConnectTimedOut`).
-- ``Failed connecting to device`` — the backend connect attempt itself
-  failed (BleakError/TimeoutError/OSError from
-  ``establish_connection``).
+- ``Timeout connecting to device: {exc}`` — the backend connect attempt
+  itself failed (BleakError/TimeoutError/OSError from
+  ``establish_connection``); the underlying error text is included so
+  log lines are self-describing.
 
 Reuse: all operation closures are inherited from
 :class:`StatelessSolemClient` unchanged — they pass their work through
@@ -244,7 +245,12 @@ class PersistentSolemClient(StatelessSolemClient):
                     self._reset_session_state()
                     self._schedule_idle_release()
                     raise SolemDeadlineExceeded(
-                        f"Operation deadline exceeded after {attempt - 1} attempt(s)"
+                        (
+                            f"Operation deadline exceeded after {attempt - 1} attempt(s)"
+                            f": {last_error}"
+                            if last_error
+                            else f"Operation deadline exceeded after {attempt - 1} attempt(s)"
+                        )
                     ) from last_error
 
                 reused = (
@@ -353,7 +359,7 @@ class PersistentSolemClient(StatelessSolemClient):
                         self._schedule_idle_release()
                         raise SolemDeadlineExceeded(
                             "Connect phase failed within operation deadline"
-                            "; deferring retry to the next operation"
+                            f"; deferring retry to the next operation: {exc}"
                         ) from exc
                 finally:
                     if op_task is not None and not op_task.done():
@@ -385,7 +391,13 @@ class PersistentSolemClient(StatelessSolemClient):
 
             self._reset_session_state()
             raise SolemDeadlineExceeded(
-                f"Operation deadline exceeded after {REQUEST_MAX_ATTEMPTS} attempt(s)"
+                (
+                    f"Operation deadline exceeded after {REQUEST_MAX_ATTEMPTS} attempt(s)"
+                    f": {last_error}"
+                    if last_error
+                    else "Operation deadline exceeded after "
+                    f"{REQUEST_MAX_ATTEMPTS} attempt(s)"
+                )
             ) from last_error
 
     # -- public API ----------------------------------------------------------

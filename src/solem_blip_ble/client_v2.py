@@ -35,9 +35,10 @@ debug log, which previously logged an empty reason for the bare
   range, or refusing connections)`` — the whole-operation deadline
   expired before the connect attempt returned
   (:class:`_ConnectTimedOut`).
-- ``Failed connecting to device`` — the backend connect attempt itself
-  failed (BleakError/TimeoutError/OSError from
-  ``establish_connection``).
+- ``Failed connecting to device: {exc}`` — the backend connect attempt
+  itself failed (BleakError/TimeoutError/OSError from
+  ``establish_connection``); the underlying error text is included so
+  the ``Attempt N failed:`` log line is self-describing.
 """
 
 from __future__ import annotations
@@ -257,9 +258,13 @@ class StatelessSolemClient:
                 "Bluetooth adapter/proxy out of connection slots or device busy"
             ) from exc
         except (BleakError, TimeoutError, OSError) as exc:
-            raise SolemConnectionError("Failed connecting to device") from exc
+            raise SolemConnectionError(
+                f"Failed connecting to device: {exc}"
+            ) from exc
         except Exception as exc:
-            raise SolemConnectionError("Unexpected BLE connection error") from exc
+            raise SolemConnectionError(
+                f"Unexpected BLE connection error: {exc}"
+            ) from exc
         self._link_dropped = False
         self._drop_event.clear()
         return client
@@ -354,7 +359,12 @@ class StatelessSolemClient:
             remaining = deadline_at - time.monotonic()
             if remaining <= 0:
                 raise SolemDeadlineExceeded(
-                    f"Operation deadline exceeded after {attempt - 1} attempt(s)"
+                    (
+                        f"Operation deadline exceeded after {attempt - 1} attempt(s)"
+                        f": {last_error}"
+                        if last_error
+                        else f"Operation deadline exceeded after {attempt - 1} attempt(s)"
+                    )
                 ) from last_error
 
             client: BleakClient | None = None
@@ -428,7 +438,13 @@ class StatelessSolemClient:
                 await asyncio.sleep(REQUEST_RETRY_DELAY)
 
         raise SolemDeadlineExceeded(
-            f"Operation deadline exceeded after {REQUEST_MAX_ATTEMPTS} attempt(s)"
+            (
+                f"Operation deadline exceeded after {REQUEST_MAX_ATTEMPTS} attempt(s)"
+                f": {last_error}"
+                if last_error
+                else "Operation deadline exceeded after "
+                f"{REQUEST_MAX_ATTEMPTS} attempt(s)"
+            )
         ) from last_error
 
     # -- shared operation helpers ------------------------------------------

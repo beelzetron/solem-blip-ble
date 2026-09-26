@@ -126,6 +126,24 @@ def _patch_connection(monkeypatch, fake: _NameSession) -> None:
     monkeypatch.setattr(StatelessSolemClient, "_connect", connect)
 
 
+@pytest.fixture
+def established(monkeypatch):
+    """Patch resolution/connection so each operation uses a fresh fake.
+
+    Mirrors the fixture in tests/test_client_v2.py without importing it
+    (test modules are not a package in this suite).
+    """
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        return _NameSession([])
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+
 async def test_write_station_name_preflight_write_readback(
     established, monkeypatch
 ):
@@ -211,16 +229,29 @@ async def test_write_station_name_readback_mismatch_raises_uncertain(
     established, monkeypatch
 ):
     before = _snapshot({i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)})
+    expected = before.renamed(2, "Greenhouse", 6)
     partial = before.renamed(2, "Green", 6)
-    fake = _NameSession(_frames_for(partial))
+    fake = _NameSession(_frames_for(before))
     _patch_connection(monkeypatch, fake)
     monkeypatch.setattr(client_v2, "NOTIFY_SETTLE_DELAY", 0)
     monkeypatch.setattr(client_v2, "STATION_NAMES_IDLE_TIMEOUT", 0)
+
+    async def partial_write(_uuid, payload, *, response):
+        fake.writes.append(payload)
+        if payload[:1] == b"\x33":
+            # Controller applied only a truncated name: readback mismatch.
+            fake.read_frames = _frames_for(partial)
+            fake.handler(1, bytearray(b"\x34" + payload[1:4]))
+            return
+        if payload == protocol.pack_get_station_names():
+            for frame in fake.read_frames:
+                fake.handler(1, bytearray(frame))
+            return
+
+    fake.write_gatt_char = partial_write
     client = StatelessSolemClient(ADDRESS, max_station_num=6)
     with pytest.raises(UncertainWrite):
-        await client.write_station_name(
-            2, "Greenhouse", before.renamed(2, "Greenhouse", 6), before=before
-        )
+        await client.write_station_name(2, "Greenhouse", expected, before=before)
 
 
 async def test_get_station_name_snapshot_rejects_incomplete(

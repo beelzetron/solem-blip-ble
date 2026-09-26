@@ -888,7 +888,7 @@ class StatelessSolemClient:
                 if data[2] == 0xF0 or (len(data) > 3 and data[3] == 0xF0):
                     rejected = True
                     acknowledged.set()
-                elif len(data) == 20 and expected_header is not None and bytes(data[:4]) == expected_header:
+                elif bytes(data[:4]) == expected_header:
                     acknowledged.set()
 
             await self._start_notify(client, notification_handler)
@@ -938,6 +938,10 @@ class StatelessSolemClient:
         try:
             return await self._run_operation(_op, retry_safe=False)
         except UncertainWrite:
+            raise
+        except (StaleProgram, InvalidSnapshot):
+            # Preflight/verification verdicts are precise: never obscure
+            # them with an uncertain-outcome wrapper.
             raise
         except Exception as exc:
             raise UncertainWrite(

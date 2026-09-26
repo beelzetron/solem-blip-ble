@@ -112,19 +112,3 @@ def test_revision_is_order_independent_and_content_sensitive(snapshot):
     assert a.revision != b.revision
     rebuilt = StationNameSnapshot(dict(a.raw_names))
     assert rebuilt.revision == a.revision
-
-
-def test_from_fragments_matches_from_frames(snapshot):
-    frames = name_frames(snapshot.renamed(6, "Garden", 6))
-    fragments = [
-        {
-            "station": f[3] + 1,
-            "sequence": f[2] & 1,
-            "name_bytes": f[4:20].split(b"\0", 1)[0],
-        }
-        for f in frames
-    ]
-    from_parsed = StationNameSnapshot.from_fragments(fragments, 6)
-    from_raw = StationNameSnapshot.from_frames(frames, 6)
-    assert from_parsed.names == from_raw.names
-    assert from_parsed.revision == from_raw.revision

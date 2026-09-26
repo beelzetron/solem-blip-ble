@@ -56,37 +56,6 @@ class StationNameSnapshot:
             raise InvalidSnapshot("Incomplete station-name response")
         return cls({station: group[1] + group[0] for station, group in parts.items()})
 
-    @classmethod
-    def from_fragments(
-        cls, fragments: list[protocol.StationNameFragment], physical_stations: int
-    ) -> StationNameSnapshot:
-        """Assemble a snapshot from already-parsed name fragments.
-
-        Fragment payloads are re-validated through :meth:`from_frames` by
-        rebuilding canonical frames (header byte 2 = fragment part), so
-        the acceptance rules are identical to a raw read.
-        """
-        parts: dict[int, dict[int, bytes]] = {}
-        for fragment in fragments:
-            station = fragment["station"]
-            part = fragment["sequence"] & 1
-            payload = fragment["name_bytes"]
-            if len(payload) > 16:
-                raise InvalidSnapshot("Invalid station-name response")
-            previous = parts.setdefault(station, {}).get(part)
-            if previous is not None and previous != payload:
-                raise InvalidSnapshot("Conflicting station-name fragments")
-            parts[station][part] = payload
-        return cls.from_frames(
-            [
-                bytes([0x36, 0x12, part, station - 1])
-                + group.get(part, b"\0" * 16).ljust(16, b"\0")
-                for station, group in sorted(parts.items())
-                for part in (0, 1)
-            ],
-            physical_stations,
-        )
-
     @property
     def names(self) -> dict[int, str]:
         """Decoded UTF-8 names keyed by 1-based output number."""

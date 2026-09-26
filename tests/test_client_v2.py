@@ -569,6 +569,7 @@ async def test_mock_mode_stays_off_ble(monkeypatch) -> None:
         "minor": 0,
         "patch": 0,
         "raw_hex": "5.0.0",
+        "controller_name": "Solem AA:BB:CC:DD:EE:FF",
     }
 
 

@@ -35,6 +35,7 @@ from .protocol import (
     parse_station_name_fragment,
     parse_status_notification,
 )
+from .station_names import StationNameSnapshot
 
 # Back-compat alias used by Home Assistant integrations
 APIConnectionError = SolemConnectionError
@@ -50,6 +51,7 @@ __all__ = [
     "IrrigationConfigFragment",
     "IrrigationProgram",
     "StationNameFragment",
+    "StationNameSnapshot",
     "assemble_irrigation_programs",
     "irrigation_config_complete",
     "irrigation_program_write_mismatches",

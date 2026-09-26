@@ -88,8 +88,14 @@ from .exceptions import (
     UncertainWrite,
 )
 from .snapshot import ProgramSnapshot
+from .station_names import StationNameSnapshot
 
 _LOGGER = logging.getLogger(__name__)
+
+# Bounded optional wait for the identification name record after the
+# firmware payload has arrived. Name metadata is optional: the firmware
+# read must never fail or stall because the record is absent.
+IDENTIFICATION_NAME_TIMEOUT = 2.0
 
 _T = TypeVar("_T")
 
@@ -151,6 +157,8 @@ class StatelessSolemClient:
         self._active_client: BleakClient | None = None
         self.last_snapshot: ProgramSnapshot | None = None
         self.program_write_diagnostics: dict[str, Any] = {}
+        self.station_name_write_diagnostics: dict[str, Any] = {}
+        self._mock_station_names: StationNameSnapshot | None = None
 
     # -- device resolution -------------------------------------------------
 
@@ -628,14 +636,26 @@ class StatelessSolemClient:
         """Read the firmware version stored on the V5 controller."""
         request = protocol.pack_get_firmware_version()
         if self.mock:
-            return {"major": 5, "minor": 0, "patch": 0, "raw_hex": "5.0.0"}
+            return {
+                "major": 5,
+                "minor": 0,
+                "patch": 0,
+                "raw_hex": "5.0.0",
+                "controller_name": f"Solem {self.mac_address}",
+            }
 
         async def _op(client: BleakClient) -> protocol.FirmwareVersion:
             firmware_version: protocol.FirmwareVersion | None = None
             firmware_event = asyncio.Event()
+            name_event = asyncio.Event()
+            controller_name: str | None = None
 
             def notification_handler(_sender: int, data: bytearray) -> None:
-                nonlocal firmware_version
+                nonlocal firmware_version, controller_name
+                name = protocol.parse_controller_name_response(data)
+                if name is not None:
+                    controller_name = name
+                    name_event.set()
                 parsed = protocol.parse_firmware_version_response(data)
                 if parsed is None:
                     return
@@ -657,6 +677,19 @@ class StatelessSolemClient:
                 )
                 if firmware_version is None:
                     raise SolemConnectionError("Empty firmware version response")
+                # The controller-name record is optional metadata: wait for
+                # it only briefly and never fail the firmware read when it
+                # is missing or malformed. Cancellation propagates and the
+                # connection is released by the operation wrapper.
+                if not name_event.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            name_event.wait(), IDENTIFICATION_NAME_TIMEOUT
+                        )
+                    except TimeoutError:
+                        pass  # Name metadata is optional; firmware is already valid.
+                if controller_name is not None:
+                    firmware_version["controller_name"] = controller_name
                 return firmware_version
             finally:
                 await self._stop_notify(client)
@@ -739,6 +772,177 @@ class StatelessSolemClient:
                 await self._stop_notify(client)
 
         return await self._run_operation(_op)
+
+    async def get_station_name_snapshot(self) -> StationNameSnapshot:
+        """Read all name fragments, rejecting partial or conflicting results.
+
+        Unlike :meth:`get_station_names`, which returns whatever arrived
+        within the idle window, this is the safety-grade read used before
+        and after name writes: the snapshot is only returned when every
+        reported output contributed both halves and the sequence IDs are
+        contiguous.
+        """
+        if self.mock:
+            if self._mock_station_names is None:
+                self._mock_station_names = StationNameSnapshot(
+                    {
+                        i: f"Station {i}".encode().ljust(32, b"\0")
+                        for i in range(1, self.max_station_num + 1)
+                    }
+                )
+            return self._mock_station_names
+
+        async def _op(client: BleakClient) -> StationNameSnapshot:
+            frames: list[bytes] = []
+
+            def notification_handler(_sender: int, data: bytearray) -> None:
+                if data[:2] in (b"\x36\x12", b"\x35\x12"):
+                    frames.append(bytes(data))
+
+            await self._start_notify(client, notification_handler)
+            try:
+                await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+                return await self._read_station_names_on_connection(client, frames)
+            finally:
+                await self._stop_notify(client)
+
+        return await self._run_operation(_op)
+
+    async def _read_station_names_on_connection(
+        self, client: BleakClient, frames: list[bytes]
+    ) -> StationNameSnapshot:
+        """Collect a complete name response on an already subscribed connection."""
+        frames.clear()
+        await self._write(client, protocol.pack_get_station_names())
+        deadline = time.monotonic() + STATUS_NOTIFY_TIMEOUT
+        last_received = time.monotonic()
+        count = len(frames)
+        while time.monotonic() < deadline:
+            self._check_drop()
+            if len(frames) != count:
+                count = len(frames)
+                last_received = time.monotonic()
+            if time.monotonic() - last_received >= STATION_NAMES_IDLE_TIMEOUT:
+                try:
+                    return StationNameSnapshot.from_frames(
+                        frames, self.max_station_num
+                    )
+                except InvalidSnapshot:
+                    pass
+            await asyncio.sleep(0.05)
+        raise InvalidSnapshot("Timeout waiting for complete station names")
+
+    async def write_station_name(
+        self,
+        station: int,
+        name: str,
+        expected: StationNameSnapshot,
+        *,
+        before: StationNameSnapshot,
+    ) -> StationNameSnapshot:
+        """Check, write once and verify names with one short, subscribed session.
+
+        ``before`` must come from a fresh :meth:`get_station_name_snapshot`
+        the caller treats as the editor's baseline. The method refuses to
+        write when the controller no longer matches that baseline
+        (stale-edit rejection), sends exactly the two 0x33 frames for the
+        selected output with per-part acknowledgement matching, then reads
+        the complete names back on the same connection and verifies them
+        against ``expected``. Any failure after the first write frame is
+        surfaced as :class:`UncertainWrite`: the caller must refresh and
+        reconcile deliberately; the write is never replayed.
+        """
+        frames = protocol.pack_station_name(station, name, self.max_station_num)
+        if self.mock:
+            self._mock_station_names = expected
+            return expected
+
+        async def _op(client: BleakClient) -> StationNameSnapshot:
+            read_frames: list[bytes] = []
+            acknowledged = asyncio.Event()
+            rejected = False
+            expected_header: bytes | None = None
+            self.station_name_write_diagnostics = {
+                "phase": "subscribe",
+                "acknowledged_parts": 0,
+            }
+
+            def notification_handler(_sender: int, data: bytearray) -> None:
+                nonlocal rejected
+                diagnostic = self.station_name_write_diagnostics
+                if diagnostic["phase"] in ("preflight", "readback"):
+                    if data[:2] in (b"\x36\x12", b"\x35\x12"):
+                        read_frames.append(bytes(data))
+                    return
+                # Retain only headers/counts: never include user names/payloads.
+                diagnostic["last_reply_header"] = bytes(data[:4]).hex()
+                diagnostic["last_reply_length"] = len(data)
+                if bytes(data) == b"\x34\x00":
+                    acknowledged.set()
+                    return
+                if len(data) < 3 or data[0] != 0x34:
+                    return
+                # Name-write replies echo the part index and output index.
+                # Unlike name READ replies, byte 2 is not a countdown.
+                # F0 signals a rejected/unsupported command, not success.
+                if data[2] == 0xF0 or (len(data) > 3 and data[3] == 0xF0):
+                    rejected = True
+                    acknowledged.set()
+                elif len(data) == 20 and expected_header is not None and bytes(data[:4]) == expected_header:
+                    acknowledged.set()
+
+            await self._start_notify(client, notification_handler)
+            try:
+                await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+                diagnostic_phase = self.station_name_write_diagnostics
+                diagnostic_phase["phase"] = "preflight"
+                current = await self._read_station_names_on_connection(
+                    client, read_frames
+                )
+                if current.revision != before.revision:
+                    raise StaleProgram(
+                        "Station names changed before writing; refresh the editor"
+                    )
+                for part, frame in enumerate(frames):
+                    expected_header = b"\x34" + frame[1:4]
+                    acknowledged.clear()
+                    rejected = False
+                    self.station_name_write_diagnostics.update(
+                        phase="await_ack", part=part
+                    )
+                    await self._write(client, frame)
+                    await self._wait_for_event(
+                        acknowledged,
+                        STATUS_NOTIFY_TIMEOUT,
+                        f"station-name part {part} acknowledgement",
+                    )
+                    if rejected:
+                        raise UncertainWrite(
+                            "Controller rejected the station-name command"
+                        )
+                    self.station_name_write_diagnostics["acknowledged_parts"] = part + 1
+                self.station_name_write_diagnostics["phase"] = "readback"
+                actual = await self._read_station_names_on_connection(
+                    client, read_frames
+                )
+                if actual.revision != expected.revision:
+                    self.station_name_write_diagnostics["phase"] = "readback_mismatch"
+                    raise UncertainWrite(
+                        "Station-name verification failed; reopen the editor to review"
+                    )
+                self.station_name_write_diagnostics["phase"] = "verified"
+                return actual
+            finally:
+                await self._stop_notify(client)
+
+        try:
+            return await self._run_operation(_op, retry_safe=False)
+        except UncertainWrite:
+            raise
+        except Exception as exc:
+            raise UncertainWrite(
+                "Station-name write outcome is uncertain; refresh before retrying"
+            ) from exc
 
     async def get_irrigation_config(
         self,

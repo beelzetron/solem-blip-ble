@@ -599,3 +599,77 @@ def test_parse_firmware_version_too_short():
     data[2] = 0x00
 
     assert protocol.parse_firmware_version_response(data) is None
+
+
+# -- V5 identification controller-name record (issue beelzetron/solem-blip-ble:
+#    hardware-validated via the ThomasHFWright fork, solem-blip-ha PR #1) ------
+
+
+NAME_RECORD = b"\x10\x10\x00" + b"Garden unit".ljust(15, b"\0")
+FIRMWARE_RECORD = bytes.fromhex("100f010000000000000000000501070000")
+
+
+@pytest.mark.parametrize(
+    ("frame", "expected"),
+    [
+        (NAME_RECORD, "Garden unit"),
+        (NAME_RECORD + b"\0\0", "Garden unit"),
+        (b"\x10\x10\x00" + b"ABCDEFGHIJKLMNO", "ABCDEFGHIJKLMNO"),
+        (b"\x10\x11\x00" + b"A" * 16, None),
+        (b"\x10\x0f\x00" + b"ABCDEFGHIJKLMN", "ABCDEFGHIJKLMN"),
+        (b"\x10\x0f\x00" + "Jardin été".encode().ljust(14, b"\0"), "Jardin été"),
+        (NAME_RECORD[:-1], None),
+        (NAME_RECORD + b"X", None),
+        (FIRMWARE_RECORD, None),
+        (b"\x10\x0f\x00" + b"\0" * 14, None),
+        (b"\x10\x0f\x00" + b"Bad\nname".ljust(14, b"\0"), None),
+        (b"\x10\x0f\x00" + b"\xff" * 14, None),
+    ],
+)
+def test_parse_controller_name_response(frame, expected):
+    assert protocol.parse_controller_name_response(frame) == expected
+
+
+def test_firmware_version_typed_dict_allows_controller_name():
+    """FirmwareVersion carries the optional controller_name record."""
+    data = bytearray(FIRMWARE_RECORD)
+    parsed = protocol.parse_firmware_version_response(data)
+    assert parsed is not None
+    parsed["controller_name"] = "Garden unit"
+    assert parsed["controller_name"] == "Garden unit"
+
+
+# -- V5 station-name write frames (hardware-validated via the ThomasHFWright
+#    fork, solem-blip-ha PR #1) ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["a" * 32, "a" * 15 + "é" + "b" * 15, "🌱" * 8],
+)
+def test_pack_station_name_utf8_exact_limit_splits_two_frames(name):
+    frames = protocol.pack_station_name(6, name, 6)
+    assert [f[:4] for f in frames] == [b"\x33\x12\x00\x05", b"\x33\x12\x01\x05"]
+    assert all(len(f) == 20 for f in frames)
+    assert frames[0][4:] + frames[1][4:] == name.encode()
+
+
+@pytest.mark.parametrize(
+    ("station", "name"),
+    [
+        (0, "ok"),
+        (7, "ok"),
+        (13, "ok"),
+        (True, "ok"),
+        (1.5, "ok"),
+        (1, ""),
+        (1, "  "),
+        (1, "a\0b"),
+        (1, "a" * 33),
+        (1, "🌱" * 9),
+        (1, None),
+    ],
+)
+def test_pack_station_name_rejects_invalid_input(station, name):
+    with pytest.raises(ValueError):
+        protocol.pack_station_name(station, name, 6)

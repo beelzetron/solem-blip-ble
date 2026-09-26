@@ -10,7 +10,7 @@ from __future__ import annotations
 import struct
 from collections.abc import Sequence
 from datetime import date, datetime
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from .const import (
     BATTERY_LEVELS_9V,
@@ -302,6 +302,7 @@ class FirmwareVersion(TypedDict):
     minor: int
     patch: int
     raw_hex: str
+    controller_name: NotRequired[str]
 
 
 class StationNameFragment(TypedDict):
@@ -430,6 +431,40 @@ def parse_firmware_version_response(data: bytes | bytearray) -> FirmwareVersion 
         "patch": patch,
         "raw_hex": raw_hex,
     }
+
+
+def parse_controller_name_response(data: bytes | bytearray) -> str | None:
+    """Decode the V5 identification name record, not the BLE advertised name.
+
+    Wrapped records use ``10 LEN 00 [name bytes]``: LEN includes the
+    record index, giving 14 or 15 name bytes for lengths 0f/10. Accept
+    zero-padded GATT packets too, but never infer a name from an
+    incomplete record or unrelated notifications. NUL terminates the
+    string; printable trailing characters are part of the name and must
+    not be guessed away.
+
+    Frame layout captured on firmware-5 hardware (hardware-validated via
+    the ThomasHFWright fork, see solem-blip-ha PR #1)::
+
+        10 [0f|10] 00 [name bytes ...] [zero padding to >= 17 bytes]
+
+    Returns the decoded, stripped, printable name, or None when *data*
+    is not a complete, decodable name record. Never raises on malformed
+    input.
+    """
+    if (
+        not 17 <= len(data) <= 20
+        or data[0] != 0x10 or data[1] not in (0x0F, 0x10) or data[2] != 0
+    ):
+        return None
+    end = data[1] + 2
+    if len(data) < end or any(data[end:]):
+        return None
+    try:
+        name = bytes(data[3:end]).split(b"\x00", 1)[0].decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    return name if name and name.isprintable() else None
 
 
 IRRIGATION_PROGRAM_CLASS = 0x1
@@ -940,3 +975,27 @@ def irrigation_config_complete(
         irrigation_program_complete(payloads, program_index)
         for program_index in range(program_count)
     )
+
+
+def pack_station_name(station: int, name: str, physical_stations: int) -> list[bytes]:
+    """Encode a physical output name as two 0x33 frames (no manual commit).
+
+    V5 output names are stored as two 16-byte halves per output, written
+    with ``33 12 [part] [station-1] [16 name bytes]`` frames
+    (hardware-validated via the ThomasHFWright fork, see solem-blip-ha
+    PR #1). The write does not use the manual ``3b00`` commit.
+
+    Validation is fail-closed: station indices must be real ints within
+    ``1..physical_stations <= 12`` (bools and floats are rejected), names
+    must be non-empty, NUL-free strings that fit 32 UTF-8 bytes.
+    """
+    if type(station) is not int or not 1 <= station <= physical_stations <= 12:
+        raise ValueError("Invalid station")
+    if not isinstance(name, str) or not name.strip() or "\0" in name:
+        raise ValueError("Enter a non-empty name without NUL characters")
+    encoded = name.encode("utf-8")
+    if len(encoded) > 32:
+        raise ValueError("Station names must fit 32 UTF-8 bytes")
+    padded = encoded.ljust(32, b"\0")
+    return [bytes([0x33, 0x12, part, station - 1]) + padded[part * 16:(part + 1) * 16]
+            for part in (0, 1)]

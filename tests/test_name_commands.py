@@ -14,7 +14,11 @@ import pytest
 
 from solem_blip_ble import client_v2, protocol
 from solem_blip_ble.client_v2 import StatelessSolemClient
-from solem_blip_ble.exceptions import StaleProgram, UncertainWrite
+from solem_blip_ble.exceptions import (
+    SolemConnectionError,
+    StaleProgram,
+    UncertainWrite,
+)
 from solem_blip_ble.station_names import StationNameSnapshot
 
 from test_client_v2 import FakeV2Client
@@ -264,8 +268,109 @@ async def test_get_station_name_snapshot_rejects_incomplete(
     monkeypatch.setattr(client_v2, "NOTIFY_SETTLE_DELAY", 0)
     monkeypatch.setattr(client_v2, "STATION_NAMES_IDLE_TIMEOUT", 0)
     client = StatelessSolemClient(ADDRESS, max_station_num=6)
-    with pytest.raises(Exception):  # InvalidSnapshot via connection error path
+    with pytest.raises(SolemConnectionError):
         await client.get_station_name_snapshot()
+    assert fake.disconnects == 1
+
+
+# Regression: the 0x34 write ack is a 4-byte echo '34 12 part station'
+# (hardware-validated); the 2-byte '34 00' generic ack must also count, and
+# a wrong-part echo must not satisfy the wait.
+
+
+async def test_write_station_name_wrong_part_echo_does_not_ack(
+    established, monkeypatch
+):
+    """A mismatched 0x34 echo never satisfies the per-part ack wait."""
+    before = _snapshot({i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)})
+    expected = before.renamed(2, "Greenhouse", 6)
+    fake = _NameSession(_frames_for(before))
+    _patch_connection(monkeypatch, fake)
+    monkeypatch.setattr(client_v2, "NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr(client_v2, "STATION_NAMES_IDLE_TIMEOUT", 0)
+    monkeypatch.setattr(client_v2, "STATUS_NOTIFY_TIMEOUT", 0.05)
+
+    async def wrong_part_acks(_uuid, payload, *, response):
+        fake.writes.append(payload)
+        if payload[:1] == b"\x33":
+            # Echo the OTHER part's header than the one just written.
+            other_part = 1 - payload[2]
+            fake.handler(
+                1, bytearray(b"\x34" + bytes([payload[1], other_part, payload[3]]))
+            )
+            return
+        if payload == protocol.pack_get_station_names():
+            for frame in fake.read_frames:
+                fake.handler(1, bytearray(frame))
+            return
+
+    fake.write_gatt_char = wrong_part_acks
+    client = StatelessSolemClient(ADDRESS, max_station_num=6)
+    with pytest.raises(SolemConnectionError):
+        await client.write_station_name(2, "Greenhouse", expected, before=before)
+    # Write attempted exactly once, never replayed.
+    assert len([f for f in fake.writes if f[:1] == b"\x33"]) == 1
+    assert client.station_name_write_diagnostics["acknowledged_parts"] == 0
+
+
+async def test_write_station_name_generic_ack_counts_and_writes_complete(
+    established, monkeypatch
+):
+    """A bare '34 00' ack satisfies the wait and the write completes."""
+    before = _snapshot({i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)})
+    expected = before.renamed(2, "Greenhouse", 6)
+    fake = _NameSession(_frames_for(before))
+    _patch_connection(monkeypatch, fake)
+    monkeypatch.setattr(client_v2, "NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr(client_v2, "STATION_NAMES_IDLE_TIMEOUT", 0)
+
+    async def generic_acks(_uuid, payload, *, response):
+        fake.writes.append(payload)
+        if payload[:1] == b"\x33":
+            fake.read_frames = _frames_for(expected)
+            fake.handler(1, bytearray(b"\x34\x00"))
+            return
+        if payload == protocol.pack_get_station_names():
+            fake.mode = "read"
+            for frame in fake.read_frames:
+                fake.handler(1, bytearray(frame))
+            return
+        fake.mode = "idle"
+
+    fake.write_gatt_char = generic_acks
+    client = StatelessSolemClient(ADDRESS, max_station_num=6)
+    actual = await client.write_station_name(2, "Greenhouse", expected, before=before)
+    assert actual.revision == expected.revision
+    assert client.station_name_write_diagnostics["acknowledged_parts"] == 2
+
+
+async def test_write_station_name_rejection_via_byte3_f0(
+    established, monkeypatch
+):
+    """0x34 echo with F0 at byte 3 is a rejection, not a success."""
+    before = _snapshot({i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)})
+    fake = _NameSession(_frames_for(before))
+
+    async def reject_byte3(_uuid, payload, *, response):
+        fake.writes.append(payload)
+        if payload[:1] == b"\x33":
+            fake.handler(1, bytearray(b"\x34" + payload[1:3] + b"\xf0"))
+            return
+        if payload == protocol.pack_get_station_names():
+            for frame in fake.read_frames:
+                fake.handler(1, bytearray(frame))
+            return
+
+    fake.write_gatt_char = reject_byte3
+    _patch_connection(monkeypatch, fake)
+    monkeypatch.setattr(client_v2, "NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr(client_v2, "STATION_NAMES_IDLE_TIMEOUT", 0)
+    client = StatelessSolemClient(ADDRESS, max_station_num=6)
+    with pytest.raises(UncertainWrite):
+        await client.write_station_name(
+            2, "Greenhouse", before.renamed(2, "Greenhouse", 6), before=before
+        )
+    assert len([f for f in fake.writes if f[:1] == b"\x33"]) == 1
 
 
 async def test_get_station_name_snapshot_returns_verified_snapshot(

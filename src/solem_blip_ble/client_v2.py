@@ -128,6 +128,53 @@ async def _await_operation(awaitable: Awaitable[_T]) -> _T:
     return await awaitable
 
 
+class _StationNameWriteSession:
+    """Ack-matching state machine for one station-name write session.
+
+    Module level so the write path stays readable and the ack rules are
+    testable in isolation. The handler retains only headers/counts —
+    never user names or payloads.
+    """
+
+    __slots__ = (
+        "acknowledged",
+        "diagnostic",
+        "expected_header",
+        "read_frames",
+        "rejected",
+    )
+
+    def __init__(self, diagnostic: dict[str, Any]) -> None:
+        self.diagnostic = diagnostic
+        self.acknowledged = asyncio.Event()
+        self.rejected = False
+        self.expected_header: bytes | None = None
+        self.read_frames: list[bytes] = []
+
+    def handle_notification(self, _sender: int, data: bytearray) -> None:
+        frame = bytes(data)
+        if self.diagnostic["phase"] in ("preflight", "readback"):
+            if frame[:2] in (b"\x36\x12", b"\x35\x12"):
+                self.read_frames.append(frame)
+            return
+        # Retain only headers/counts: never include user names/payloads.
+        self.diagnostic["last_reply_header"] = frame[:4].hex()
+        self.diagnostic["last_reply_length"] = len(frame)
+        if frame == b"\x34\x00":
+            self.acknowledged.set()
+            return
+        if len(frame) < 3 or frame[0] != 0x34:
+            return
+        # Name-write replies echo the part index and output index.
+        # Unlike name READ replies, byte 2 is not a countdown.
+        # F0 signals a rejected/unsupported command, not success.
+        if frame[2] == 0xF0 or (len(frame) > 3 and frame[3] == 0xF0):
+            self.rejected = True
+            self.acknowledged.set()
+        elif frame[:4] == self.expected_header:
+            self.acknowledged.set()
+
+
 class StatelessSolemClient:
     """Connect-per-operation BLE client for a single Solem BL-IP controller.
 
@@ -413,6 +460,12 @@ class StatelessSolemClient:
             except asyncio.CancelledError:
                 raise
             except SolemDeadlineExceeded:
+                raise
+            except (InvalidSnapshot, StaleProgram):
+                # Deterministic data verdicts: reconnecting cannot change the
+                # controller's answer, so retrying only burns the deadline
+                # budget and finally masks the precise cause as
+                # SolemDeadlineExceeded. Surface them unwrapped.
                 raise
             except (
                 asyncio.TimeoutError,
@@ -817,6 +870,7 @@ class StatelessSolemClient:
         deadline = time.monotonic() + STATUS_NOTIFY_TIMEOUT
         last_received = time.monotonic()
         count = len(frames)
+        last_rejected_count = -1
         while time.monotonic() < deadline:
             self._check_drop()
             if len(frames) != count:
@@ -828,7 +882,14 @@ class StatelessSolemClient:
                         frames, self.max_station_num
                     )
                 except InvalidSnapshot:
-                    pass
+                    # One grace cycle in case late fragments still arrive;
+                    # if the idle window elapsed again with no new frames,
+                    # the response is final and the verdict is precise —
+                    # never poll until the stage deadline and mask it as a
+                    # timeout/UncertainWrite.
+                    if len(frames) == last_rejected_count:
+                        raise
+                    last_rejected_count = len(frames)
             await asyncio.sleep(0.05)
         raise InvalidSnapshot("Timeout waiting for complete station names")
 
@@ -858,72 +919,44 @@ class StatelessSolemClient:
             return expected
 
         async def _op(client: BleakClient) -> StationNameSnapshot:
-            read_frames: list[bytes] = []
-            acknowledged = asyncio.Event()
-            rejected = False
-            expected_header: bytes | None = None
             self.station_name_write_diagnostics = {
                 "phase": "subscribe",
                 "acknowledged_parts": 0,
             }
+            session = _StationNameWriteSession(self.station_name_write_diagnostics)
 
-            def notification_handler(_sender: int, data: bytearray) -> None:
-                nonlocal rejected
-                diagnostic = self.station_name_write_diagnostics
-                if diagnostic["phase"] in ("preflight", "readback"):
-                    if data[:2] in (b"\x36\x12", b"\x35\x12"):
-                        read_frames.append(bytes(data))
-                    return
-                # Retain only headers/counts: never include user names/payloads.
-                diagnostic["last_reply_header"] = bytes(data[:4]).hex()
-                diagnostic["last_reply_length"] = len(data)
-                if bytes(data) == b"\x34\x00":
-                    acknowledged.set()
-                    return
-                if len(data) < 3 or data[0] != 0x34:
-                    return
-                # Name-write replies echo the part index and output index.
-                # Unlike name READ replies, byte 2 is not a countdown.
-                # F0 signals a rejected/unsupported command, not success.
-                if data[2] == 0xF0 or (len(data) > 3 and data[3] == 0xF0):
-                    rejected = True
-                    acknowledged.set()
-                elif bytes(data[:4]) == expected_header:
-                    acknowledged.set()
-
-            await self._start_notify(client, notification_handler)
+            await self._start_notify(client, session.handle_notification)
             try:
                 await asyncio.sleep(NOTIFY_SETTLE_DELAY)
-                diagnostic_phase = self.station_name_write_diagnostics
-                diagnostic_phase["phase"] = "preflight"
+                self.station_name_write_diagnostics["phase"] = "preflight"
                 current = await self._read_station_names_on_connection(
-                    client, read_frames
+                    client, session.read_frames
                 )
                 if current.revision != before.revision:
                     raise StaleProgram(
                         "Station names changed before writing; refresh the editor"
                     )
                 for part, frame in enumerate(frames):
-                    expected_header = b"\x34" + frame[1:4]
-                    acknowledged.clear()
-                    rejected = False
+                    session.expected_header = b"\x34" + frame[1:4]
+                    session.acknowledged.clear()
+                    session.rejected = False
                     self.station_name_write_diagnostics.update(
                         phase="await_ack", part=part
                     )
                     await self._write(client, frame)
                     await self._wait_for_event(
-                        acknowledged,
+                        session.acknowledged,
                         STATUS_NOTIFY_TIMEOUT,
                         f"station-name part {part} acknowledgement",
                     )
-                    if rejected:
+                    if session.rejected:
                         raise UncertainWrite(
                             "Controller rejected the station-name command"
                         )
                     self.station_name_write_diagnostics["acknowledged_parts"] = part + 1
                 self.station_name_write_diagnostics["phase"] = "readback"
                 actual = await self._read_station_names_on_connection(
-                    client, read_frames
+                    client, session.read_frames
                 )
                 if actual.revision != expected.revision:
                     self.station_name_write_diagnostics["phase"] = "readback_mismatch"

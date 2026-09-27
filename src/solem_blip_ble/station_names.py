@@ -65,6 +65,34 @@ class StationNameSnapshot:
         }
 
     @property
+    def station_count(self) -> int:
+        """Highest 1-based output with a non-empty (NUL-stripped) name.
+
+        This is the device-derived physical station count (#57): the
+        name-read request asks for *all* output names and the device
+        decides what to report, so the highest named output is the
+        authoritative width. Whitespace-only names deliberately count as
+        named: whatever the device holds in that slot is device-held
+        data, and this value must mirror the controller's own notion of
+        its width, not an editorial judgement about name quality.
+        When the controller also reports unnamed
+        (unused) outputs they are ignored here; when no output has a
+        non-empty name, the count falls back to the highest reported
+        output number.
+        """
+        named = [station for station, name in self.names.items() if name]
+        return max(named, default=max(self.raw_names, default=0))
+
+    @property
+    def reported_count(self) -> int:
+        """Number of outputs the device reported in the name response.
+
+        Diagnostic value: it may exceed :attr:`station_count` on devices
+        that also report unnamed/unused output slots.
+        """
+        return len(self.raw_names)
+
+    @property
     def revision(self) -> str:
         """Stable digest over every raw name; used for stale-edit checks."""
         return hashlib.sha256(

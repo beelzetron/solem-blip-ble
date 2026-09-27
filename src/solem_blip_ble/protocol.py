@@ -610,7 +610,16 @@ def irrigation_program_write_mismatches(
     written: IrrigationProgram | None,
     expected: IrrigationProgram,
 ) -> dict[str, tuple[Any, Any]]:
-    """Return writable-field read-back mismatches as ``expected, actual`` pairs."""
+    """Return writable-field read-back mismatches as ``expected, actual`` pairs.
+
+    The ``station_durations`` comparison is width-insensitive: only the first
+    ``len(expected['station_durations'])`` entries are compared, entries beyond
+    that width are ignored entirely (they are pre-existing hidden-slot state
+    outside this write's contract), and a shorter written list is zero-padded.
+    Hidden-slot zeroing is NOT verified: pack_set_irrigation_program writes
+    zeros to all 12 slots, but nonzero hidden slots in the readback are
+    deliberately ignored.
+    """
     if written is None:
         return {"program": (expected, None)}
 

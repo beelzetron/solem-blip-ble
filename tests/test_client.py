@@ -536,7 +536,17 @@ async def test_set_irrigation_program_fails_on_readback_mismatch(monkeypatch):
 
 
 async def test_set_irrigation_program_accepts_wider_readback(monkeypatch):
-    """Issue #56: hidden trailing storage slots never fail write verification."""
+    """Issue #56: width-insensitive duration comparison is harmless on v1.
+
+    Note: v1 readbacks are always assembled at max_station_num width
+    (client.assemble_irrigation_programs uses max_stations=self.max_station_num,
+    and the protocol chunk caps at that width), so a 12-slot readback can never
+    occur on v1 and this scenario is not reachable there. This test documents
+    that the comparison is harmless when the widths are equal; the true
+    regression coverage for the 12-slot case (v2 snapshot path and protocol
+    unit tests) lives in tests/test_client_v2.py (ProgramSnapshot) and the
+    protocol tests.
+    """
     fake_client = FakeWriteOnlyBleakClient()
     client = SolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
     program: protocol.IrrigationProgram = {

@@ -208,7 +208,15 @@ class StatelessSolemClient:
         self._mock_station_names: StationNameSnapshot | None = None
         # Effective user-facing station width. Falls back to the
         # constructor value until the first full station-name read adopts
-        # the device-reported count (#57).
+        # the device-reported count (#57). Adoption is UPWARD-ONLY (D1,
+        # adversarial review of #57): the device reports every configured
+        # slot in the name read even when the higher outputs carry no
+        # onboard names (fresh install, names live HA-side), so the
+        # highest named output can legitimately undershoot the true
+        # width. A name read can raise the count (a rename names an
+        # empty slot) but never lower it, or live status for the higher
+        # stations would be dropped and HA would force-mark them
+        # inactive mid-program.
         self.station_count = max_station_num
 
     # -- device resolution -------------------------------------------------
@@ -897,11 +905,33 @@ class StatelessSolemClient:
                         raise
                     last_rejected_count = len(frames)
                 else:
-                    # Adopt the device-reported station count (#57): the
-                    # name read is the authoritative physical width. The
-                    # snapshot validation stays at the constructor width;
-                    # only user-facing sizing follows the device.
-                    self.station_count = snapshot.station_count
+                    # Adopt the device-reported station count (#57):
+                    # UPWARD-ONLY. The device ALWAYS reports every
+                    # configured slot in the name read (real captures:
+                    # 12 at every width), so slots with no onboard name
+                    # still arrive in the response and
+                    # snapshot.station_count (highest named output) can
+                    # legitimately be LOWER than the true width on fresh
+                    # installs whose names live HA-side. Shrinking to it
+                    # would drop live status for the higher stations (HA
+                    # would force-mark them inactive mid-program), so a
+                    # name read can only RAISE the count (e.g. a rename
+                    # names empty slot 7), never lower it: the
+                    # constructor width stays the floor. KNOWN
+                    # LIMITATION (S1, stale adoption): the raised floor
+                    # is deliberately never reset on disconnect —
+                    # reconnection keeps the wider count until process
+                    # replacement (no reset mechanism by design here).
+                    adopted = snapshot.station_count
+                    if not any(snapshot.names.values()):
+                        # D2: with no named output at all, the snapshot
+                        # count is the all-empty fallback (highest
+                        # reported slot, can reach 12) which EXCEEDS the
+                        # validated width; clamp it so the fallback can
+                        # never push the adopted count above
+                        # max_station_num through the max() below.
+                        adopted = min(adopted, self.max_station_num)
+                    self.station_count = max(self.station_count, adopted)
                     return snapshot
             await asyncio.sleep(0.05)
         raise InvalidSnapshot("Timeout waiting for complete station names")

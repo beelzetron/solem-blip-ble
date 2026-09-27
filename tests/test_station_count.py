@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from solem_blip_ble import protocol
 from solem_blip_ble.client_v2 import StatelessSolemClient
 from solem_blip_ble.station_names import StationNameSnapshot
 
@@ -194,7 +195,7 @@ async def test_unnamed_outputs_do_not_inflate_adopted_count(
     fake = _SnapshotNameSession(frames)
     _patch_connection(monkeypatch, fake)
 
-    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=8)
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
     await client.get_station_name_snapshot()
 
     assert client.station_count == 6
@@ -215,9 +216,12 @@ async def test_unnamed_outputs_do_not_inflate_adopted_count(
 
 
 async def test_rename_of_empty_slot_bumps_station_count(monkeypatch) -> None:
-    """Post-rename refresh re-adopts the device count: naming the highest
-    empty slot via write_station_name bumps client.station_count from 6
-    to 7 (max_station_num stays 12)."""
+    """Post-rename refresh re-adopts the device count. Under upward-only
+    adoption (D1 fix) the constructor width is the floor, so with
+    max_station_num=7 the client already sits at 7 before the rename and
+    stays there after; what must hold is that the refresh re-adoption
+    never DROPS the count below the floor while the snapshot itself grows
+    from 6 to 7 named outputs."""
     before = StationNameSnapshot(
         {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)}
         | {i: bytes(32) for i in range(7, 13)}
@@ -240,12 +244,114 @@ async def test_rename_of_empty_slot_bumps_station_count(monkeypatch) -> None:
 
     fake.write_gatt_char = swap_after_write
 
-    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=12)
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=7)
     await client.get_station_name_snapshot()
-    assert client.station_count == 6
-
+    assert client.station_count == 7  # floor: constructor width
     actual = await client.write_station_name(
         7, "Hedge", expected, before=before
     )
-    assert actual.station_count == 7
-    assert client.station_count == 7
+    assert actual.station_count == 7  # snapshot grew 6 -> 7 named
+    assert client.station_count == 7  # floor kept, never dropped
+
+
+# -- upward-only adoption (D1 regression + growth/shrink) -------------------
+
+
+async def test_real_capture_frame_station_5_survives_low_snapshot_count(
+    monkeypatch,
+) -> None:
+    """D1 regression with the REAL device capture: a unit whose outputs 5-6
+    exist physically but carry no onboard names (fresh install, names live
+    HA-side) reports a snapshot with only outputs 1-4 named out of all 12
+    reported slots. The device always reports every slot in the name read,
+    so the snapshot count (4) must never shrink the client width below the
+    configured maximum (6): the live watering frame for station 5 from the
+    field capture must parse as station_num=5 / is_watering=True."""
+    frames = _name_frames(
+        {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 5)}
+        | {i: bytes(32) for i in range(5, 13)}
+    )
+    fake = _SnapshotNameSession(frames)
+    _patch_connection(monkeypatch, fake)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    snapshot = await client.get_station_name_snapshot()
+    assert snapshot.station_count == 4  # highest named output is 4
+    assert client.station_count == 6  # upward-only: floor stays at 6
+
+    status = protocol.parse_status_notification(
+        bytes.fromhex("3c10024000aaaaaa02054f11100000100000"),
+        max_station_num=client.station_count,
+    )
+    assert status is not None
+    assert status["station_num"] == 5
+    assert status["is_watering"] is True
+
+
+async def test_second_read_with_more_named_outputs_grows_station_count(
+    monkeypatch,
+) -> None:
+    """A rename that names empty slots grows the adopted count: first read
+    adopts 6 (slots 1-6 named), a later read with 1-8 named adopts 8."""
+    fake = _SnapshotNameSession(
+        _name_frames(
+            {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)}
+            | {i: bytes(32) for i in range(7, 13)}
+        )
+    )
+    _patch_connection(monkeypatch, fake)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    await client.get_station_name_snapshot()
+    assert client.station_count == 6
+
+    fake.frames = _name_frames(
+        {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 9)}
+        | {i: bytes(32) for i in range(9, 13)}
+    )
+    await client.get_station_name_snapshot()
+    assert client.station_count == 8
+
+
+async def test_second_read_with_fewer_named_outputs_does_not_shrink(
+    monkeypatch,
+) -> None:
+    """Downward read never shrinks the adopted count: after adopting 8,
+    a snapshot with only outputs 1-4 named leaves station_count at 8 —
+    the device reports all slots regardless of onboard names."""
+    fake = _SnapshotNameSession(
+        _name_frames(
+            {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 9)}
+            | {i: bytes(32) for i in range(9, 13)}
+        )
+    )
+    _patch_connection(monkeypatch, fake)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=8)
+    await client.get_station_name_snapshot()
+    assert client.station_count == 8
+
+    fake.frames = _name_frames(
+        {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 5)}
+        | {i: bytes(32) for i in range(5, 13)}
+    )
+    await client.get_station_name_snapshot()
+    assert client.station_count == 8
+
+
+async def test_all_empty_snapshot_clamped_to_max_station_num(
+    monkeypatch,
+) -> None:
+    """All-empty fallback clamp (D2): when no output has a name, the
+    snapshot count falls back to the highest reported output (12) — that
+    fallback must clamp to the configured maximum instead of adopting a
+    12-wide parse on a 6-output unit."""
+    fake = _SnapshotNameSession(
+        _name_frames({i: bytes(32) for i in range(1, 13)})
+    )
+    _patch_connection(monkeypatch, fake)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    snapshot = await client.get_station_name_snapshot()
+    assert snapshot.station_count == 12  # raw all-empty fallback
+    assert client.station_count == 6  # clamped at the validation width

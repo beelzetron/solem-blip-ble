@@ -78,7 +78,10 @@ class StationNameSnapshot:
         When the controller also reports unnamed
         (unused) outputs they are ignored here; when no output has a
         non-empty name, the count falls back to the highest reported
-        output number.
+        output number. Note: the client adopts this value upward-only
+        (it can raise but never lower the client's effective width,
+        because the device reports every configured slot even when the
+        higher ones carry no onboard names).
         """
         named = [station for station, name in self.names.items() if name]
         return max(named, default=max(self.raw_names, default=0))

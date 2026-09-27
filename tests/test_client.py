@@ -4,7 +4,7 @@ import asyncio
 import json
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -223,6 +223,31 @@ class CaptureIrrigationConfigBleakClient(FakeBleakClient):
     ) -> None:
         self.writes.append(payload)
         assert response is False
+        assert self.handler is not None
+        for line in IRRIGATION_CAPTURE_FIXTURE.read_text().splitlines():
+            if not line:
+                continue
+            event = json.loads(line)
+            if event["probe"] == "irrigation_config" and event["direction"] == "RX":
+                self.handler(1, bytearray.fromhex(event["payload_hex"]))
+
+
+class WriteIrrigationConfigBleakClient(CaptureIrrigationConfigBleakClient):
+    """Deliver the captured config frames only after the 0x3900 read request.
+
+    This lets a verified program write run end-to-end: the write frames are
+    recorded like on a real controller and the subsequent readback is served
+    by the actual ``solem_irrigation_config`` capture, exercising the real
+    ``assemble_irrigation_programs`` assembly path for verification.
+    """
+
+    async def write_gatt_char(
+        self, _uuid: str, payload: bytes, *, response: bool
+    ) -> None:
+        self.writes.append(payload)
+        assert response is False
+        if payload != protocol.pack_get_irrigation_config():
+            return
         assert self.handler is not None
         for line in IRRIGATION_CAPTURE_FIXTURE.read_text().splitlines():
             if not line:
@@ -685,6 +710,40 @@ async def test_get_irrigation_config_assembles_at_full_storage_width(monkeypatch
     assert set(programs) == {0, 1, 2}
     for program in programs.values():
         assert len(program["station_durations"]) == protocol.MAX_PROGRAM_STATIONS
+
+
+async def test_set_irrigation_program_verifies_against_real_capture_readback(
+    monkeypatch,
+):
+    """Write → real frame assembly → verify with the captured device frames.
+
+    The mocked readback source is the actual ``solem_irrigation_config`` BLE
+    capture: the client's real protocol path
+    (``protocol.assemble_irrigation_programs`` at the full 12-slot storage
+    width) assembles the programs from the fixture frames, so verification
+    compares the normalized expected against genuinely device-shaped data
+    rather than a dict rebuilt from ``expected`` itself. Program A is written
+    with exactly the values the capture shows for it, so the assembled
+    readback must verify clean without fixture patching.
+    """
+    fake_client = WriteIrrigationConfigBleakClient()
+    client = SolemClient("C8:B9:61:D4:4D:C8", max_station_num=6)
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr("solem_blip_ble.client.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client.IRRIGATION_CONFIG_IDLE_TIMEOUT", 0.02)
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+
+    readback = await client.get_irrigation_config()
+    program = cast(protocol.IrrigationProgram, dict(readback[0]))
+    write_count = len(fake_client.writes)
+
+    assert await client.set_irrigation_program(0, program) == readback
+    # The write phase sent the 7 packed program frames before the readback.
+    assert len(fake_client.writes) > write_count
+    assert protocol.pack_get_irrigation_config() in fake_client.writes
 
 
 async def test_get_station_names_uses_configured_station_count():

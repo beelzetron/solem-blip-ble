@@ -588,6 +588,24 @@ def normalize_irrigation_program_for_write(
     }
 
 
+def _station_durations_equal(
+    written: list[Any],
+    expected: list[Any],
+) -> bool:
+    """Compare durations width-insensitively over the expected stations only.
+
+    Readback programs are assembled at the full 12-slot V5 storage width while
+    the expected program is normalized to the controller's station count, so
+    trailing hidden slots (always zero for freshly written stations) must not
+    fail verification. Entries beyond the expected width are ignored entirely:
+    they are pre-existing hidden-slot state outside this write's contract.
+    """
+    width = len(expected)
+    padded_written = list(written[:width])
+    padded_written.extend([0] * (width - len(padded_written)))
+    return padded_written == list(expected)
+
+
 def irrigation_program_write_mismatches(
     written: IrrigationProgram | None,
     expected: IrrigationProgram,
@@ -620,7 +638,9 @@ def irrigation_program_write_mismatches(
         mismatches["synchro_day"] = (expected["synchro_day"], written["synchro_day"])
     if written["start_times"] != expected["start_times"]:
         mismatches["start_times"] = (expected["start_times"], written["start_times"])
-    if written["station_durations"] != expected["station_durations"]:
+    if not _station_durations_equal(
+        written["station_durations"], expected["station_durations"]
+    ):
         mismatches["station_durations"] = (
             expected["station_durations"],
             written["station_durations"],

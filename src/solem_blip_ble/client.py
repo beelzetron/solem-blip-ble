@@ -821,7 +821,7 @@ class SolemClient:
                     await self._write(client, request)
                     await _wait_for_irrigation_config()
                     programs = protocol.assemble_irrigation_programs(
-                        payloads, max_stations=self.max_station_num
+                        payloads, max_stations=protocol.MAX_PROGRAM_STATIONS
                     )
                     if not protocol.irrigation_config_complete(payloads):
                         raise SolemConnectionError(
@@ -847,11 +847,15 @@ class SolemClient:
         frames = protocol.pack_set_irrigation_program(
             program_index,
             program,
-            max_stations=self.max_station_num,
+            # The wire always carries all 12 storage slots, so pack at the full
+            # V5 storage width. This also accepts readback-shaped programs from
+            # get_irrigation_config on a narrower (6-station) client instead of
+            # rejecting their hidden-slot entries with ValueError.
+            max_stations=protocol.MAX_PROGRAM_STATIONS,
         )
         expected = protocol.normalize_irrigation_program_for_write(
             program,
-            max_stations=self.max_station_num,
+            max_stations=protocol.MAX_PROGRAM_STATIONS,
         )
 
         if self.mock:

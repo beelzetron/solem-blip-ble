@@ -1264,7 +1264,11 @@ class StatelessSolemClient:
         frames = protocol.pack_set_irrigation_program(
             program_index,
             program,
-            max_stations=self.max_station_num,
+            # The wire always carries all 12 storage slots, so pack at the full
+            # V5 storage width. This also accepts readback-shaped programs from
+            # get_irrigation_config on a narrower (6-station) client instead of
+            # rejecting their hidden-slot entries with ValueError.
+            max_stations=protocol.MAX_PROGRAM_STATIONS,
         )
 
         if self.mock:
@@ -1307,7 +1311,7 @@ class StatelessSolemClient:
         """Write one persisted V5 irrigation program and verify by reading it back."""
         expected = protocol.normalize_irrigation_program_for_write(
             program,
-            max_stations=self.max_station_num,
+            max_stations=protocol.MAX_PROGRAM_STATIONS,
         )
 
         if self.mock:

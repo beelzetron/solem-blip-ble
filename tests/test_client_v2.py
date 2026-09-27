@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
-from typing import Any
+from datetime import date
+from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -24,6 +27,7 @@ from solem_blip_ble.exceptions import (
     SolemDeadlineExceeded,
     UncertainWrite,
 )
+from solem_blip_ble.snapshot import ProgramSnapshot
 
 
 class FakeV2Client:
@@ -608,8 +612,13 @@ async def test_write_irrigation_program_skips_readback(monkeypatch) -> None:
     assert operation_writes == [[frame] for frame in frames]
 
 
-async def test_set_irrigation_program_accepts_wider_readback(monkeypatch) -> None:
-    """Issue #56: hidden trailing storage slots never fail write verification."""
+async def test_set_irrigation_program_verifies_at_full_storage_width(monkeypatch) -> None:
+    """Issue #56: expected is normalized at the 12-slot storage width.
+
+    A 6-station client writing a 6-entry program: the expected program has all
+    12 slots (hidden slots = 0), so a readback assembled at the full V5 storage
+    width matches without width-insensitive comparison.
+    """
     client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
     program = {
         "name": "Prato",
@@ -625,14 +634,10 @@ async def test_set_irrigation_program_accepts_wider_readback(monkeypatch) -> Non
     }
     expected = protocol.normalize_irrigation_program_for_write(
         program,
-        max_stations=6,
+        max_stations=protocol.MAX_PROGRAM_STATIONS,
     )
-    written = {
-        1: {
-            **expected,
-            "station_durations": [0, 180, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0],
-        }
-    }
+    assert expected["station_durations"] == [0, 180, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0]
+    written = {1: expected}
     write = AsyncMock()
     readback = AsyncMock(return_value=written)
     monkeypatch.setattr(client, "write_irrigation_program", write)
@@ -643,6 +648,111 @@ async def test_set_irrigation_program_accepts_wider_readback(monkeypatch) -> Non
     write.assert_awaited_once_with(1, program)
     readback.assert_awaited_once()
     assert result == written
+
+
+async def test_set_irrigation_program_fails_on_nonzero_hidden_slot(monkeypatch) -> None:
+    """A nonzero hidden-slot readback is a verification failure, not ignored state."""
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    program = {
+        "name": "Prato",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 2,
+        "synchro_day": 0,
+        "period_start_date": None,
+        "start_times": [270, None, None, None, None, None, None, None],
+        "station_durations": [0, 180],
+    }
+    expected = protocol.normalize_irrigation_program_for_write(
+        program,
+        max_stations=protocol.MAX_PROGRAM_STATIONS,
+    )
+    written = {
+        1: {
+            **expected,
+            "station_durations": [0, 180, 0, 0, 0, 0, 300, 0, 0, 0, 0, 0],
+        }
+    }
+    write = AsyncMock()
+    readback = AsyncMock(return_value=written)
+    monkeypatch.setattr(client, "write_irrigation_program", write)
+    monkeypatch.setattr(client, "get_irrigation_config", readback)
+
+    with pytest.raises(SolemConnectionError, match="station_durations"):
+        await client.set_irrigation_program(1, program)
+
+
+async def test_set_irrigation_program_verifies_against_real_capture_readback(
+    monkeypatch,
+) -> None:
+    """Write → real frame assembly (ProgramSnapshot) → verify with captured frames.
+
+    The mocked readback source is the actual ``solem_irrigation_config`` BLE
+    capture assembled by the real v2 protocol path
+    (``ProgramSnapshot.from_frames`` at the full 12-slot storage width), so
+    verification compares the normalized expected against genuinely
+    device-shaped data rather than a dict rebuilt from ``expected`` itself.
+    Program A is written with exactly the values the capture shows for it, so
+    the assembled readback must verify clean without fixture patching.
+    """
+    fixture = Path(__file__).parent / "fixtures" / "solem_irrigation_config_c8b961d44dcc8.jsonl"
+    frames: list[bytes] = []
+    for line in fixture.read_text().splitlines():
+        if not line:
+            continue
+        event = json.loads(line)
+        if event["probe"] == "irrigation_config" and event["direction"] == "RX":
+            frames.append(bytes.fromhex(event["payload_hex"]))
+    snapshot = ProgramSnapshot.from_frames(tuple(frames))
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    program = cast(protocol.IrrigationProgram, dict(snapshot.programs[0]))
+    write = AsyncMock()
+    readback = AsyncMock(return_value=snapshot.programs)
+    monkeypatch.setattr(client, "write_irrigation_program", write)
+    monkeypatch.setattr(client, "get_irrigation_config", readback)
+
+    result = await client.set_irrigation_program(0, program)
+
+    write.assert_awaited_once_with(0, program)
+    readback.assert_awaited_once()
+    assert result == snapshot.programs
+
+
+async def test_set_irrigation_program_accepts_get_readback_width(monkeypatch) -> None:
+    """A 12-wide program from get_irrigation_config round-trips on a 6-station client.
+
+    get_irrigation_config assembles programs at the full 12-slot storage
+    width; feeding one back into set_irrigation_program must not raise
+    ValueError even though the client only exposes 6 physical stations —
+    hidden-slot entries are part of the on-wire program block.
+    """
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    readback_program = {
+        "name": "Programma C",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x11,
+        "period_length": 3,
+        "synchro_day": 1,
+        "period_start_date": date(2014, 1, 1),
+        "start_times": [270, None, None, None, None, None, None, None],
+        "station_durations": [0, 1500, 1500, 1500, 0, 0, 0, 0, 0, 0, 0, 0],
+    }
+    assert len(readback_program["station_durations"]) == protocol.MAX_PROGRAM_STATIONS
+    write = AsyncMock()
+    readback = AsyncMock(return_value={2: readback_program})
+    monkeypatch.setattr(client, "write_irrigation_program", write)
+    monkeypatch.setattr(client, "get_irrigation_config", readback)
+
+    result = await client.set_irrigation_program(2, readback_program)
+
+    write.assert_awaited_once_with(2, readback_program)
+    readback.assert_awaited_once()
+    assert result == {2: readback_program}
 
 
 async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> None:
@@ -662,7 +772,7 @@ async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> 
     }
     expected = protocol.normalize_irrigation_program_for_write(
         program,
-        max_stations=2,
+        max_stations=protocol.MAX_PROGRAM_STATIONS,
     )
     write = AsyncMock()
     readback = AsyncMock(return_value={1: expected})

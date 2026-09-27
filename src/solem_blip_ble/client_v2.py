@@ -206,6 +206,10 @@ class StatelessSolemClient:
         self.program_write_diagnostics: dict[str, Any] = {}
         self.station_name_write_diagnostics: dict[str, Any] = {}
         self._mock_station_names: StationNameSnapshot | None = None
+        # Effective user-facing station width. Falls back to the
+        # constructor value until the first full station-name read adopts
+        # the device-reported count (#57).
+        self.station_count = max_station_num
 
     # -- device resolution -------------------------------------------------
 
@@ -623,8 +627,10 @@ class StatelessSolemClient:
             status_event = asyncio.Event()
 
             def notification_handler(_sender: int, data: bytearray) -> None:
+                # station_count follows the device-reported width once the
+                # name read ran (#57); max_station_num is the fallback.
                 parsed = protocol.parse_status_notification(
-                    data, max_station_num=self.max_station_num
+                    data, max_station_num=self.station_count
                 )
                 if parsed is not None:
                     status_result.update(parsed)
@@ -649,7 +655,7 @@ class StatelessSolemClient:
                         remaining := protocol.parse_intermediate_remaining(
                             data,
                             station_num,
-                            max_station_num=self.max_station_num,
+                            max_station_num=self.station_count,
                         )
                     )
                     is not None
@@ -878,7 +884,7 @@ class StatelessSolemClient:
                 last_received = time.monotonic()
             if time.monotonic() - last_received >= STATION_NAMES_IDLE_TIMEOUT:
                 try:
-                    return StationNameSnapshot.from_frames(
+                    snapshot = StationNameSnapshot.from_frames(
                         frames, self.max_station_num
                     )
                 except InvalidSnapshot:
@@ -890,6 +896,13 @@ class StatelessSolemClient:
                     if len(frames) == last_rejected_count:
                         raise
                     last_rejected_count = len(frames)
+                else:
+                    # Adopt the device-reported station count (#57): the
+                    # name read is the authoritative physical width. The
+                    # snapshot validation stays at the constructor width;
+                    # only user-facing sizing follows the device.
+                    self.station_count = snapshot.station_count
+                    return snapshot
             await asyncio.sleep(0.05)
         raise InvalidSnapshot("Timeout waiting for complete station names")
 

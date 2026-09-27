@@ -11,7 +11,7 @@ Covers:
 
 from __future__ import annotations
 
-import pytest
+from typing import Any
 
 from solem_blip_ble.client_v2 import StatelessSolemClient
 from solem_blip_ble.station_names import StationNameSnapshot
@@ -68,6 +68,17 @@ def test_reported_count_matches_station_count_when_all_named():
     assert snapshot.station_count == 6
 
 
+def test_station_count_whitespace_only_name_counts_as_named():
+    # Deliberate choice: a whitespace-only name is still device-held data,
+    # so slot 7 counts toward station_count (see station_names.py docstring).
+    snapshot = StationNameSnapshot(
+        {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)}
+        | {7: b"  ".ljust(32, b"\0")}
+        | {i: bytes(32) for i in range(8, 13)}
+    )
+    assert snapshot.station_count == 7
+
+
 # -- connect-time adoption -------------------------------------------------
 
 
@@ -91,7 +102,7 @@ class _SnapshotNameSession:
     def __init__(self, frames: list[bytes], station_num: int = 6) -> None:
         self.frames = frames
         self.station_num = station_num
-        self.handler = None
+        self.handler: Any = None
         self.writes: list[bytes] = []
 
     @property
@@ -201,3 +212,40 @@ async def test_unnamed_outputs_do_not_inflate_adopted_count(
     assert readback.reported_count == 8
     assert readback.station_count == 6
     assert client.station_count == 6
+
+
+async def test_rename_of_empty_slot_bumps_station_count(monkeypatch) -> None:
+    """Post-rename refresh re-adopts the device count: naming the highest
+    empty slot via write_station_name bumps client.station_count from 6
+    to 7 (max_station_num stays 12)."""
+    before = StationNameSnapshot(
+        {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)}
+        | {i: bytes(32) for i in range(7, 13)}
+    )
+    expected = before.renamed(7, "Hedge", 12)
+    fake = _SnapshotNameSession(_name_frames(before.raw_names), station_num=6)
+    _patch_connection(monkeypatch, fake)
+
+    async def swap_after_write(_uuid, payload, *, response):
+        fake.writes.append(payload)
+        if payload[:1] == b"\x33":
+            fake.frames = _name_frames(expected.raw_names)
+            fake.handler(1, bytearray(b"\x34" + payload[1:4]))
+            return
+        if payload == b"\x35\x00":
+            for frame in fake.frames:
+                fake.handler(1, bytearray(frame))
+            return
+        fake.handler(1, fake.status_frame)
+
+    fake.write_gatt_char = swap_after_write
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=12)
+    await client.get_station_name_snapshot()
+    assert client.station_count == 6
+
+    actual = await client.write_station_name(
+        7, "Hedge", expected, before=before
+    )
+    assert actual.station_count == 7
+    assert client.station_count == 7

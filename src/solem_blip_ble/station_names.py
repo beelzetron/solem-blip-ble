@@ -71,7 +71,11 @@ class StationNameSnapshot:
         This is the device-derived physical station count (#57): the
         name-read request asks for *all* output names and the device
         decides what to report, so the highest named output is the
-        authoritative width. When the controller also reports unnamed
+        authoritative width. Whitespace-only names deliberately count as
+        named: whatever the device holds in that slot is device-held
+        data, and this value must mirror the controller's own notion of
+        its width, not an editorial judgement about name quality.
+        When the controller also reports unnamed
         (unused) outputs they are ignored here; when no output has a
         non-empty name, the count falls back to the highest reported
         output number.

@@ -1373,7 +1373,7 @@ class StatelessSolemClient:
             def notification_handler(_sender: int, data: bytearray) -> None:
                 nonlocal reply_acknowledged
                 parsed = protocol.parse_status_notification(
-                    data, max_station_num=self.max_station_num
+                    data, max_station_num=self.station_count
                 )
                 if parsed is not None:
                     status_result.update(parsed)
@@ -1452,7 +1452,7 @@ class StatelessSolemClient:
                 if not protocol.is_command_notification(data):
                     return
                 parsed = protocol.parse_status_notification(
-                    data, max_station_num=self.max_station_num
+                    data, max_station_num=self.station_count
                 )
                 if parsed is not None:
                     last_status = parsed

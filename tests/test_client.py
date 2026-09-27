@@ -535,6 +535,56 @@ async def test_set_irrigation_program_fails_on_readback_mismatch(monkeypatch):
         await client.set_irrigation_program(0, program)
 
 
+async def test_set_irrigation_program_accepts_wider_readback(monkeypatch):
+    """Issue #56: width-insensitive duration comparison is harmless on v1.
+
+    Note: v1 readbacks are always assembled at max_station_num width
+    (client.assemble_irrigation_programs uses max_stations=self.max_station_num,
+    and the protocol chunk caps at that width), so a 12-slot readback can never
+    occur on v1 and this scenario is not reachable there. This test documents
+    that the comparison is harmless when the widths are equal; the true
+    regression coverage for the 12-slot case (v2 snapshot path and protocol
+    unit tests) lives in tests/test_client_v2.py (ProgramSnapshot) and the
+    protocol tests.
+    """
+    fake_client = FakeWriteOnlyBleakClient()
+    client = SolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    program: protocol.IrrigationProgram = {
+        "name": "Prato",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 2,
+        "synchro_day": 0,
+        "period_start_date": date(2026, 6, 24),
+        "start_times": [270, None, None, None, None, None, None, None],
+        "station_durations": [0, 180, 180, 180, 0, 0],
+    }
+    expected = protocol.normalize_irrigation_program_for_write(
+        program,
+        max_stations=6,
+    )
+    readback = {
+        1: {
+            **expected,
+            "station_durations": [0, 180, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0],
+        }
+    }
+
+    async def run_with_client(operation) -> Any:
+        return await operation(fake_client)
+
+    monkeypatch.setattr(client, "_run_with_client", run_with_client)
+    monkeypatch.setattr(
+        client,
+        "get_irrigation_config",
+        AsyncMock(return_value=readback),
+    )
+
+    assert await client.set_irrigation_program(1, program) == readback
+
+
 async def test_get_station_names_from_capture(monkeypatch):
     fake_client = CaptureStationNamesBleakClient()
     client = SolemClient("C8:B9:61:D4:4D:C8", max_station_num=6)

@@ -224,6 +224,76 @@ def test_irrigation_program_write_mismatches_reports_schedule_fields():
     }
 
 
+def _mismatch_program(
+    *,
+    station_durations: list[int],
+) -> protocol.IrrigationProgram:
+    """Build a minimal program fixture around given station durations."""
+    return {
+        "name": "Prato",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 2,
+        "synchro_day": 0,
+        "period_start_date": date(2026, 6, 24),
+        "start_times": [270, None, None, None, None, None, None, None],
+        "station_durations": station_durations,
+    }
+
+
+def test_irrigation_program_write_mismatches_ignores_hidden_trailing_slots():
+    """Issue #56: a 6-station write read back at 12-slot storage width passes."""
+    expected = _mismatch_program(station_durations=[0, 180, 180, 180, 0, 0])
+    written = _mismatch_program(
+        station_durations=[0, 180, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0]
+    )
+
+    assert protocol.irrigation_program_write_mismatches(written, expected) == {}
+
+
+def test_irrigation_program_write_mismatches_ignores_nonzero_hidden_slots():
+    """Pre-existing hidden-slot state beyond the configured width never fails."""
+    expected = _mismatch_program(station_durations=[0, 180])
+    written = _mismatch_program(station_durations=[0, 180, 300, 0, 0, 0])
+
+    assert protocol.irrigation_program_write_mismatches(written, expected) == {}
+
+
+def test_irrigation_program_write_mismatches_reports_within_configured_width():
+    """A genuine duration mismatch inside the configured width is still caught."""
+    expected = _mismatch_program(station_durations=[0, 180, 180, 180, 0, 0])
+    written = _mismatch_program(
+        station_durations=[0, 120, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0]
+    )
+
+    assert protocol.irrigation_program_write_mismatches(written, expected) == {
+        "station_durations": (
+            [0, 180, 180, 180, 0, 0],
+            [0, 120, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0],
+        )
+    }
+
+
+def test_irrigation_program_write_mismatches_pads_shorter_written_side():
+    """A shorter-than-expected readback is zero-padded before comparison."""
+    expected = _mismatch_program(station_durations=[0, 180, 0, 0])
+    written = _mismatch_program(station_durations=[0, 180])
+
+    assert protocol.irrigation_program_write_mismatches(written, expected) == {}
+
+
+def test_irrigation_program_write_mismatches_pads_shorter_written_side_mismatch():
+    """Missing trailing durations in a short readback still count as mismatches."""
+    expected = _mismatch_program(station_durations=[0, 180, 180])
+    written = _mismatch_program(station_durations=[0, 180])
+
+    assert protocol.irrigation_program_write_mismatches(written, expected) == {
+        "station_durations": ([0, 180, 180], [0, 180])
+    }
+
+
 def test_pack_set_irrigation_program_rejects_invalid_values():
     program: protocol.IrrigationProgram = {
         "name": "Too long",

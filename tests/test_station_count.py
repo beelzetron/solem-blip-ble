@@ -11,10 +11,14 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
+
+import pytest
 
 from solem_blip_ble import protocol
 from solem_blip_ble.client_v2 import StatelessSolemClient
+from solem_blip_ble.exceptions import SolemConnectionError
 from solem_blip_ble.station_names import StationNameSnapshot
 
 
@@ -355,3 +359,93 @@ async def test_all_empty_snapshot_clamped_to_max_station_num(
     snapshot = await client.get_station_name_snapshot()
     assert snapshot.station_count == 12  # raw all-empty fallback
     assert client.station_count == 6  # clamped at the validation width
+
+
+# -- snapshot read discipline (public API, #57/#122) ------------------------
+
+
+async def test_snapshot_returns_validated_names_incl_extras_beyond_width(
+    monkeypatch,
+) -> None:
+    """The public snapshot read returns every reported output — including
+    slots beyond max_station_num (extras captured, not rejected) — and
+    adopts the device count upward-only, exactly like the write-preflight
+    read. This is what lets HA polling derive growth (#122)."""
+    frames = _name_frames(
+        {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 5)}
+        | {i: bytes(32) for i in range(5, 13)}
+    )
+    fake = _SnapshotNameSession(frames)
+    _patch_connection(monkeypatch, fake)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=4)
+    snapshot = await client.get_station_name_snapshot()
+
+    # Extras beyond the validation width are captured, not rejected...
+    assert snapshot.reported_count == 12
+    assert snapshot.names[1] == "S1"
+    assert 5 in snapshot.names and snapshot.names[5] == ""
+    # ...and the upward-only adoption raised the width from 4 to 4 (named
+    # floor) — the unnamed extras never inflate it (D2-adjacent behavior).
+    assert client.station_count == 4
+
+
+async def test_snapshot_named_slot_beyond_width_adopts_upward(
+    monkeypatch,
+) -> None:
+    """A named slot beyond max_station_num grows station_count through the
+    public snapshot read — the polling-derived-growth path (#122)."""
+    frames = _name_frames(
+        {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)}
+    )
+    fake = _SnapshotNameSession(frames)
+    _patch_connection(monkeypatch, fake)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=4)
+    snapshot = await client.get_station_name_snapshot()
+
+    assert snapshot.station_count == 6
+    assert client.station_count == 6  # adopted upward from 4
+
+
+async def test_snapshot_incomplete_response_raises_invalid_snapshot(
+    monkeypatch,
+) -> None:
+    """A truncated response (one half missing) surfaces as InvalidSnapshot
+    after the idle grace cycle — precise verdict, no retry masking."""
+    frames = _name_frames(
+        {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)}
+    )
+    fake = _SnapshotNameSession(frames[:-1])
+    _patch_connection(monkeypatch, fake)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    with pytest.raises(SolemConnectionError, match="Incomplete"):
+        await client.get_station_name_snapshot()
+    # The failure must not adopt anything.
+    assert client.station_count == 6
+
+
+async def test_snapshot_drop_during_read_raises_connection_error(
+    monkeypatch,
+) -> None:
+    """A confirmed mid-read link drop surfaces as SolemConnectionError
+    immediately (retry_safe=False, mirroring the write preflight) instead
+    of being retried into a deadline mask."""
+    fake = _SnapshotNameSession([])
+
+    async def drop_on_read(_uuid: str, payload: bytes, *, response: bool) -> None:
+        fake.writes.append(payload)
+        if payload == b"\x35\x00":
+            fake.is_connected = False
+            fake.handler = None
+
+    fake.write_gatt_char = drop_on_read  # type: ignore[method-assign]
+    _patch_connection(monkeypatch, fake)
+    monkeypatch.setattr(
+        "solem_blip_ble.client_v2.OPERATION_DEADLINE", 5.0
+    )
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    with pytest.raises(SolemConnectionError, match="dropped during"):
+        await asyncio.wait_for(client.get_station_name_snapshot(), timeout=10.0)

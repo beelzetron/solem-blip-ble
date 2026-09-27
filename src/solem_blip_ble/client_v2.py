@@ -847,7 +847,14 @@ class StatelessSolemClient:
         within the idle window, this is the safety-grade read used before
         and after name writes: the snapshot is only returned when every
         reported output contributed both halves and the sequence IDs are
-        contiguous.
+        contiguous. The session discipline mirrors the write-preflight
+        flow: one short subscribed operation with retries disabled — a
+        confirmed mid-read link drop surfaces immediately as
+        :class:`SolemConnectionError` instead of being retried into a
+        deadline mask, and :class:`InvalidSnapshot` verdicts stay
+        unwrapped. The device-derived station count is adopted
+        upward-only from the validated snapshot (see
+        :meth:`_read_station_names_on_connection`).
         """
         if self.mock:
             if self._mock_station_names is None:
@@ -873,7 +880,10 @@ class StatelessSolemClient:
             finally:
                 await self._stop_notify(client)
 
-        return await self._run_operation(_op)
+        # retry_safe=False mirrors write_station_name's preflight: a
+        # confirmed drop during the read is a precise verdict, not a
+        # transient worth masking behind the deadline.
+        return await self._run_operation(_op, retry_safe=False)
 
     async def _read_station_names_on_connection(
         self, client: BleakClient, frames: list[bytes]
@@ -887,6 +897,14 @@ class StatelessSolemClient:
         last_rejected_count = -1
         while time.monotonic() < deadline:
             self._check_drop()
+            if not client.is_connected:
+                # A confirmed-dead link wins over the data verdict: without
+                # this the idle-window validation can fire first (idle
+                # timeout 0 or fragments cut mid-stream) and mask the drop
+                # as a confusing InvalidSnapshot.
+                raise SolemConnectionError(
+                    "BLE link dropped during station-name read"
+                )
             if len(frames) != count:
                 count = len(frames)
                 last_received = time.monotonic()

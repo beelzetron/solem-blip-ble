@@ -821,7 +821,7 @@ class SolemClient:
                     await self._write(client, request)
                     await _wait_for_irrigation_config()
                     programs = protocol.assemble_irrigation_programs(
-                        payloads, max_stations=self.max_station_num
+                        payloads, max_stations=protocol.MAX_PROGRAM_STATIONS
                     )
                     if not protocol.irrigation_config_complete(payloads):
                         raise SolemConnectionError(
@@ -851,7 +851,7 @@ class SolemClient:
         )
         expected = protocol.normalize_irrigation_program_for_write(
             program,
-            max_stations=self.max_station_num,
+            max_stations=protocol.MAX_PROGRAM_STATIONS,
         )
 
         if self.mock:

@@ -1307,7 +1307,7 @@ class StatelessSolemClient:
         """Write one persisted V5 irrigation program and verify by reading it back."""
         expected = protocol.normalize_irrigation_program_for_write(
             program,
-            max_stations=self.max_station_num,
+            max_stations=protocol.MAX_PROGRAM_STATIONS,
         )
 
         if self.mock:

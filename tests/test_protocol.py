@@ -243,9 +243,16 @@ def _mismatch_program(
     }
 
 
-def test_irrigation_program_write_mismatches_ignores_hidden_trailing_slots():
-    """Issue #56: a 6-station write read back at 12-slot storage width passes."""
-    expected = _mismatch_program(station_durations=[0, 180, 180, 180, 0, 0])
+def test_irrigation_program_write_mismatches_full_width_trailing_zeros_match():
+    """Issue #56: expected and readback are both the full 12-slot storage width.
+
+    A 6-station write on a 12-slot controller: the expected program is
+    normalized at the full storage width, so the trailing hidden slots (zero)
+    compare equal against the readback.
+    """
+    expected = _mismatch_program(
+        station_durations=[0, 180, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0]
+    )
     written = _mismatch_program(
         station_durations=[0, 180, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0]
     )
@@ -253,45 +260,90 @@ def test_irrigation_program_write_mismatches_ignores_hidden_trailing_slots():
     assert protocol.irrigation_program_write_mismatches(written, expected) == {}
 
 
-def test_irrigation_program_write_mismatches_ignores_nonzero_hidden_slots():
-    """Pre-existing hidden-slot state beyond the configured width never fails."""
-    expected = _mismatch_program(station_durations=[0, 180])
-    written = _mismatch_program(station_durations=[0, 180, 300, 0, 0, 0])
+def test_irrigation_program_write_mismatches_reports_nonzero_hidden_slot():
+    """Nonzero hidden-slot readback state now fails verification.
 
-    assert protocol.irrigation_program_write_mismatches(written, expected) == {}
+    Both sides are compared at the full 12-slot storage width: a write zeroes
+    all 12 slots, so a nonzero duration in a hidden slot (station 7+) is a
+    genuine mismatch, not pre-existing state to ignore.
+    """
+    expected = _mismatch_program(
+        station_durations=[0, 180, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    )
+    written = _mismatch_program(
+        station_durations=[0, 180, 0, 0, 0, 0, 300, 0, 0, 0, 0, 0]
+    )
+
+    assert protocol.irrigation_program_write_mismatches(written, expected) == {
+        "station_durations": (
+            [0, 180, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 180, 0, 0, 0, 0, 300, 0, 0, 0, 0, 0],
+        )
+    }
 
 
-def test_irrigation_program_write_mismatches_reports_within_configured_width():
-    """A genuine duration mismatch inside the configured width is still caught."""
-    expected = _mismatch_program(station_durations=[0, 180, 180, 180, 0, 0])
+def test_irrigation_program_write_mismatches_reports_within_storage_width():
+    """A genuine duration mismatch inside the storage width is still caught."""
+    expected = _mismatch_program(
+        station_durations=[0, 180, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0]
+    )
     written = _mismatch_program(
         station_durations=[0, 120, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0]
     )
 
     assert protocol.irrigation_program_write_mismatches(written, expected) == {
         "station_durations": (
-            [0, 180, 180, 180, 0, 0],
+            [0, 180, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0],
             [0, 120, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0],
         )
     }
 
 
-def test_irrigation_program_write_mismatches_pads_shorter_written_side():
-    """A shorter-than-expected readback is zero-padded before comparison."""
-    expected = _mismatch_program(station_durations=[0, 180, 0, 0])
-    written = _mismatch_program(station_durations=[0, 180])
-
-    assert protocol.irrigation_program_write_mismatches(written, expected) == {}
-
-
-def test_irrigation_program_write_mismatches_pads_shorter_written_side_mismatch():
-    """Missing trailing durations in a short readback still count as mismatches."""
-    expected = _mismatch_program(station_durations=[0, 180, 180])
+def test_irrigation_program_write_mismatches_reports_shorter_written_side():
+    """A shorter-than-expected readback is a mismatch: no width padding."""
+    expected = _mismatch_program(
+        station_durations=[0, 180, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    )
     written = _mismatch_program(station_durations=[0, 180])
 
     assert protocol.irrigation_program_write_mismatches(written, expected) == {
-        "station_durations": ([0, 180, 180], [0, 180])
+        "station_durations": (
+            [0, 180, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 180],
+        )
     }
+
+
+def test_normalize_irrigation_program_for_write_pads_to_full_storage_width():
+    """max_stations=12 pads short duration lists to the 12-slot storage width."""
+    program = _mismatch_program(station_durations=[0, 180])
+
+    normalized = protocol.normalize_irrigation_program_for_write(
+        program, max_stations=protocol.MAX_PROGRAM_STATIONS
+    )
+
+    assert normalized["station_durations"] == [0, 180, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+
+def test_normalize_irrigation_program_for_write_empty_durations_pad_to_twelve():
+    """A program with no durations still normalizes to 12 zero-filled slots."""
+    program = _mismatch_program(station_durations=[])
+
+    normalized = protocol.normalize_irrigation_program_for_write(
+        program, max_stations=protocol.MAX_PROGRAM_STATIONS
+    )
+
+    assert normalized["station_durations"] == [0] * 12
+
+
+def test_normalize_irrigation_program_for_write_rejects_more_than_twelve():
+    """A caller program with more than 12 stations still raises ValueError."""
+    program = _mismatch_program(station_durations=[0] * 13)
+
+    with pytest.raises(ValueError, match="at most 12"):
+        protocol.normalize_irrigation_program_for_write(
+            program, max_stations=protocol.MAX_PROGRAM_STATIONS
+        )
 
 
 def test_pack_set_irrigation_program_rejects_invalid_values():

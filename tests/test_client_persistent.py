@@ -362,6 +362,80 @@ async def test_reuses_one_connection_across_operations(
     assert established[0].writes.count(bytes.fromhex("3b00")) == 2
 
 
+class _SnapshotNameClient(FakeV2Client):
+    """Fake answering the 0x35 all-names read with full name frames."""
+
+    def __init__(self, frames: list[bytes]) -> None:
+        super().__init__()
+        self.frames = frames
+
+    async def write_gatt_char(
+        self, _uuid: str, payload: bytes, *, response: bool
+    ) -> None:
+        self.writes.append(payload)
+        if self.handler is None:
+            return
+        if payload == bytes.fromhex("3500"):
+            for frame in self.frames:
+                self.handler(1, bytearray(frame))
+        elif payload == bytes.fromhex("3b00"):
+            self.handler(
+                1,
+                bytearray.fromhex("3210024200aaaaaa00014f0c10003c100000"),
+            )
+
+
+def _name_frames(raw_names: dict[int, bytes]) -> list[bytes]:
+    frames = []
+    total = len(raw_names)
+    for station, raw in sorted(raw_names.items()):
+        seq = (total - station) * 2
+        frames += [
+            bytes([0x36, 0x12, seq + 1, station - 1]) + raw[:16],
+            bytes([0x36, 0x12, seq, station - 1]) + raw[16:],
+        ]
+    return frames
+
+
+async def test_snapshot_read_reuses_held_connection(
+    established, no_settle, monkeypatch
+) -> None:
+    """The snapshot read runs on the held persistent link (same discipline
+    as every other persistent operation: reuse the connection, subscribe
+    and unsubscribe around the exchange), and adoption persists on the
+    client for the next operation."""
+    monkeypatch.setattr(
+        "solem_blip_ble.client_v2.STATION_NAMES_IDLE_TIMEOUT", 0
+    )
+    fake = _SnapshotNameClient(
+        _name_frames(
+            {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)}
+        )
+    )
+    established.append(fake)
+
+    async def fake_connect(self):
+        return fake
+
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=4)
+    status = await client.get_status()
+    assert status["is_watering"] is True
+
+    snapshot = await client.get_station_name_snapshot()
+    assert snapshot.station_count == 6
+    assert client.station_count == 6  # adopted upward from 4
+    assert len(established) == 1  # held link reused, no reconnect
+    assert fake.disconnects == 0
+    assert fake.handler is None  # unsubscribed after the exchange
+    assert fake.writes.count(bytes.fromhex("3500")) == 1
+
+    # The adopted width sizes the NEXT operation on the same link.
+    status2 = await client.get_status()
+    assert status2["is_watering"] is True
+
+
 async def test_operation_failure_invalidates_session(monkeypatch) -> None:
     """A failed operation releases the link; the next one reconnects fresh."""
     created: list[FakeV2Client] = []

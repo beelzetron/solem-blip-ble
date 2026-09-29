@@ -17,6 +17,11 @@ from . import protocol
 from .exceptions import InvalidSnapshot
 
 
+def _frame_hex(frame: bytes, limit: int = 8) -> str:
+    """First ``limit`` bytes of a frame, for compact error diagnostics."""
+    return frame[:limit].hex() + ("…" if len(frame) > limit else "")
+
+
 @dataclass(frozen=True)
 class StationNameSnapshot:
     """Names for every reported output, including unused physical slots."""
@@ -41,19 +46,56 @@ class StationNameSnapshot:
                 or frame[:2] not in (b"\x36\x12", b"\x35\x12")
                 or frame[3] >= 12
             ):
-                raise InvalidSnapshot("Invalid station-name response")
+                raise InvalidSnapshot(
+                    f"Invalid station-name response: frame {_frame_hex(frame)}"
+                )
             station, part = frame[3] + 1, frame[2] & 1
             group = parts.setdefault(station, {})
             if part in group and group[part] != frame[4:]:
-                raise InvalidSnapshot("Conflicting station-name fragments")
+                raise InvalidSnapshot(
+                    f"Conflicting station-name fragments: "
+                    f"station {station} half {part} "
+                    f"({group[part].hex()} vs {frame[4:].hex()})"
+                )
             group[part] = frame[4:]
             sequences.add(frame[2])
-        if (
-            not set(range(1, physical_stations + 1)) <= parts.keys()
-            or any(set(group) != {0, 1} for group in parts.values())
-            or sequences != set(range(max(sequences, default=-1) + 1))
-        ):
-            raise InvalidSnapshot("Incomplete station-name response")
+        details = []
+        missing_halves = {
+            station: sorted({0, 1} - set(group))
+            for station, group in parts.items()
+            if set(group) != {0, 1}
+        }
+        missing_stations = sorted(
+            set(range(1, physical_stations + 1)) - parts.keys()
+        )
+        if missing_stations:
+            missing_halves.update({station: [0, 1] for station in missing_stations})
+        if missing_halves:
+            details.append(
+                "missing halves for stations "
+                + str(
+                    {
+                        station: missing
+                        for station, missing in sorted(missing_halves.items())
+                    }
+                )
+            )
+        # Devices may report more outputs than physical_stations (unused
+        # slots); extras are valid, only a shortfall is diagnostic.
+        expected_frames = 2 * max(physical_stations, max(parts, default=0))
+        if len(frames) < expected_frames:
+            details.append(
+                f"{len(frames)}/{expected_frames} frames received"
+            )
+        gaps = sorted(
+            set(range(max(sequences, default=-1) + 1)) - sequences
+        )
+        if gaps:
+            details.append(f"sequence gaps: {gaps}")
+        if details:
+            raise InvalidSnapshot(
+                "Incomplete station-name response: " + "; ".join(details)
+            )
         return cls({station: group[1] + group[0] for station, group in parts.items()})
 
     @property

@@ -81,6 +81,56 @@ def test_conflicting_fragment_rejects_snapshot(snapshot):
         StationNameSnapshot.from_frames(frames + [conflict], 6)
 
 
+def test_missing_half_message_names_station_and_part(snapshot):
+    frames = name_frames(snapshot)
+    del frames[3]  # station 2, part 0
+    with pytest.raises(InvalidSnapshot, match=r"2: \[0\]"):
+        StationNameSnapshot.from_frames(frames, 6)
+
+
+def test_missing_station_message_lists_station(snapshot):
+    frames = name_frames(snapshot)[4:]  # drop stations 1 and 2 entirely
+    with pytest.raises(
+        InvalidSnapshot, match=r"missing halves for stations \{1: \[0, 1\], 2: \[0, 1\]\}"
+    ):
+        StationNameSnapshot.from_frames(frames, 6)
+
+
+def test_missing_frame_message_contains_received_count(snapshot):
+    frames = name_frames(snapshot)
+    del frames[3]
+    with pytest.raises(InvalidSnapshot, match="23/24 frames received"):
+        StationNameSnapshot.from_frames(frames, 6)
+
+
+def test_sequence_gap_message_mentions_gap(snapshot):
+    frames = [bytearray(f) for f in name_frames(snapshot)]
+    frames[0][2] = frames[0][2] + 8  # gap in the countdown sequence
+    with pytest.raises(InvalidSnapshot, match=r"sequence gaps: \[23"):
+        StationNameSnapshot.from_frames([bytes(f) for f in frames], 6)
+
+
+def test_malformed_frame_message_contains_frame_hex(snapshot):
+    frames = name_frames(snapshot)
+    bad = b"\x36\x12\x00\x0c" + bytes(16)
+    with pytest.raises(InvalidSnapshot, match="3612000c"):
+        StationNameSnapshot.from_frames(frames + [bad], 6)
+
+
+def test_conflict_message_names_station_and_half(snapshot):
+    frames = name_frames(snapshot)
+    conflict = bytes([0x36, 0x12, frames[0][2], frames[0][3]]) + b"X" * 16
+    with pytest.raises(InvalidSnapshot, match=r"station 1 half 1"):
+        StationNameSnapshot.from_frames(frames + [conflict], 6)
+
+
+def test_incomplete_message_keeps_greppable_prefix(snapshot):
+    frames = name_frames(snapshot)
+    del frames[3]
+    with pytest.raises(InvalidSnapshot, match="^Incomplete station-name response: "):
+        StationNameSnapshot.from_frames(frames, 6)
+
+
 def test_empty_and_partial_responses_reject_snapshot(snapshot):
     frames = name_frames(snapshot)
     with pytest.raises(InvalidSnapshot):

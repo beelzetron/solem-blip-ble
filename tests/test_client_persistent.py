@@ -358,7 +358,10 @@ async def test_reuses_one_connection_across_operations(
 
     assert len(established) == 1
     assert established[0].disconnects == 0
-    assert established[0].handler is None  # notify stopped between ops
+    # Subscription is held for the connection lifetime; routing is disabled
+    # between operations (frames with no active handler are dropped).
+    assert established[0].handler == client._dispatch_notification
+    assert client._active_handler is None
     assert established[0].writes.count(bytes.fromhex("3b00")) == 2
 
 
@@ -428,7 +431,10 @@ async def test_snapshot_read_reuses_held_connection(
     assert client.station_count == 6  # adopted upward from 4
     assert len(established) == 1  # held link reused, no reconnect
     assert fake.disconnects == 0
-    assert fake.handler is None  # unsubscribed after the exchange
+    # Subscription held for the connection lifetime (no CCCD churn);
+    # routing disabled between operations.
+    assert fake.handler == client._dispatch_notification
+    assert client._active_handler is None
     assert fake.writes.count(bytes.fromhex("3500")) == 1
 
     # The adopted width sizes the NEXT operation on the same link.
@@ -751,3 +757,169 @@ async def test_persistent_no_replay_invalidates_session(monkeypatch) -> None:
     assert client._active_client is None
     await drain_background_disconnects()
     assert created[0].disconnects == 1
+
+
+class _CountingNotifyClient(FakeV2Client):
+    """Fake counting real CCCD writes/unsubscribes on the wire."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_notify_calls = 0
+        self.stop_notify_calls = 0
+
+    async def start_notify(self, _uuid: str, handler) -> None:
+        self.start_notify_calls += 1
+        await super().start_notify(_uuid, handler)
+
+    async def stop_notify(self, _uuid: str) -> None:
+        self.stop_notify_calls += 1
+        await super().stop_notify(_uuid)
+
+
+async def test_subscription_held_across_operations_single_cccd_write(
+    no_settle, monkeypatch
+) -> None:
+    """Consecutive operations on a held link produce exactly ONE CCCD
+    enable and ZERO CCCD disables: the FW5-killing disable→re-enable
+    cycle (issue #136) never happens on the wire."""
+    created: list[_CountingNotifyClient] = []
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        fake = _CountingNotifyClient()
+        created.append(fake)
+        return fake
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF")
+    status = await client.get_status()
+    assert status["is_watering"] is True
+    status2 = await client.get_status()
+    assert status2["is_watering"] is True
+
+    fake = created[0]
+    assert fake.start_notify_calls == 1
+    assert fake.stop_notify_calls == 0
+    assert fake.writes.count(bytes.fromhex("3b00")) == 2
+    assert len(created) == 1
+
+
+async def test_fresh_connection_subscribes_for_real(no_settle, monkeypatch) -> None:
+    """After the link is torn down, the next operation performs a real
+    subscribe on the new connection."""
+    created: list[_CountingNotifyClient] = []
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        fake = _CountingNotifyClient()
+        created.append(fake)
+        return fake
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF")
+    await client.get_status()
+    # Kill the held link so the next operation must reconnect.
+    created[0].is_connected = False
+    await drain_background_disconnects()
+    await client.get_status()
+
+    assert len(created) == 2
+    assert created[0].start_notify_calls == 1
+    assert created[1].start_notify_calls == 1  # fresh CCCD write
+    assert client._dispatch_client is created[1]
+    assert created[1].handler == client._dispatch_notification
+
+
+async def test_straggler_window_drops_stale_frames(established, no_settle) -> None:
+    """Frames arriving inside the post-swap window belong to the previous
+    operation (no op writes before its settle delay) and are dropped
+    instead of polluting the new handler's buffers."""
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF")
+    await client.get_status()
+
+    received: list[bytes] = []
+
+    def new_handler(_sender: int, data: bytearray) -> None:
+        received.append(bytes(data))
+
+    # Simulate the swap performed by an operation's _start_notify, with
+    # the straggler window armed (as it always is on the swap path).
+    client._active_handler = new_handler
+    client._straggler_drop_until = time.monotonic() + 1.0
+    stale = bytearray.fromhex("3210024200aaaaaa00014f0c10003c100000")
+    client._dispatch_notification(1, stale)
+    assert received == []  # dropped inside the window
+
+    client._straggler_drop_until = 0.0
+    client._dispatch_notification(1, stale)
+    assert received == [bytes(stale)]
+
+
+async def test_frames_without_active_handler_are_dropped(
+    established, no_settle
+) -> None:
+    """Between operations the subscription stays live but routes nowhere:
+    a stray notification must not reach any handler or raise."""
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF")
+    await client.get_status()
+    assert client._active_handler is None
+
+    stray = bytearray.fromhex("3210024200aaaaaa00014f0c10003c100000")
+    client._dispatch_notification(1, stray)  # must be a silent no-op
+
+
+# -- 0.3.2b10: release-before-connect serialization --------------------------
+
+
+async def test_pending_release_drained_before_reconnect(monkeypatch) -> None:
+    """A bounded background release is awaited before any new connection:
+    bleak-esphome disconnects by MAC, so a release racing a reconnect
+    kills the fresh link (issue #136's 'Cannot notify GATT
+    characteristic, not connected')."""
+    order: list[str] = []
+    created: list[FakeV2Client] = []
+
+    class SlowReleaseClient(FakeV2Client):
+        async def disconnect(self) -> None:
+            order.append("release")
+            await asyncio.sleep(0.05)
+            await super().disconnect()
+
+    async def fake_resolve(self):
+        return object()
+
+    async def fake_connect(self):
+        fake = FakeV2Client()
+        created.append(fake)
+        order.append("connect")
+        return fake
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", fake_resolve)
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+    monkeypatch.setattr("solem_blip_ble.client_v2.NOTIFY_SETTLE_DELAY", 0)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF")
+    # A stale, disconnected client: _run_operation's stale branch schedules
+    # its bounded background release, then (with the fix) drains it before
+    # connecting — the exact shape of attempt-1 failure followed by a
+    # retry reconnect.
+    stale = SlowReleaseClient()
+    stale.is_connected = False
+    client._active_client = stale
+
+    status = await client.get_status()
+    assert status["is_watering"] is True
+
+    # The new link was established only after the release completed.
+    assert order[0] == "release"
+    assert order[1] == "connect"
+    assert created[0].disconnects == 0  # fresh link untouched
+    assert client._active_client is created[0]

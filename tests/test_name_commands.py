@@ -273,6 +273,109 @@ async def test_get_station_name_snapshot_rejects_incomplete(
     assert fake.disconnects == 1
 
 
+class _SilentNameSession(_NameSession):
+    """Name session whose controller never answers the 35 00 read.
+
+    Mirrors the issue #136 dead-link shape: the write is accepted
+    (start_notify succeeded, _write succeeded) but zero notification
+    frames ever arrive, and the backend's is_connected still reads True
+    through the whole read — the proxy-side link death is only
+    discovered at teardown.
+    """
+
+    async def write_gatt_char(self, _uuid, payload, *, response) -> None:
+        self.writes.append(payload)
+        if payload[:1] == b"\x33":
+            self.mode = "write"
+            self.handler(1, bytearray(b"\x34" + payload[1:4]))
+            return
+        self.mode = "idle"
+
+
+async def test_zero_frame_read_raises_connection_error_not_invalid_snapshot(
+    established, monkeypatch
+):
+    """Issue #136: 0/12 frames must surface as SolemConnectionError.
+
+    A zero-frame response is a transport verdict. Reporting it as
+    InvalidSnapshot defeats the caller's retry heuristics (the
+    editor-open retry in solem-blip-ha intentionally does not retry
+    InvalidSnapshot from a dead link) and mislabels the failure in the
+    user-facing log.
+    """
+    fake = _SilentNameSession([])
+    _patch_connection(monkeypatch, fake)
+    monkeypatch.setattr(client_v2, "NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr(client_v2, "STATION_NAMES_IDLE_TIMEOUT", 0)
+    # Two empty windows must fit inside the stage deadline: the verdict
+    # fires on the second consecutive empty idle window, not the outer
+    # timeout.
+    monkeypatch.setattr(client_v2, "STATUS_NOTIFY_TIMEOUT", 1.0)
+    client = StatelessSolemClient(ADDRESS, max_station_num=6)
+    with pytest.raises(SolemConnectionError, match="unresponsive"):
+        await client.get_station_name_snapshot()
+    # The 35 00 write went out on the (silently dead) link...
+    assert fake.writes == [protocol.pack_get_station_names()]
+    # ...and the link was still torn down exactly once.
+    assert fake.disconnects == 1
+    # The verdict is NOT an InvalidSnapshot subclass masquerade:
+    with pytest.raises(SolemConnectionError) as exc_info:
+        await client.get_station_name_snapshot()
+    assert not isinstance(exc_info.value, __import__(
+        "solem_blip_ble.exceptions", fromlist=["InvalidSnapshot"]
+    ).InvalidSnapshot)
+
+
+async def test_late_frame_after_first_empty_window_still_accepted(
+    established, monkeypatch
+):
+    """The grace cycle after a first empty idle window is preserved.
+
+    One idle window elapses with zero frames, then the fragments land;
+    the read must still complete instead of condemning the link.
+    """
+    before = _snapshot({i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)})
+
+    class LateNameSession(_NameSession):
+        def __init__(self, read_frames: list[bytes]) -> None:
+            super().__init__(read_frames)
+            self.sent = False
+
+        async def write_gatt_char(self, _uuid, payload, *, response) -> None:
+            self.writes.append(payload)
+            if payload == protocol.pack_get_station_names() and not self.sent:
+                self.sent = True
+
+                async def deliver() -> None:
+                    # Land inside the SECOND idle window: after
+                    # STATION_NAMES_IDLE_TIMEOUT (0 in this test) has
+                    # already fired once with zero frames.
+                    await asyncio.sleep(0.01)
+                    for frame in self.read_frames:
+                        self.handler(1, bytearray(frame))
+
+                asyncio.create_task(deliver())
+                return
+            if payload[:1] == b"\x33":
+                self.mode = "write"
+                self.handler(1, bytearray(b"\x34" + payload[1:4]))
+                return
+            self.mode = "idle"
+
+    fake = LateNameSession(_frames_for(before))
+    _patch_connection(monkeypatch, fake)
+    monkeypatch.setattr(client_v2, "NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr(client_v2, "STATION_NAMES_IDLE_TIMEOUT", 0)
+    monkeypatch.setattr(client_v2, "STATUS_NOTIFY_TIMEOUT", 5.0)
+    client = StatelessSolemClient(ADDRESS, max_station_num=6)
+    snapshot = await client.get_station_name_snapshot()
+    assert snapshot.names == before.names
+    # The stateless executor always closes the link after the operation;
+    # what matters is the read completed with the full snapshot instead
+    # of failing on the first empty idle window.
+    assert fake.writes == [protocol.pack_get_station_names()]
+
+
 # Regression: the 0x34 write ack is a 4-byte echo '34 12 part station'
 # (hardware-validated); the 2-byte '34 00' generic ack must also count, and
 # a wrong-part echo must not satisfy the wait.

@@ -876,6 +876,9 @@ class StatelessSolemClient:
             await self._start_notify(client, notification_handler)
             try:
                 await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+                self._ensure_client(
+                    client, phase="station-name snapshot read"
+                )
                 return await self._read_station_names_on_connection(client, frames)
             finally:
                 await self._stop_notify(client)
@@ -888,7 +891,16 @@ class StatelessSolemClient:
     async def _read_station_names_on_connection(
         self, client: BleakClient, frames: list[bytes]
     ) -> StationNameSnapshot:
-        """Collect a complete name response on an already subscribed connection."""
+        """Collect a complete name response on an already subscribed connection.
+
+        A *silent* dead link — the ``35 00`` write accepted, then zero
+        notification frames through consecutive idle windows while the
+        backend still reports ``is_connected`` — surfaces as
+        :class:`SolemConnectionError` (issue #136), never as
+        :class:`InvalidSnapshot`: a zero-frame response is a transport
+        verdict, not a data verdict, and mislabelling it defeats both the
+        caller's retry heuristics and the error message the user sees.
+        """
         frames.clear()
         await self._write(client, protocol.pack_get_station_names())
         deadline = time.monotonic() + STATUS_NOTIFY_TIMEOUT
@@ -909,48 +921,70 @@ class StatelessSolemClient:
                 count = len(frames)
                 last_received = time.monotonic()
             if time.monotonic() - last_received >= STATION_NAMES_IDLE_TIMEOUT:
-                try:
-                    snapshot = StationNameSnapshot.from_frames(
-                        frames, self.max_station_num
-                    )
-                except InvalidSnapshot:
-                    # One grace cycle in case late fragments still arrive;
-                    # if the idle window elapsed again with no new frames,
-                    # the response is final and the verdict is precise —
-                    # never poll until the stage deadline and mask it as a
-                    # timeout/UncertainWrite.
-                    if len(frames) == last_rejected_count:
-                        raise
-                    last_rejected_count = len(frames)
+                # A zero-frame response is transport, not data: the write
+                # was accepted (or _write would have raised) yet not a
+                # single notification arrived. Issue #136 showed this
+                # shape is a dead link the backend's is_connected has not
+                # reflected yet (ESPHome proxies report GATT
+                # NOT_CONNECTED on the teardown that follows), so raise
+                # the connection error the caller's retry policy is
+                # written for instead of a misleading InvalidSnapshot.
+                # The first zero-frame idle window still grants the same
+                # grace cycle as a partial response; only the second
+                # consecutive empty window is the verdict. Nonzero
+                # partial responses keep the from_frames path below:
+                # those are genuine data verdicts.
+                if not frames:
+                    if last_rejected_count == 0:
+                        raise SolemConnectionError(
+                            "No station-name notifications received; "
+                            "the BLE link is unresponsive"
+                        )
+                    last_rejected_count = 0
                 else:
-                    # Adopt the device-reported station count (#57):
-                    # UPWARD-ONLY. The device ALWAYS reports every
-                    # configured slot in the name read (real captures:
-                    # 12 at every width), so slots with no onboard name
-                    # still arrive in the response and
-                    # snapshot.station_count (highest named output) can
-                    # legitimately be LOWER than the true width on fresh
-                    # installs whose names live HA-side. Shrinking to it
-                    # would drop live status for the higher stations (HA
-                    # would force-mark them inactive mid-program), so a
-                    # name read can only RAISE the count (e.g. a rename
-                    # names empty slot 7), never lower it: the
-                    # constructor width stays the floor. KNOWN
-                    # LIMITATION (S1, stale adoption): the raised floor
-                    # is deliberately never reset on disconnect —
-                    # reconnection keeps the wider count until process
-                    # replacement (no reset mechanism by design here).
-                    adopted = snapshot.station_count
-                    if not any(snapshot.names.values()):
-                        # D2: with no named output at all, the snapshot
-                        # count is the all-empty fallback (highest
-                        # reported slot, can reach 12) which EXCEEDS the
-                        # validated width; clamp it so the fallback can
-                        # never push the adopted count above
-                        # max_station_num through the max() below.
-                        adopted = min(adopted, self.max_station_num)
-                    self.station_count = max(self.station_count, adopted)
-                    return snapshot
+                    try:
+                        snapshot = StationNameSnapshot.from_frames(
+                            frames, self.max_station_num
+                        )
+                    except InvalidSnapshot:
+                        # One grace cycle in case late fragments still
+                        # arrive; if the idle window elapsed again with
+                        # no new frames, the response is final and the
+                        # verdict is precise — never poll until the
+                        # stage deadline and mask it as a
+                        # timeout/UncertainWrite.
+                        if len(frames) == last_rejected_count:
+                            raise
+                        last_rejected_count = len(frames)
+                    else:
+                        # Adopt the device-reported station count (#57):
+                        # UPWARD-ONLY. The device ALWAYS reports every
+                        # configured slot in the name read (real captures:
+                        # 12 at every width), so slots with no onboard name
+                        # still arrive in the response and
+                        # snapshot.station_count (highest named output) can
+                        # legitimately be LOWER than the true width on fresh
+                        # installs whose names live HA-side. Shrinking to it
+                        # would drop live status for the higher stations (HA
+                        # would force-mark them inactive mid-program), so a
+                        # name read can only RAISE the count (e.g. a rename
+                        # names empty slot 7), never lower it: the
+                        # constructor width stays the floor. KNOWN
+                        # LIMITATION (S1, stale adoption): the raised floor
+                        # is deliberately never reset on disconnect —
+                        # reconnection keeps the wider count until process
+                        # replacement (no reset mechanism by design here).
+                        adopted = snapshot.station_count
+                        if not any(snapshot.names.values()):
+                            # D2: with no named output at all, the snapshot
+                            # count is the all-empty fallback (highest
+                            # reported slot, can reach 12) which EXCEEDS the
+                            # validated width; clamp it so the fallback can
+                            # never push the adopted count above
+                            # max_station_num through the max() below.
+                            adopted = min(adopted, self.max_station_num)
+                        self.station_count = max(self.station_count, adopted)
+                        return snapshot
             await asyncio.sleep(0.05)
         raise InvalidSnapshot("Timeout waiting for complete station names")
 
@@ -989,6 +1023,9 @@ class StatelessSolemClient:
             await self._start_notify(client, session.handle_notification)
             try:
                 await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+                self._ensure_client(
+                    client, phase="station-name write preflight"
+                )
                 self.station_name_write_diagnostics["phase"] = "preflight"
                 current = await self._read_station_names_on_connection(
                     client, session.read_frames

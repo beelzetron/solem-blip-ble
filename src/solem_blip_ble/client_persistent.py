@@ -23,6 +23,20 @@ guarantee:
 - **Optional idle release**: with ``idle_release_seconds`` set, the link is
   released after that much idle time, and the timer is rescheduled by
   activity.
+- **Single subscription per connection** (0.3.2b10): on a held
+  connection the notify CCCD is written exactly once and the subscription
+  lives for the connection's lifetime; per-operation handlers are routed
+  through an in-memory dispatcher instead of disable/re-enable cycles on
+  the shared notify characteristic. FW5 controllers stop delivering
+  notifications after a CCCD disable→re-enable cycle without reconnect
+  (issue #136), so the stateless per-operation subscribe/unsubscribe is
+  not safe to replay on a reused link.
+- **Release-before-connect serialization** (0.3.2b10): a bounded
+  background release is awaited before any new connection is established.
+  bleak-esphome disconnects *by MAC address*, so a release still in
+  flight when a retry reconnects tears down the fresh link instead of
+  the dead one (#136: the ``Cannot notify GATT characteristic, not
+  connected`` failures).
 
 Single-connection device behavior: the BL-IP controller stops advertising
 during and for tens of seconds after a connect attempt, so connect-phase
@@ -68,6 +82,9 @@ from .client_v2 import (
     _DropDetected,
     StatelessSolemClient,
 )
+# Imported as a module (not from-imported) so the straggler window always
+# reads the same live constant the operations settle on.
+from . import client_v2 as _v2
 from .const import (
     DEFAULT_BLUETOOTH_TIMEOUT,
     MAX_STATION_NUM,
@@ -128,6 +145,19 @@ class PersistentSolemClient(StatelessSolemClient):
         self._session_lock = asyncio.Lock()
         self._session_generation = 0
         self._idle_task: asyncio.Task[None] | None = None
+        # Single-subscription routing state (0.3.2b10). The CCCD is written
+        # once per connection; per-operation handlers are swapped in memory.
+        self._dispatch_client: BleakClient | None = None
+        self._active_handler: Callable[[Any, bytearray], None] | None = None
+        # Frames arriving this soon after a handler swap can only be
+        # stragglers of the previous operation (no operation writes its
+        # command before the settle delay), so they are dropped instead of
+        # being misdelivered to the new handler's buffers.
+        self._straggler_drop_until = 0.0
+        # Bounded background releases still in flight; awaited before any
+        # new connection so a MAC-addressed disconnect can never reach a
+        # fresh link (0.3.2b10).
+        self._pending_releases: set[asyncio.Task[None]] = set()
 
     # -- teardown / invalidation -------------------------------------------
 
@@ -141,6 +171,77 @@ class PersistentSolemClient(StatelessSolemClient):
         self._link_dropped = False
         self._drop_event.clear()
         self._session_generation += 1
+        # The subscription dies with the connection; the next connect
+        # re-subscribes for real.
+        self._dispatch_client = None
+        self._active_handler = None
+        self._straggler_drop_until = 0.0
+
+    def _dispatch_notification(
+        self, sender: int, data: bytearray
+    ) -> None:
+        """Route one notification to the in-flight operation's handler.
+
+        Called by bleak for every notification on the single shared notify
+        characteristic. Frames with no active handler (between operations)
+        or within the post-swap straggler window (responses to the previous
+        operation) are dropped.
+        """
+        handler = self._active_handler
+        if handler is None:
+            return
+        if time.monotonic() < self._straggler_drop_until:
+            return
+        handler(sender, data)
+
+    async def _start_notify(
+        self,
+        client: BleakClient,
+        handler: Callable[[Any, bytearray], None],
+    ) -> None:
+        """Subscribe once per connection; afterwards swap handlers only.
+
+        Overrides the stateless per-operation subscribe/unsubscribe: on a
+        held connection a CCCD disable→re-enable cycle makes FW5 stop
+        delivering notifications entirely (issue #136), so the CCCD write
+        happens exactly once per connection and the per-operation handler
+        is installed in memory. The straggler window covers the settle
+        delay, during which no operation has written its command yet —
+        anything arriving there belongs to the previous operation.
+        """
+        if self._dispatch_client is client and client.is_connected:
+            self._active_handler = handler
+            # The window must cover exactly the operation's own pre-write
+            # settle delay (ops sleep NOTIFY_SETTLE_DELAY between the swap
+            # and their first write) — read it live from the client_v2
+            # module so the invariant holds under test patching too.
+            self._straggler_drop_until = (
+                time.monotonic() + _v2.NOTIFY_SETTLE_DELAY
+            )
+            return
+        # Real subscribe on a fresh connection. Clear routing state first:
+        # notifications may start arriving while start_notify is awaited,
+        # and frames before the operation's first write carry no data.
+        self._dispatch_client = None
+        self._active_handler = None
+        await super()._start_notify(client, self._dispatch_notification)
+        self._dispatch_client = client
+        self._active_handler = handler
+        self._straggler_drop_until = 0.0
+
+    async def _stop_notify(self, client: BleakClient) -> None:
+        """Keep the subscription; only stop routing to the finished op.
+
+        The stateless client unsubscribes here (CCCD write), which on a
+        reused connection is the first half of the FW5-killing
+        disable→re-enable cycle (issue #136). The subscription instead
+        lives until the connection is torn down; the CCCD state resets
+        server-side on disconnect.
+        """
+        if self._dispatch_client is client:
+            self._active_handler = None
+            return
+        await super()._stop_notify(client)
 
     def _schedule_background_disconnect(self, client: BleakClient) -> None:
         """Detach a bounded background disconnect for the given client."""
@@ -160,7 +261,29 @@ class PersistentSolemClient(StatelessSolemClient):
                 )
 
         task = asyncio.create_task(_release())
+        self._pending_releases.add(task)
+        task.add_done_callback(self._pending_releases.discard)
         task.add_done_callback(_consume_task_exception)
+
+    async def _drain_pending_releases(self, timeout: float) -> None:
+        """Await in-flight background releases before establishing a link.
+
+        bleak-esphome disconnects *by MAC address*, so a release still
+        running when a fresh connection is established tears down the new
+        link instead of the dead one — the historic ``Cannot notify GATT
+        characteristic, not connected`` retry failures (issue #136).
+        Serializing release-then-connect makes the release unable to reach
+        a link it does not own.
+        """
+        tasks = [t for t in self._pending_releases if not t.done()]
+        if not tasks:
+            return
+        _LOGGER.debug(
+            "%s - Awaiting %d pending release(s) before reconnect",
+            self.mac_address,
+            len(tasks),
+        )
+        await asyncio.wait(tasks, timeout=max(timeout, 0.0))
 
     # -- idle release --------------------------------------------------------
 
@@ -286,6 +409,11 @@ class PersistentSolemClient(StatelessSolemClient):
                             )
                             self._reset_session_state()
                             self._schedule_background_disconnect(stale)
+                        # Never let an in-flight release (including the one
+                        # just scheduled above) race the new connect: the
+                        # backend disconnects by MAC and would kill the
+                        # fresh link (issue #136).
+                        await self._drain_pending_releases(remaining)
                         client = await self._connect_within(remaining)
                         self._active_client = client
                     connect_succeeded = True

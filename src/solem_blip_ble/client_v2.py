@@ -876,6 +876,9 @@ class StatelessSolemClient:
             await self._start_notify(client, notification_handler)
             try:
                 await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+                self._ensure_client(
+                    client, phase="station-name snapshot read"
+                )
                 return await self._read_station_names_on_connection(client, frames)
             finally:
                 await self._stop_notify(client)
@@ -1020,6 +1023,9 @@ class StatelessSolemClient:
             await self._start_notify(client, session.handle_notification)
             try:
                 await asyncio.sleep(NOTIFY_SETTLE_DELAY)
+                self._ensure_client(
+                    client, phase="station-name write preflight"
+                )
                 self.station_name_write_diagnostics["phase"] = "preflight"
                 current = await self._read_station_names_on_connection(
                     client, session.read_frames

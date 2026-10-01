@@ -606,6 +606,32 @@ class PersistentSolemClient(StatelessSolemClient):
 
     # -- public API ----------------------------------------------------------
 
+    async def hold_link(self) -> None:
+        """Establish (or reuse) the persistent link without a transaction.
+
+        Diagnostic/coordination primitive for the #136 probe: connects,
+        writes the single per-connection CCCD subscription, arms the idle
+        release, and returns — no controller transaction is issued, so a
+        caller can measure whether a plain post-connect wait changes the
+        outcome of the first ``35 00`` request. A subsequent operation
+        reuses the held link like any other. Safe on a mock client (no-op).
+        """
+        if self.mock:
+            return
+
+        async def _hold(client: BleakClient) -> None:
+            # Subscribe at hold time, not inside the first transaction: the
+            # single per-connection CCCD write must land BEFORE the wait, so
+            # the wait measures the controller's post-connect state and not
+            # the CCCD write itself (0.3.2b10 single-subscription contract).
+            await self._start_notify(client, self._dispatch_notification)
+            # End the op like every other one: subscription kept at the BLE
+            # level, routing disabled until the next operation swaps in.
+            await self._stop_notify(client)
+            return None
+
+        await self._run_operation(_hold, retry_safe=False)
+
     async def disconnect(self) -> None:
         """Close the persistent connection.
 

@@ -1099,6 +1099,58 @@ async def _probe_shape_a(
     return step
 
 
+async def _probe_shape_a2(
+    mac: str,
+    connect_timeout: float,
+    max_stations: int,
+    delay: float,
+) -> list[StepResult]:
+    """Hold a fresh link, wait ``delay`` s, then read the names.
+
+    Discriminates "the status transaction warms the link" (the #136 probe
+    matrix's working theory) from "the link merely needs settle time after
+    connect": the held link here is exactly as fresh as shape A's, only
+    older by the wait. A-fails/A2-works => a plain post-connect wait is the
+    fix; A and A2 both fail => waiting alone does not help.
+    """
+    client = PersistentSolemClient(
+        mac,
+        bluetooth_timeout=connect_timeout,
+        max_station_num=max_stations,
+    )
+    try:
+        hold_step = StepResult(
+            f"shape A2: hold fresh link ({delay:.0f}s wait planned)", False
+        )
+        started = monotonic()
+        try:
+            await client.hold_link()
+            hold_step.ok = True
+            hold_step.detail = f"held in {monotonic() - started:.1f}s"
+        except (SolemConnectionError, RetryError) as exc:
+            hold_step.detail = _connection_detail(exc)
+            return [hold_step]
+
+        await asyncio.sleep(delay)
+        name_step = StepResult(
+            f"shape A2: name read after {delay:.0f}s on the fresh-held link",
+            False,
+        )
+        started = monotonic()
+        try:
+            snapshot = await client.get_station_name_snapshot()
+            name_step.ok = True
+            name_step.detail = (
+                f"ok in {monotonic() - started:.1f}s; "
+                f"{snapshot.reported_count} output(s) reported"
+            )
+        except (SolemConnectionError, RetryError) as exc:
+            name_step.detail = _connection_detail(exc)
+        return [hold_step, name_step]
+    finally:
+        await client.disconnect()
+
+
 async def _probe_shape_b(
     mac: str,
     connect_timeout: float,
@@ -1147,21 +1199,37 @@ async def _probe_shape_b(
 
 def _print_probe_verdict(report: list[StepResult]) -> None:
     """Interpret the shape matrix per the #136 discriminating plan."""
-    a_steps = [s for s in report if s.name.startswith("shape A")]
+    # "shape A:" (not "shape A") so the optional shape A2 steps don't match.
+    a_steps = [s for s in report if s.name.startswith("shape A:")]
+    a2_name_steps = [
+        s for s in report if s.name.startswith("shape A2: name read")
+    ]
     b_name_steps = [
         s for s in report if s.name.startswith("shape B: name read")
     ]
     print("-" * 60)
-    if a_steps and all(s.ok for s in a_steps) and b_name_steps and not any(
-        s.ok for s in b_name_steps
-    ):
+    a_fails = bool(a_steps) and not any(s.ok for s in a_steps)
+    b_name_fails = bool(b_name_steps) and not any(s.ok for s in b_name_steps)
+    if a_steps and all(s.ok for s in a_steps) and b_name_fails:
         print(
             "Result: name-first works, status-then-name fails — the "
             "trigger is the preceding commit on the same link."
         )
-    elif a_steps and not any(s.ok for s in a_steps) and b_name_steps and not any(
-        s.ok for s in b_name_steps
+    elif a_fails and b_name_fails and a2_name_steps and any(
+        s.ok for s in a2_name_steps
     ):
+        print(
+            "Result: a plain post-connect wait is enough — shape A2 "
+            "(wait, no status op) read the names. The status transaction "
+            "is irrelevant; delay the first name read after connect."
+        )
+    elif a_fails and b_name_fails and a2_name_steps:
+        print(
+            "Result: waiting alone does not help — shape A2 also failed; "
+            "the status transaction itself warms the link (rerun with "
+            "more repeats to confirm)."
+        )
+    elif a_fails and b_name_fails:
         print(
             "Result: both shapes fail — this firmware refuses the 35 00 "
             "request in every state."
@@ -1187,9 +1255,15 @@ async def _probe_name_read(args: argparse.Namespace) -> int:
     """
     print("solem-blip-ble #136 name-read probe (persistent client)")
     print(f"MAC:      {args.mac}")
+    a2_note = (
+        f", shape A2 delay {args.probe_shape_a_delay:.0f}s"
+        if args.probe_shape_a_delay > 0
+        else ""
+    )
     print(
         f"Repeats:  {args.probe_repeats} "
-        f"(delay {args.probe_delay:.0f}s, settle {args.probe_between:.0f}s)"
+        f"(delay {args.probe_delay:.0f}s, settle {args.probe_between:.0f}s"
+        f"{a2_note})"
     )
     print("-" * 60)
     report: list[StepResult] = []
@@ -1201,6 +1275,18 @@ async def _probe_name_read(args: argparse.Namespace) -> int:
         )
         _print_step(step)
         report.append(step)
+        if args.probe_shape_a_delay > 0:
+            # Let the controller leave the post-disconnect quiet window
+            # before shape A2 opens its own connection.
+            await asyncio.sleep(args.probe_between)
+            for step in await _probe_shape_a2(
+                args.mac,
+                args.connect_timeout,
+                args.max_stations,
+                args.probe_shape_a_delay,
+            ):
+                _print_step(step)
+                report.append(step)
         # Let the controller leave the post-disconnect quiet window
         # before shape B opens its own connection.
         await asyncio.sleep(args.probe_between)
@@ -1425,6 +1511,16 @@ Examples:
         type=float,
         default=5.0,
         help="Seconds between status poll and name read in the status-then-name shape (default: 5)",
+    )
+    parser.add_argument(
+        "--probe-shape-a-delay",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, run an extra 'shape A2': hold a fresh link, wait this "
+            "many seconds, then read names — discriminating a plain "
+            "post-connect wait from the status transaction (default: off)"
+        ),
     )
     parser.add_argument(
         "--probe-repeats",

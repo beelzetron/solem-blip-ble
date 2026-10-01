@@ -37,6 +37,13 @@ guarantee:
   flight when a retry reconnects tears down the fresh link instead of
   the dead one (#136: the ``Cannot notify GATT characteristic, not
   connected`` failures).
+- **In-place retry of a silent name request** (0.3.2b11): the shared
+  zero-frame verdict (:class:`~solem_blip_ble.exceptions.SolemSilentLink`)
+  is answered with re-requests on the SAME held link — spaced by
+  :data:`NAME_READ_IN_PLACE_DELAY` — before it is allowed to fail the
+  operation. The FW 5.1.5 capture (#136) proved a link can be healthy
+  yet silent to the ``35 00`` request; tearing it down then guarantees
+  the next connect lands in the post-disconnect quiet window.
 
 Single-connection device behavior: the BL-IP controller stops advertising
 during and for tens of seconds after a connect attempt, so connect-phase
@@ -92,7 +99,8 @@ from .const import (
     REQUEST_MAX_ATTEMPTS,
     REQUEST_RETRY_DELAY,
 )
-from .exceptions import SolemConnectionError, SolemDeadlineExceeded
+from .exceptions import SolemConnectionError, SolemDeadlineExceeded, SolemSilentLink
+from .station_names import StationNameSnapshot
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -102,6 +110,16 @@ _T = TypeVar("_T")
 # disconnect must never block the next operation or the idle/disconnect
 # path (0.1.x #31/#32 pattern).
 RELEASE_DISCONNECT_TIMEOUT = 5.0
+
+# In-place retry of a silent name request on a HELD link (issue #136).
+# The FW 5.1.5 capture of 2026-09-30 showed the controller holding a
+# healthy link (status notification seconds earlier) yet never answering
+# the ``35 00`` request; tearing the session down for that verdict buys a
+# post-disconnect quiet window in which the next connect is guaranteed to
+# fail. The verdict is instead answered with re-requests on the same
+# link, spaced by the delay, before it is allowed to fail the operation.
+NAME_READ_IN_PLACE_RETRIES = 2
+NAME_READ_IN_PLACE_DELAY = 5.0
 
 
 def _consume_task_exception(task: asyncio.Task[Any]) -> None:
@@ -284,6 +302,64 @@ class PersistentSolemClient(StatelessSolemClient):
             len(tasks),
         )
         await asyncio.wait(tasks, timeout=max(timeout, 0.0))
+
+    # -- silent name-request recovery (issue #136) ---------------------------
+
+    async def _read_station_names_on_connection(
+        self, client: BleakClient, frames: list[bytes]
+    ) -> StationNameSnapshot:
+        """Answer a silent name request in place before tearing the link down.
+
+        Issue #136 (FW 5.1.5, 2026-09-30 capture): the controller can hold
+        a demonstrably healthy link — a status notification arrived on it
+        seconds earlier — yet never answer the ``35 00`` request. The
+        shared zero-frame verdict treats that as a dead link, and the
+        resulting teardown is worse than the silence: on a
+        single-connection controller the disconnect opens a
+        post-disconnect quiet window in which the next connect is
+        guaranteed to fail, so a link that was merely silent becomes one
+        that is unreachable for tens of seconds.
+
+        On a held connection the verdict is therefore first answered with
+        an in-place re-request on the SAME link (after
+        :data:`NAME_READ_IN_PLACE_DELAY`), up to
+        :data:`NAME_READ_IN_PLACE_RETRIES` times — the request is a pure
+        read, so re-issuing it with zero frames collected is stateless and
+        safe. Only when the controller stays silent through every
+        re-request does the original :class:`SolemSilentLink` verdict
+        propagate to the executor, which invalidates the session and
+        reconnects exactly as before. A confirmed-dead link
+        (``is_connected`` False) or a partial/invalid response is never
+        retried in place: those keep their precise stateless verdicts.
+        """
+        attempts_left = NAME_READ_IN_PLACE_RETRIES
+        while True:
+            try:
+                return await super()._read_station_names_on_connection(
+                    client, frames
+                )
+            except SolemSilentLink:
+                if (
+                    client is not self._active_client
+                    or not client.is_connected
+                    or attempts_left <= 0
+                ):
+                    raise
+            attempts_left -= 1
+            _LOGGER.debug(
+                "%s - Station-name request unanswered on the held link; "
+                "re-requesting in place (retry %d/%d)",
+                self.mac_address,
+                NAME_READ_IN_PLACE_RETRIES - attempts_left,
+                NAME_READ_IN_PLACE_RETRIES,
+            )
+            await asyncio.sleep(NAME_READ_IN_PLACE_DELAY)
+            if not client.is_connected:
+                # The link died during the wait: hand the precise dead-link
+                # verdict to the executor instead of another write.
+                raise SolemConnectionError(
+                    "BLE link dropped during station-name read"
+                )
 
     # -- idle release --------------------------------------------------------
 

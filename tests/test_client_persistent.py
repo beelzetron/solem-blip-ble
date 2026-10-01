@@ -374,6 +374,30 @@ async def test_reuses_one_connection_across_operations(
     assert established[0].writes.count(bytes.fromhex("3b00")) == 2
 
 
+async def test_hold_link_connects_without_transaction(established) -> None:
+    """hold_link establishes the session but issues no controller writes."""
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF")
+    await client.hold_link()
+
+    assert len(established) == 1
+    assert established[0].writes == []
+    # Subscription is routed for the connection lifetime, like after any op.
+    assert established[0].handler == client._dispatch_notification
+    assert client._active_handler is None
+
+    # A subsequent operation reuses the held link (still ONE connect).
+    status = await client.get_status()
+    assert status["is_watering"] is True
+    assert len(established) == 1
+    assert established[0].writes.count(bytes.fromhex("3b00")) == 1
+
+
+async def test_hold_link_on_mock_client_is_noop() -> None:
+    """The mock client has no BLE operations; hold_link must not raise."""
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF", mock=True)
+    await client.hold_link()
+
+
 class _SnapshotNameClient(FakeV2Client):
     """Fake answering the 0x35 all-names read with full name frames."""
 

@@ -18,6 +18,7 @@ from bleak.exc import BleakError
 
 from solem_blip_ble import (
     IrrigationProgram,
+    PersistentSolemClient,
     SolemClient,
     SolemConnectionError,
     assemble_irrigation_programs,
@@ -1077,6 +1078,143 @@ def _replay_schedule_write(
     return ok
 
 
+async def _probe_shape_a(
+    mac: str, connect_timeout: float, max_stations: int
+) -> StepResult:
+    """Name snapshot as the FIRST operation on a fresh connection."""
+    step = StepResult("shape A: name-first (fresh connection)", False)
+    client = PersistentSolemClient(
+        mac,
+        bluetooth_timeout=connect_timeout,
+        max_station_num=max_stations,
+    )
+    try:
+        snapshot = await client.get_station_name_snapshot()
+        step.ok = True
+        step.detail = f"{snapshot.reported_count} output(s) reported"
+    except (SolemConnectionError, RetryError) as exc:
+        step.detail = _connection_detail(exc)
+    finally:
+        await client.disconnect()
+    return step
+
+
+async def _probe_shape_b(
+    mac: str,
+    connect_timeout: float,
+    max_stations: int,
+    delay: float,
+) -> list[StepResult]:
+    """Status poll, then the name snapshot on the same held link."""
+    client = PersistentSolemClient(
+        mac,
+        bluetooth_timeout=connect_timeout,
+        max_station_num=max_stations,
+    )
+    try:
+        status_step = StepResult(
+            "shape B: status poll (link holder)", False
+        )
+        started = monotonic()
+        try:
+            status = await client.get_status()
+            status_step.ok = True
+            status_step.detail = (
+                f"ok in {monotonic() - started:.1f}s; "
+                f"{format_status(status)}"
+            )
+        except (SolemConnectionError, RetryError) as exc:
+            status_step.detail = _connection_detail(exc)
+            return [status_step]
+
+        name_step = StepResult(
+            f"shape B: name read after {delay:.0f}s on the held link", False
+        )
+        started = monotonic()
+        try:
+            snapshot = await client.get_station_name_snapshot()
+            name_step.ok = True
+            name_step.detail = (
+                f"ok in {monotonic() - started:.1f}s; "
+                f"{snapshot.reported_count} output(s) reported"
+            )
+        except (SolemConnectionError, RetryError) as exc:
+            name_step.detail = _connection_detail(exc)
+        return [status_step, name_step]
+    finally:
+        await client.disconnect()
+
+
+def _print_probe_verdict(report: list[StepResult]) -> None:
+    """Interpret the shape matrix per the #136 discriminating plan."""
+    a_steps = [s for s in report if s.name.startswith("shape A")]
+    b_name_steps = [
+        s for s in report if s.name.startswith("shape B: name read")
+    ]
+    print("-" * 60)
+    if a_steps and all(s.ok for s in a_steps) and b_name_steps and not any(
+        s.ok for s in b_name_steps
+    ):
+        print(
+            "Result: name-first works, status-then-name fails — the "
+            "trigger is the preceding commit on the same link."
+        )
+    elif a_steps and not any(s.ok for s in a_steps) and b_name_steps and not any(
+        s.ok for s in b_name_steps
+    ):
+        print(
+            "Result: both shapes fail — this firmware refuses the 35 00 "
+            "request in every state."
+        )
+    else:
+        print(
+            "Result: mixed outcome — rerun with more repeats before "
+            "drawing a conclusion."
+        )
+
+
+async def _probe_name_read(args: argparse.Namespace) -> int:
+    """Run the two discriminating issue-#136 shapes (read-only).
+
+    Shape A reads the station-name snapshot as the first operation on a
+    fresh connection; shape B polls status first and reads the names
+    after ``--probe-delay`` seconds on the same held link. A succeeds
+    while B fails => the trigger is the preceding commit on the same
+    link; both fail => the controller refuses the ``35 00`` request in
+    every state on this firmware. A silent name request on the held
+    link is answered with in-place re-requests (0.3.2b11) before any
+    teardown, which is visible in the verbose step detail.
+    """
+    print("solem-blip-ble #136 name-read probe (persistent client)")
+    print(f"MAC:      {args.mac}")
+    print(
+        f"Repeats:  {args.probe_repeats} "
+        f"(delay {args.probe_delay:.0f}s, settle {args.probe_between:.0f}s)"
+    )
+    print("-" * 60)
+    report: list[StepResult] = []
+    for repeat in range(1, args.probe_repeats + 1):
+        if args.probe_repeats > 1:
+            print(f"--- repeat {repeat}/{args.probe_repeats} ---")
+        step = await _probe_shape_a(
+            args.mac, args.connect_timeout, args.max_stations
+        )
+        _print_step(step)
+        report.append(step)
+        # Let the controller leave the post-disconnect quiet window
+        # before shape B opens its own connection.
+        await asyncio.sleep(args.probe_between)
+        for step in await _probe_shape_b(
+            args.mac, args.connect_timeout, args.max_stations, args.probe_delay
+        ):
+            _print_step(step)
+            report.append(step)
+        if repeat < args.probe_repeats:
+            await asyncio.sleep(args.probe_between)
+    _print_probe_verdict(report)
+    return 0
+
+
 def _replay(args: argparse.Namespace) -> int:
     include_actions = any(
         section in (args.only or []) for section in ("actions", "schedule_write")
@@ -1169,6 +1307,7 @@ Capture modes:
   --capture --actions --run-program 1   Program A run for --minutes, then stop
   --capture --write-schedule 2          Write a small Program B schedule, then read back
   --capture-off-days 3   Turn off for 3 days, capture status, then turn back on
+  --probe-name-read      Discriminating #136 shapes: name-first vs status-then-name
 
 Examples:
   validate-solem-blip AA:BB:CC:DD:EE:FF
@@ -1178,6 +1317,7 @@ Examples:
   validate-solem-blip AA:BB:CC:DD:EE:FF --capture --actions --run-program 1 --minutes 1
   validate-solem-blip AA:BB:CC:DD:EE:FF --capture --write-schedule 2 --write-schedule-station 5
   validate-solem-blip AA:BB:CC:DD:EE:FF --capture-off-days 3 --verbose
+  validate-solem-blip AA:BB:CC:DD:EE:FF --probe-name-read --verbose
   validate-solem-blip AA:BB:CC:DD:EE:FF --replay capture.jsonl --only schedule_write
   validate-solem-blip AA:BB:CC:DD:EE:FF --replay capture.jsonl --only actions
   validate-solem-blip AA:BB:CC:DD:EE:FF --actions --run-program 1 --minutes 1
@@ -1201,6 +1341,14 @@ Examples:
         type=Path,
         metavar="PATH",
         help="Replay and decode one or more JSONL captures offline",
+    )
+    mode.add_argument(
+        "--probe-name-read",
+        action="store_true",
+        help=(
+            "Run the two discriminating issue-#136 shapes with the "
+            "persistent client: name-first vs status-then-name"
+        ),
     )
     parser.add_argument(
         "--only",
@@ -1271,6 +1419,24 @@ Examples:
         choices=range(1, len(PROGRAM_LABELS) + 1),
         metavar="N",
         help="Run program N (1=A, 2=B, 3=C) instead of manual station sprinkle",
+    )
+    parser.add_argument(
+        "--probe-delay",
+        type=float,
+        default=5.0,
+        help="Seconds between status poll and name read in the status-then-name shape (default: 5)",
+    )
+    parser.add_argument(
+        "--probe-repeats",
+        type=int,
+        default=1,
+        help="How many times to run both probe shapes (default: 1)",
+    )
+    parser.add_argument(
+        "--probe-between",
+        type=float,
+        default=20.0,
+        help="Seconds between probe shapes/repeats so the controller can settle (default: 20)",
     )
     parser.add_argument(
         "--max-stations",
@@ -1364,6 +1530,29 @@ async def _async_main(args: argparse.Namespace) -> int:
     if args.capture_off_days is not None and args.actions:
         print("--capture-off-days cannot be combined with --actions", file=sys.stderr)
         return 2
+    if args.probe_name_read and args.capture:
+        print("--probe-name-read cannot be combined with --capture", file=sys.stderr)
+        return 2
+    if args.probe_name_read and args.replay:
+        print("--probe-name-read cannot be combined with --replay", file=sys.stderr)
+        return 2
+    if args.probe_name_read and args.capture_off_days is not None:
+        print(
+            "--probe-name-read cannot be combined with --capture-off-days",
+            file=sys.stderr,
+        )
+        return 2
+    if args.probe_name_read and args.actions:
+        print("--probe-name-read cannot be combined with --actions", file=sys.stderr)
+        return 2
+    if args.probe_name_read and args.write_schedule_program is not None:
+        print(
+            "--probe-name-read cannot be combined with --write-schedule",
+            file=sys.stderr,
+        )
+        return 2
+    if args.probe_name_read:
+        return await _probe_name_read(args)
     if args.capture_off_days is not None:
         if args.capture == "auto" or args.capture is None:
             args.capture = default_capture_output(args.capture_prefix)

@@ -81,6 +81,7 @@ from .exceptions import (
     ProgramWriteRejected,
     SolemConnectionError,
     SolemDeadlineExceeded,
+    SolemSilentLink,
     SolemTimeSyncBusy,
     SolemTimeSyncRejected,
     SolemTimeSyncVerificationFailed,
@@ -936,7 +937,12 @@ class StatelessSolemClient:
                 # those are genuine data verdicts.
                 if not frames:
                     if last_rejected_count == 0:
-                        raise SolemConnectionError(
+                        # SolemSilentLink, not a bare SolemConnectionError:
+                        # the persistent client answers this verdict with an
+                        # in-place re-request on the same link (issue #136)
+                        # and must be able to tell it apart from a confirmed
+                        # dead link without string-matching the message.
+                        raise SolemSilentLink(
                             "No station-name notifications received; "
                             "the BLE link is unresponsive"
                         )

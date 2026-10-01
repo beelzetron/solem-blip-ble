@@ -18,6 +18,17 @@ class InvalidSnapshot(SolemConnectionError):
     """The configuration cannot be safely interpreted or edited."""
 
 
+class SolemSilentLink(SolemConnectionError):
+    """The controller accepted a request but answered with zero frames.
+
+    Distinct from a confirmed-dead link (``is_connected`` False) and from
+    a partial/invalid response (:class:`InvalidSnapshot`): the link *may*
+    still be alive and merely unresponsive to this one request (issue
+    #136, FW 5.1.5), so a persistent-connection caller can answer it with
+    an in-place re-request instead of a teardown.
+    """
+
+
 class StaleProgram(SolemConnectionError):
     """The controller changed since the draft was opened."""
 

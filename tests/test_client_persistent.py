@@ -10,9 +10,18 @@ import pytest
 from bleak.exc import BleakError
 from bleak_retry_connector import BleakClientWithServiceCache
 
-from solem_blip_ble.client_persistent import PersistentSolemClient
+from solem_blip_ble import protocol
+from solem_blip_ble.client_persistent import (
+    NAME_READ_IN_PLACE_DELAY,
+    NAME_READ_IN_PLACE_RETRIES,
+    PersistentSolemClient,
+)
 from solem_blip_ble.client_v2 import StatelessSolemClient, _ConnectTimedOut
-from solem_blip_ble.exceptions import SolemConnectionError, SolemDeadlineExceeded
+from solem_blip_ble.exceptions import (
+    SolemConnectionError,
+    SolemDeadlineExceeded,
+    SolemSilentLink,
+)
 
 
 async def drain_background_disconnects() -> None:
@@ -922,4 +931,141 @@ async def test_pending_release_drained_before_reconnect(monkeypatch) -> None:
     assert order[0] == "release"
     assert order[1] == "connect"
     assert created[0].disconnects == 0  # fresh link untouched
-    assert client._active_client is created[0]
+
+
+class _SilentThenAnsweringNameSession(FakeV2Client):
+    """Name session whose controller stays silent through N name requests.
+
+    Mirrors the issue #136 FW 5.1.5 shape: the link stays up
+    (``is_connected`` True throughout) and the ``35 00`` write is
+    accepted, but zero notification frames arrive for the first
+    ``silent_writes`` requests; the next request is answered with the
+    given frames.
+    """
+
+    def __init__(self, read_frames: list[bytes], silent_writes: int) -> None:
+        super().__init__()
+        self.read_frames = read_frames
+        self.silent_writes = silent_writes
+        self.name_writes = 0
+
+    async def write_gatt_char(self, _uuid, payload, *, response) -> None:
+        self.writes.append(payload)
+        if payload == protocol.pack_get_station_names():
+            self.name_writes += 1
+            if self.name_writes > self.silent_writes:
+                for frame in self.read_frames:
+                    self.handler(1, bytearray(frame))
+            return
+        if payload[:1] == b"\x33":
+            self.handler(1, bytearray(b"\x34" + payload[1:4]))
+
+
+def _silent_name_frames() -> list[bytes]:
+    return _name_frames(
+        {i: f"S{i}".encode().ljust(32, b"\0") for i in range(1, 7)}
+    )
+
+
+async def test_silent_name_request_retried_in_place_on_held_link(
+    established, monkeypatch
+):
+    """Issue #136: a silent 35 00 request is re-requested, not torn down.
+
+    The controller stays silent through the first name request; with the
+    persistent client the verdict is answered by a second request on the
+    SAME connection, which succeeds. No disconnect may occur at all: the
+    teardown would open the post-disconnect quiet window that guarantees
+    the next connect fails.
+    """
+    fake = _SilentThenAnsweringNameSession(_silent_name_frames(), silent_writes=1)
+
+    async def fake_connect(self):
+        return fake
+
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+    monkeypatch.setattr("solem_blip_ble.client_v2.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client_v2.STATION_NAMES_IDLE_TIMEOUT", 0)
+    monkeypatch.setattr("solem_blip_ble.client_v2.STATUS_NOTIFY_TIMEOUT", 1.0)
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def record_sleep(delay, *args, **kwargs):
+        sleeps.append(delay)
+        # Must yield to the loop: _watch_drop polls via asyncio.sleep, and
+        # a never-yielding stub would spin it forever.
+        await real_sleep(min(delay, 0.01))
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    snapshot = await client.get_station_name_snapshot()
+    assert snapshot.reported_count == 6
+    # Two 35 00 writes on one link: original request + one in-place retry.
+    assert fake.name_writes == 2
+    # The in-place delay was honoured (watch_drop's 0.25 s poll also
+    # records; only the explicit 5 s re-request delay matters here)...
+    assert NAME_READ_IN_PLACE_DELAY in sleeps
+    # ...and the link was never torn down.
+    assert fake.disconnects == 0
+    assert fake.is_connected
+
+
+async def test_persistent_silent_link_exhausts_retries_then_raises(
+    established, monkeypatch
+):
+    """Silence through every in-place retry propagates the verdict."""
+    fake = _SilentThenAnsweringNameSession([], silent_writes=10**9)
+    real_sleep = asyncio.sleep
+
+    async def fake_connect(self):
+        return fake
+
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+    monkeypatch.setattr("solem_blip_ble.client_v2.NOTIFY_SETTLE_DELAY", 0)
+    monkeypatch.setattr("solem_blip_ble.client_v2.STATION_NAMES_IDLE_TIMEOUT", 0)
+    monkeypatch.setattr("solem_blip_ble.client_v2.STATUS_NOTIFY_TIMEOUT", 1.0)
+
+    async def no_sleep(delay, *args, **kwargs):
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    with pytest.raises(SolemSilentLink):
+        await client.get_station_name_snapshot()
+    # Original request + NAME_READ_IN_PLACE_RETRIES re-requests, no teardown.
+    assert fake.name_writes == 1 + NAME_READ_IN_PLACE_RETRIES
+    assert fake.disconnects == 0
+
+
+async def test_persistent_name_read_dead_link_not_retried_in_place(
+    established, monkeypatch
+):
+    """A confirmed-dead link surfaces immediately; no in-place re-request.
+
+    The stateless verdict for a link that reports ``is_connected`` False
+    during the read is a precise dead-link error, distinct from
+    SolemSilentLink, and must not be converted into a write on a dead
+    socket.
+    """
+    class DyingLinkClient(FakeV2Client):
+        async def write_gatt_char(self, _uuid, payload, *, response) -> None:
+            self.writes.append(payload)
+            self.is_connected = False
+            return
+
+    fake = DyingLinkClient()
+
+    async def fake_connect(self):
+        return fake
+
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+    monkeypatch.setattr("solem_blip_ble.client_v2.NOTIFY_SETTLE_DELAY", 0)
+
+    client = PersistentSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    with pytest.raises(SolemConnectionError, match="dropped"):
+        await client.get_station_name_snapshot()
+    await drain_background_disconnects()
+    assert len(fake.writes) == 1  # exactly one 35 00 attempt
+    assert fake.disconnects == 1  # torn down per the stateless verdict

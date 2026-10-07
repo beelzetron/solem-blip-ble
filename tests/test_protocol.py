@@ -456,6 +456,64 @@ def test_parse_status_watering_station_1():
     assert parsed["battery_voltage"] is None
 
 
+def test_parse_status_off_phantom_program_run_reports_idle():
+    """OFF controllers never report a run, even mid-schedule (#141).
+
+    Real capture from a permanent-OFF controller executing Program B with the
+    valves suppressed (issue #141): byte 3 = 0x10 (off), byte 8 = 0x02
+    (program 2), byte 9 = 0x02 (station 2), station-2 slot = 597 s remaining.
+    """
+    data = bytes.fromhex("3C1002000000000002025B0B100000100255")
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["controller_state"] == "Off"
+    assert parsed["is_watering"] is False
+    assert parsed["station_num"] is None
+    assert parsed["remaining_seconds"] is None
+    assert parsed["active_program"] is None
+    assert parsed["watering_origin"] is None
+
+
+def test_parse_status_off_phantom_program_transition_reports_idle():
+    """Station 2→3 transition while OFF stays idle; off-mode still parsed."""
+    data = bytes.fromhex("3C1002000000000002035B0B100000100000")
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["controller_state"] == "Off"
+    assert parsed["is_watering"] is False
+    assert parsed["station_num"] is None
+    assert parsed["controller_off_mode"] == "permanent"
+
+
+def test_parse_status_off_manual_station_reports_idle():
+    """An OFF controller reporting a station with no program stays idle."""
+    data = bytearray(18)
+    data[2] = 0x02
+    data[3] = 0x02  # off; manual-activity bit set, no controller-ON bit
+    data[9] = 1
+    data[13] = 0x00
+    data[14] = 0xB4
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["controller_state"] == "Off"
+    assert parsed["is_watering"] is False
+    assert parsed["station_num"] is None
+    assert parsed["remaining_seconds"] is None
+
+
+def test_parse_status_off_keeps_battery_and_alarm():
+    """The OFF idle path still parses battery and time-alarm bits."""
+    data = bytearray(18)
+    data[2] = 0x02
+    data[3] = 0x30  # off + time alarm (0x20)
+    data[10] = 0x50
+    parsed = protocol.parse_status_notification(data)
+    assert parsed is not None
+    assert parsed["time_alarm"] is True
+    assert parsed["battery_voltage"] == 0x50
+    assert parsed["is_watering"] is False
+
+
 def test_battery_level_9v():
     assert protocol.battery_level_9v(59) == 0
     assert protocol.battery_level_9v(64) == 1

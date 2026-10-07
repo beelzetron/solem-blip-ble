@@ -239,6 +239,32 @@ def parse_status_notification(
     controller_off_mode, controller_off_days_remaining = parse_controller_off_state(
         data, is_controller_on=is_on
     )
+
+    # While the controller is OFF the firmware keeps reporting the stored
+    # program schedule in the status frames (byte 8 / byte 9 progress in real
+    # time) but does not energize the valves — confirmed by water-meter and
+    # direct valve observations (#141). A run that does not water must not
+    # enter the activity history, so an OFF controller never reports a run:
+    # not for scheduled sequences (phantom), and not for manual starts either
+    # (no evidence the firmware accepts them while OFF; revisitable with a
+    # metered test).
+    if not is_on:
+        battery_voltage, battery_level, battery_low = parse_battery_9v(data)
+        return {
+            "controller_state": "Off",
+            "controller_off_mode": controller_off_mode,
+            "controller_off_days_remaining": controller_off_days_remaining,
+            "is_watering": False,
+            "station_num": None,
+            "remaining_seconds": None,
+            "battery_voltage": battery_voltage,
+            "battery_level": battery_level,
+            "battery_low": battery_low,
+            "time_alarm": bool(status_byte & 0x20),
+            "active_program": None,
+            "watering_origin": None,
+        }
+
     has_activity_bits = is_watering_status(status_byte)
     station_num = data[9] if 1 <= data[9] <= max_station_num else None
     is_watering = station_num is not None or has_activity_bits

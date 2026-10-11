@@ -13,7 +13,6 @@ authors = [{ name = "Solem BL-IP contributors" }]
 dependencies = [
     "bleak>=0.22.3",
     "bleak-retry-connector>=3.6.0",
-    "tenacity>=8.0.0",
 ]
 
 [project.optional-dependencies]

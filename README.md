@@ -31,14 +31,15 @@ Configure PyPI trusted publishing for this repository: PyPI project → Publishi
 ## Usage
 
 ```python
-from solem_blip_ble import SolemClient, SolemConnectionError
+from solem_blip_ble import StatelessSolemClient, SolemConnectionError
 
-client = SolemClient("AA:BB:CC:DD:EE:FF", bluetooth_timeout=30)
+client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", bluetooth_timeout=30)
 await client.connect()
 status = await client.get_status()
 await client.sprinkle_station_x_for_y_minutes(1, 5)
 await client.stop_manual_sprinkle()
-await client.disconnect()
+# Stateless: every operation connects, runs, and closes — there is no
+# disconnect() to call.
 ```
 
 ## Documentation

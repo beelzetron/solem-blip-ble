@@ -30,7 +30,7 @@ uv run mypy src/solem_blip_ble
 uv build
 
 # Test on a specific Python version
-UV_PYTHON=3.12 uv run pytest -v tests/test_client.py
+UV_PYTHON=3.12 uv run pytest -v tests/test_client_v2.py
 
 # Audit locked dependencies for known vulnerabilities
 uv export --frozen --no-emit-project -o /tmp/requirements.txt
@@ -91,7 +91,8 @@ Use the lightweight Git Flow policy in `docs/branching_and_release.md`.
 
 ## Key Files
 
-- `src/solem_blip_ble/client.py` - Main `SolemClient` class
+- `src/solem_blip_ble/client_v2.py` - `StatelessSolemClient` (stateless, default)
+- `src/solem_blip_ble/client_persistent.py` - `PersistentSolemClient` (held link)
 - `src/solem_blip_ble/protocol.py` - Protocol frame encoding/decoding
 - `src/solem_blip_ble/const.py` - Constants and command definitions
 - `scripts/validate_device.py` - Real-device validation script

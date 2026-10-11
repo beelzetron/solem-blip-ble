@@ -21,6 +21,7 @@ from solem_blip_ble.client_v2 import (
     _ConnectTimedOut,
     _DropDetected,
 )
+from solem_blip_ble.const import NOTIFY_CHAR_UUID, WRITE_CHAR_UUID
 from solem_blip_ble.exceptions import (
     ProgramWriteRejected,
     SolemConnectionError,
@@ -895,3 +896,114 @@ async def test_run_operation_no_replay_after_mutation_error(monkeypatch) -> None
 def test_program_write_rejected_remains_conservative_uncertain_write() -> None:
     """Explicit rejection is distinguishable without weakening old handling."""
     assert issubclass(ProgramWriteRejected, UncertainWrite)
+
+
+class _FakeGattCharacteristic:
+    def __init__(self, uuid: str) -> None:
+        self.uuid = uuid
+        self.properties = ["write-without-response", "notify"]
+        self.descriptors: list[str] = []
+
+
+class _FakeGattService:
+    def __init__(self, uuid: str, characteristics: list) -> None:
+        self.uuid = uuid
+        self.characteristics = characteristics
+
+
+class FakeRawV2Client(FakeV2Client):
+    """FakeV2Client with a resolvable service/characteristic tree."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.services = [
+            _FakeGattService(
+                "00001800-0000-1000-8000-00805f9b34fb",
+                [_FakeGattCharacteristic("00002a00-0000-1000-8000-00805f9b34fb")],
+            ),
+            _FakeGattService(
+                "108b0001-eab5-bc09-d0ea-0b8f467ce8ee",
+                [
+                    _FakeGattCharacteristic(
+                        "108b0002-eab5-bc09-d0ea-0b8f467ce8ee"
+                    ),
+                    _FakeGattCharacteristic(
+                        "108b0003-eab5-bc09-d0ea-0b8f467ce8ee"
+                    ),
+                ],
+            ),
+        ]
+
+
+async def test_raw_ble_session_resolves_characteristics_and_disconnects(
+    monkeypatch,
+) -> None:
+    """The raw session yields resolved characteristics and always releases."""
+    fake_client = FakeRawV2Client()
+
+    async def fake_connect(self):
+        return fake_client
+
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    async with client.raw_ble_session() as session:
+        assert session.client is fake_client
+        assert session.write_characteristic.uuid == WRITE_CHAR_UUID
+        assert session.notify_characteristic.uuid == NOTIFY_CHAR_UUID
+
+    assert fake_client.disconnects == 1
+    assert client._active_client is None
+
+
+async def test_raw_ble_session_releases_on_error(monkeypatch) -> None:
+    """An error inside the block still releases the underlying client."""
+    fake_client = FakeRawV2Client()
+
+    async def fake_connect(self):
+        return fake_client
+
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    with pytest.raises(RuntimeError, match="boom"):
+        async with client.raw_ble_session() as session:
+            raise RuntimeError("boom")
+
+    assert fake_client.disconnects == 1
+    assert client._active_client is None
+
+
+async def test_raw_ble_session_rejects_mock() -> None:
+    """Raw sessions are unavailable on a mock client."""
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", mock=True)
+    with pytest.raises(SolemConnectionError, match="mock"):
+        async with client.raw_ble_session():
+            pass  # pragma: no cover
+
+
+async def test_raw_ble_session_preserves_concurrent_drop_hint(monkeypatch) -> None:
+    """Teardown must not erase a drop hint belonging to a newer client.
+
+    The shared instance state (_active_client/_link_dropped/_drop_event) may
+    be owned by a concurrent operation when the raw session exits; the clear
+    must be conditional on the raw session still owning it.
+    """
+    raw_client = FakeRawV2Client()
+    other_client = FakeV2Client()
+
+    async def fake_connect(self):
+        return raw_client
+
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    async with client.raw_ble_session():
+        # A concurrent operation installs its own client and records a drop.
+        client._active_client = other_client
+        client._link_dropped = True
+        client._drop_event.set()
+
+    assert raw_client.disconnects == 1
+    assert client._link_dropped is True
+    assert client._drop_event.is_set()

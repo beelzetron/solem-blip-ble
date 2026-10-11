@@ -16,8 +16,8 @@ Guarantees, by construction rather than by patching:
 - **No stale state**: nothing survives an operation except parsed data.
   Stale-client reuse and poisoned-release bugs are impossible by design.
 
-The public API mirrors the 0.1.x ``SolemClient`` so consumers migrate by
-changing the import, not the calls. ``protocol.py`` is reused unchanged.
+The 0.1.x persistent-session client (``client.py``) was removed in 0.4.0;
+``protocol.py`` is reused unchanged.
 
 Single-connection device behavior: the BL-IP controller stops advertising
 during and for tens of seconds after any connection attempt. Therefore
@@ -46,7 +46,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, TypeVar
 
@@ -101,6 +103,32 @@ IDENTIFICATION_NAME_TIMEOUT = 2.0
 _T = TypeVar("_T")
 
 DISCONNECT_CLEANUP_TIMEOUT = 3.0
+
+
+@dataclass(frozen=True)
+class SolemRawBleSession:
+    """Connected BL-IP BLE session for raw validation/debug captures."""
+
+    client: BleakClient
+    notify_characteristic: Any
+    write_characteristic: Any
+
+
+def _find_characteristic(client: BleakClient, uuid: str) -> Any:
+    """Resolve a characteristic by UUID, preferring the service cache."""
+    services = client.services
+    get_characteristic = getattr(services, "get_characteristic", None)
+    if callable(get_characteristic):
+        characteristic = get_characteristic(uuid)
+        if characteristic is not None:
+            return characteristic
+
+    for service in services:
+        for characteristic in service.characteristics:
+            if str(characteristic.uuid).lower() == uuid.lower():
+                return characteristic
+
+    raise SolemConnectionError(f"Missing BLE characteristic: {uuid}")
 
 # Backend-level errors. BleakError is the base class of every backend error
 # family (BleakDBusError, BleakGATTProtocolError, bleak-esphome wrappers), so
@@ -177,11 +205,7 @@ class _StationNameWriteSession:
 
 
 class StatelessSolemClient:
-    """Connect-per-operation BLE client for a single Solem BL-IP controller.
-
-    Public API mirrors ``solem_blip_ble.client.SolemClient`` (0.1.x) so the
-    integration can migrate by changing the import.
-    """
+    """Connect-per-operation BLE client for a single Solem BL-IP controller."""
 
     def __init__(
         self,
@@ -605,7 +629,7 @@ class StatelessSolemClient:
         finally:
             wait_task.cancel()
 
-    # -- public API (mirrors 0.1.x SolemClient) ----------------------------
+    # -- public API ----------------------------------------------------------
 
     async def connect(self) -> None:
         """Verify the device is reachable and exposes the write characteristic."""
@@ -625,6 +649,36 @@ class StatelessSolemClient:
             raise SolemConnectionError("Device isn't suitable!")
 
         await self._run_operation(_op)
+
+    @asynccontextmanager
+    async def raw_ble_session(self) -> AsyncIterator[SolemRawBleSession]:
+        """Open a connected raw BLE session for validation/debug capture tooling.
+
+        The caller owns the link for the duration of the block; the client is
+        always released on exit, including on error. Not a normal operation:
+        there is no deadline, retry, or drop detection — the caller drives
+        writes/notifications directly against the resolved characteristics.
+        """
+        if self.mock:
+            raise SolemConnectionError("Raw BLE sessions are unavailable in mock mode")
+
+        client = await self._connect()
+        self._active_client = client
+        try:
+            yield SolemRawBleSession(
+                client=client,
+                notify_characteristic=_find_characteristic(client, NOTIFY_CHAR_UUID),
+                write_characteristic=_find_characteristic(client, WRITE_CHAR_UUID),
+            )
+        finally:
+            if self._active_client is client:
+                # Only clear the drop signal while we still own the shared
+                # instance state; a concurrent operation may have installed
+                # its own client (and its own in-flight drop hint).
+                self._active_client = None
+                self._link_dropped = False
+                self._drop_event.clear()
+            await self._disconnect_quietly(client)
 
     async def get_status(self, *, include_raw: bool = False) -> dict[str, Any]:
         """Poll status via commit (triggers seq 0x02 notification)."""

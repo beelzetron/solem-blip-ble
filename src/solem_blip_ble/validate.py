@@ -19,7 +19,6 @@ from bleak.exc import BleakError
 from solem_blip_ble import (
     IrrigationProgram,
     PersistentSolemClient,
-    SolemClient,
     SolemConnectionError,
     assemble_irrigation_programs,
     irrigation_config_complete,
@@ -27,6 +26,8 @@ from solem_blip_ble import (
     parse_station_name_fragment,
     parse_status_notification,
 )
+from solem_blip_ble.client_v2 import StatelessSolemClient
+from solem_blip_ble.exceptions import SolemDeadlineExceeded
 from solem_blip_ble.validate_common import (
     ALL_SECTIONS,
     BLE_BUSY_HINT,
@@ -54,11 +55,6 @@ from solem_blip_ble.validate_common import (
     write_capture_event,
 )
 
-try:
-    from tenacity import RetryError
-except ImportError:  # pragma: no cover
-    RetryError = Exception  # type: ignore[misc, assignment]
-
 SPRINKLE_VERIFY_TIMEOUT = 60.0
 ACTION_PROBE_PREFIXES = (
     "stop_manual",
@@ -76,9 +72,7 @@ SCHEDULE_WRITE_PROBE_PREFIXES = (
 
 def _connection_detail(exc: BaseException) -> str:
     detail = str(exc)
-    if isinstance(exc, RetryError):
-        detail = "BLE operation failed after retries"
-    if "not connected" in detail.lower() or isinstance(exc, RetryError):
+    if "not connected" in detail.lower():
         detail = f"{detail}. {BLE_BUSY_HINT}"
     return detail
 
@@ -144,7 +138,7 @@ def _assemble_station_names(payloads: list[bytes], *, max_stations: int) -> dict
 
 
 async def _wait_for_watering(
-    client: SolemClient,
+    client: StatelessSolemClient,
     *,
     station: int,
     timeout: float,
@@ -160,7 +154,7 @@ async def _wait_for_watering(
 
 
 async def _wait_for_program_watering(
-    client: SolemClient,
+    client: StatelessSolemClient,
     *,
     program: int,
     timeout: float,
@@ -196,7 +190,7 @@ def _parse_hhmm(value: str) -> int:
 
 
 async def _run_status_checks(
-    client: SolemClient,
+    client: StatelessSolemClient,
     report: list[StepResult],
     *,
     verbose: bool,
@@ -209,7 +203,7 @@ async def _run_status_checks(
             status = await client.get_status(include_raw=verbose)
             step.ok = True
             step.data = status
-        except (SolemConnectionError, RetryError) as exc:
+        except (SolemConnectionError, SolemDeadlineExceeded) as exc:
             step.detail = _connection_detail(exc)
             ok = False
         report.append(step)
@@ -219,7 +213,7 @@ async def _run_status_checks(
 
 
 async def _run_firmware_check(
-    client: SolemClient,
+    client: StatelessSolemClient,
     report: list[StepResult],
 ) -> None:
     step = StepResult("get_firmware_version", False)
@@ -227,13 +221,13 @@ async def _run_firmware_check(
         step.data = dict(await client.get_firmware_version())
         step.ok = True
         step.detail = f"firmware={step.data['raw_hex']}"
-    except (SolemConnectionError, RetryError) as exc:
+    except (SolemConnectionError, SolemDeadlineExceeded) as exc:
         step.detail = _connection_detail(exc)
     report.append(step)
 
 
 async def _run_names_check(
-    client: SolemClient,
+    client: StatelessSolemClient,
     report: list[StepResult],
 ) -> None:
     step = StepResult("get_station_names", False)
@@ -242,13 +236,13 @@ async def _run_names_check(
         step.ok = bool(names)
         step.data = names
         step.detail = f"{len(names)} station name(s)"
-    except (SolemConnectionError, RetryError) as exc:
+    except (SolemConnectionError, SolemDeadlineExceeded) as exc:
         step.detail = _connection_detail(exc)
     report.append(step)
 
 
 async def _run_schedule_check(
-    client: SolemClient,
+    client: StatelessSolemClient,
     report: list[StepResult],
 ) -> None:
     step = StepResult("get_irrigation_config", False)
@@ -271,18 +265,33 @@ async def _run_schedule_check(
                     detail=detail,
                 )
             )
-    except (SolemConnectionError, RetryError) as exc:
+    except (SolemConnectionError, SolemDeadlineExceeded) as exc:
         step.detail = _connection_detail(exc)
         report.append(step)
 
 
 async def _run_gatt_check(
-    client: SolemClient,
+    client: StatelessSolemClient,
     report: list[StepResult],
 ) -> None:
     step = StepResult("list_characteristics", False)
     try:
-        chars = await client.list_characteristics()
+        async with client.raw_ble_session() as session:
+            services = getattr(session.client, "services", None)
+            if services is None:
+                raise SolemConnectionError(
+                    "Services not available on BLE client"
+                )
+            chars: dict[str, list[dict[str, Any]]] = {}
+            for svc in services:
+                chars[str(svc.uuid)] = [
+                    {
+                        "uuid": str(char.uuid),
+                        "properties": list(char.properties),
+                        "descriptors": [str(d.uuid) for d in char.descriptors],
+                    }
+                    for char in svc.characteristics
+                ]
         step.ok = bool(chars)
         step.detail = f"{len(chars)} service(s)"
         report.append(step)
@@ -291,13 +300,13 @@ async def _run_gatt_check(
             for char in characteristics:
                 props = ", ".join(char["properties"])
                 print(f"         {char['uuid']} [{props}]")
-    except (SolemConnectionError, RetryError) as exc:
+    except (SolemConnectionError, SolemDeadlineExceeded) as exc:
         step.detail = _connection_detail(exc)
         report.append(step)
 
 
 async def _run_action_checks(
-    client: SolemClient,
+    client: StatelessSolemClient,
     report: list[StepResult],
     *,
     station: int,
@@ -311,7 +320,7 @@ async def _run_action_checks(
         await client.stop_manual_sprinkle()
         step.ok = True
         step.detail = "Command sent"
-    except (SolemConnectionError, RetryError) as exc:
+    except (SolemConnectionError, SolemDeadlineExceeded) as exc:
         step.detail = _connection_detail(exc)
     report.append(step)
 
@@ -328,7 +337,7 @@ async def _run_action_checks(
             await client.run_program_x(run_program)
             step.ok = True
             step.detail = "Command sent"
-        except (SolemConnectionError, RetryError) as exc:
+        except (SolemConnectionError, SolemDeadlineExceeded) as exc:
             step.detail = _connection_detail(exc)
         report.append(step)
         if not step.ok:
@@ -350,7 +359,7 @@ async def _run_action_checks(
             else:
                 step.ok = True
                 step.data = status
-        except (SolemConnectionError, RetryError) as exc:
+        except (SolemConnectionError, SolemDeadlineExceeded) as exc:
             step.detail = _connection_detail(exc)
         report.append(step)
 
@@ -362,7 +371,7 @@ async def _run_action_checks(
             await client.stop_manual_sprinkle()
             step.ok = True
             step.detail = "Command sent"
-        except (SolemConnectionError, RetryError) as exc:
+        except (SolemConnectionError, SolemDeadlineExceeded) as exc:
             step.detail = _connection_detail(exc)
         report.append(step)
         return
@@ -373,7 +382,7 @@ async def _run_action_checks(
         command_status = await client.sprinkle_station_x_for_y_minutes(station, minutes)
         step.ok = True
         step.detail = "Command sent"
-    except (SolemConnectionError, RetryError) as exc:
+    except (SolemConnectionError, SolemDeadlineExceeded) as exc:
         step.detail = _connection_detail(exc)
     report.append(step)
     if not step.ok:
@@ -408,7 +417,7 @@ async def _run_action_checks(
             else:
                 step.ok = True
                 step.data = status
-    except (SolemConnectionError, RetryError) as exc:
+    except (SolemConnectionError, SolemDeadlineExceeded) as exc:
         step.detail = _connection_detail(exc)
     report.append(step)
 
@@ -417,7 +426,7 @@ async def _run_action_checks(
         await client.stop_manual_sprinkle()
         step.ok = True
         step.detail = "Command sent"
-    except (SolemConnectionError, RetryError) as exc:
+    except (SolemConnectionError, SolemDeadlineExceeded) as exc:
         step.detail = _connection_detail(exc)
     report.append(step)
 
@@ -430,7 +439,7 @@ async def _run_live(args: argparse.Namespace) -> int:
         print("[FAIL] solem-blip-ble is not installed in this Python environment")
         return 1
 
-    client = SolemClient(
+    client = StatelessSolemClient(
         args.mac,
         bluetooth_timeout=args.connect_timeout,
         max_station_num=args.max_stations,
@@ -450,47 +459,44 @@ async def _run_live(args: argparse.Namespace) -> int:
     print(f"Mode:     {action_mode}")
     print("-" * 60)
 
-    try:
-        if "status" in sections:
-            if not await _run_status_checks(client, report, verbose=args.verbose):
-                print("-" * 60)
-                for step in report:
-                    _print_step(step)
-                print("-" * 60)
-                print("Result: FAILED (status checks did not complete)")
-                return 1
+    if "status" in sections:
+        if not await _run_status_checks(client, report, verbose=args.verbose):
+            print("-" * 60)
+            for step in report:
+                _print_step(step)
+            print("-" * 60)
+            print("Result: FAILED (status checks did not complete)")
+            return 1
 
-        if "firmware" in sections:
-            await _run_firmware_check(client, report)
-        if "names" in sections:
-            await _run_names_check(client, report)
-        if "schedule" in sections:
-            await _run_schedule_check(client, report)
-        if "gatt" in sections:
-            await _run_gatt_check(client, report)
-        if "actions" in sections and args.actions:
-            await _run_action_checks(
-                client,
-                report,
-                station=args.station,
-                minutes=args.minutes,
-                run_program=args.run_program,
-                skip_sprinkle=args.skip_sprinkle,
-                verbose=args.verbose,
-            )
+    if "firmware" in sections:
+        await _run_firmware_check(client, report)
+    if "names" in sections:
+        await _run_names_check(client, report)
+    if "schedule" in sections:
+        await _run_schedule_check(client, report)
+    if "gatt" in sections:
+        await _run_gatt_check(client, report)
+    if "actions" in sections and args.actions:
+        await _run_action_checks(
+            client,
+            report,
+            station=args.station,
+            minutes=args.minutes,
+            run_program=args.run_program,
+            skip_sprinkle=args.skip_sprinkle,
+            verbose=args.verbose,
+        )
 
-        print("-" * 60)
-        for step in report:
-            _print_step(step)
-        print("-" * 60)
-        if all(step.ok for step in report):
-            print("Result: ALL CHECKS PASSED")
-            return 0
-        failed = [step.name for step in report if not step.ok]
-        print(f"Result: FAILED ({len(failed)} step(s): {', '.join(failed)})")
-        return 1
-    finally:
-        await client.disconnect()
+    print("-" * 60)
+    for step in report:
+        _print_step(step)
+    print("-" * 60)
+    if all(step.ok for step in report):
+        print("Result: ALL CHECKS PASSED")
+        return 0
+    failed = [step.name for step in report if not step.ok]
+    print(f"Result: FAILED ({len(failed)} step(s): {', '.join(failed)})")
+    return 1
 
 
 async def _capture(args: argparse.Namespace) -> int:
@@ -547,7 +553,7 @@ async def _capture(args: argparse.Namespace) -> int:
             return 1
 
         print(f"Connecting to {args.mac}...")
-        client = SolemClient(
+        client = StatelessSolemClient(
             args.mac,
             bluetooth_timeout=args.connect_timeout,
             ble_device=device,
@@ -643,7 +649,7 @@ async def _capture_actions(args: argparse.Namespace) -> int:
 
         print(f"Connecting to {args.mac}...")
         print(f"Action capture: {action_label}")
-        client = SolemClient(
+        client = StatelessSolemClient(
             args.mac,
             bluetooth_timeout=args.connect_timeout,
             ble_device=device,
@@ -729,7 +735,7 @@ async def _capture_off_days(args: argparse.Namespace) -> int:
 
         print(f"Connecting to {args.mac}...")
         print(f"Off-days capture: {args.capture_off_days} day(s)")
-        client = SolemClient(
+        client = StatelessSolemClient(
             args.mac,
             bluetooth_timeout=args.connect_timeout,
             ble_device=device,
@@ -853,7 +859,7 @@ async def _capture_schedule_write(args: argparse.Namespace) -> int:
                     if device is None:
                         raise SolemConnectionError(f"Device not found: {args.mac}")
 
-                    client = SolemClient(
+                    client = StatelessSolemClient(
                         args.mac,
                         bluetooth_timeout=args.connect_timeout,
                         ble_device=device,
@@ -1092,7 +1098,7 @@ async def _probe_shape_a(
         snapshot = await client.get_station_name_snapshot()
         step.ok = True
         step.detail = f"{snapshot.reported_count} output(s) reported"
-    except (SolemConnectionError, RetryError) as exc:
+    except (SolemConnectionError, SolemDeadlineExceeded) as exc:
         step.detail = _connection_detail(exc)
     finally:
         await client.disconnect()
@@ -1127,7 +1133,7 @@ async def _probe_shape_a2(
             await client.hold_link()
             hold_step.ok = True
             hold_step.detail = f"held in {monotonic() - started:.1f}s"
-        except (SolemConnectionError, RetryError) as exc:
+        except (SolemConnectionError, SolemDeadlineExceeded) as exc:
             hold_step.detail = _connection_detail(exc)
             return [hold_step]
 
@@ -1144,7 +1150,7 @@ async def _probe_shape_a2(
                 f"ok in {monotonic() - started:.1f}s; "
                 f"{snapshot.reported_count} output(s) reported"
             )
-        except (SolemConnectionError, RetryError) as exc:
+        except (SolemConnectionError, SolemDeadlineExceeded) as exc:
             name_step.detail = _connection_detail(exc)
         return [hold_step, name_step]
     finally:
@@ -1175,7 +1181,7 @@ async def _probe_shape_b(
                 f"ok in {monotonic() - started:.1f}s; "
                 f"{format_status(status)}"
             )
-        except (SolemConnectionError, RetryError) as exc:
+        except (SolemConnectionError, SolemDeadlineExceeded) as exc:
             status_step.detail = _connection_detail(exc)
             return [status_step]
 
@@ -1190,7 +1196,7 @@ async def _probe_shape_b(
                 f"ok in {monotonic() - started:.1f}s; "
                 f"{snapshot.reported_count} output(s) reported"
             )
-        except (SolemConnectionError, RetryError) as exc:
+        except (SolemConnectionError, SolemDeadlineExceeded) as exc:
             name_step.detail = _connection_detail(exc)
         return [status_step, name_step]
     finally:
@@ -1680,7 +1686,7 @@ def main(default_only: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("Validation interrupted", file=sys.stderr)
         return 130
-    except RetryError as exc:
+    except (SolemConnectionError, SolemDeadlineExceeded) as exc:
         print(f"[FAIL] {_connection_detail(exc)}", file=sys.stderr)
         return 1
 

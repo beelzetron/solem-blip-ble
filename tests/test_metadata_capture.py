@@ -33,7 +33,7 @@ def load_capture_events(probe: str, direction: str = "RX") -> list[bytes]:
 def assemble_station_names(
     payloads: list[bytes], *, max_station_num: int
 ) -> dict[int, str]:
-    """Mirror SolemClient.get_station_names() fragment assembly."""
+    """Mirror StatelessSolemClient.get_station_names() fragment assembly."""
     fragments: dict[int, dict[int, bytes]] = {}
     station_names: dict[int, str] = {}
 

@@ -1007,3 +1007,74 @@ async def test_raw_ble_session_preserves_concurrent_drop_hint(monkeypatch) -> No
     assert raw_client.disconnects == 1
     assert client._link_dropped is True
     assert client._drop_event.is_set()
+
+
+# --- write echoes during config reads (issue #73) ------------------------
+
+_ECHO_FRAMES = (
+    # op 0x30 write echo, fragments 0-1 (name chunks), program 2
+    "301200124c617572696572730000000000000000",
+    "3012011200000000000000000000000000000000",
+    # op 0x38 write echo, fragments 0-4 (config/starts/durations)
+    "380e001200000064004007000b0a07ea",
+    "3812011204b005a005a005a005a005a005a005a005a0",
+    "38110212000000000000000000000000000000",
+    "381103120004b0000000000000000000000000",
+    "38080412000000000000",
+)
+
+
+def _capture_read_frames() -> list[bytes]:
+    fixture = (
+        Path(__file__).parent
+        / "fixtures"
+        / "solem_irrigation_config_c8b961d44dcc8.jsonl"
+    )
+    payloads: list[bytes] = []
+    for line in fixture.read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        event = json.loads(line)
+        if event.get("probe") == "irrigation_config" and event.get("direction") == "RX":
+            payloads.append(bytes.fromhex(event["payload_hex"]))
+    return payloads
+
+
+async def test_config_read_ignores_trailing_write_echoes(monkeypatch) -> None:
+    """Echo fragments after a write must not poison the next config read.
+
+    On a persistent connection the write echoes (normalized op 0x2F/0x37)
+    arrive about a second after the write and can land inside the next
+    get_irrigation_config collection window, where they collide by
+    fragment id with each other and with the 0x3A read response
+    (issue #73): the read must collect read responses only.
+    """
+    import solem_blip_ble.client_v2 as client_v2_module
+
+    monkeypatch.setattr(client_v2_module, "IRRIGATION_CONFIG_IDLE_TIMEOUT", 0.05)
+    read_frames = _capture_read_frames()
+
+    class EchoingClient(FakeV2Client):
+        async def write_gatt_char(
+            self, _uuid: str, payload: bytes, *, response: bool
+        ) -> None:
+            self.writes.append(payload)
+            assert response is False
+            if payload == protocol.pack_get_irrigation_config() and self.handler:
+                for frame in (*(bytes.fromhex(f) for f in _ECHO_FRAMES), *read_frames):
+                    self.handler(1, bytearray(frame))
+
+    async def fake_connect(self):
+        return EchoingClient()
+
+    monkeypatch.setattr(StatelessSolemClient, "_resolve_ble_device", lambda self: object())
+    monkeypatch.setattr(StatelessSolemClient, "_connect", fake_connect)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
+    # Without the filter the colliding echo fragments raise
+    # InvalidSnapshot("Conflicting configuration fragments") on attempt 1.
+    programs = await client.get_irrigation_config()
+
+    assert programs[0]["name"] == "Programma A"
+    assert programs[1]["name"] == "Programma B"
+    assert programs[2]["name"] == "Programma C"

@@ -1172,13 +1172,26 @@ class StatelessSolemClient:
                 nonlocal last_fragment_at
                 payload = bytes(data)
                 normalized = protocol.normalize_config_notification(payload)
-                if (
-                    normalized is not None
-                    and normalized[3] >> 4 == protocol.IRRIGATION_PROGRAM_CLASS
-                ):
-                    last_fragment_at = time.monotonic()
                 if normalized is None or normalized[3] >> 4 != protocol.IRRIGATION_PROGRAM_CLASS:
                     return
+                # A program write echoes its fragments (normalized op
+                # 0x2F/0x37) on the config characteristic about a second
+                # later; on a persistent connection they can land inside
+                # this read's collection window and collide by fragment id
+                # with read responses (issue #73). Collect read responses
+                # only.
+                if normalized[0] != protocol.IRRIGATION_CONFIG_READ_RESPONSE:
+                    _LOGGER.debug(
+                        "%s - Ignoring irrigation write echo during config read"
+                        " (op=%s, program=%s, fragment=%s): %s",
+                        self.mac_address,
+                        normalized[0],
+                        (normalized[3] & 0x0F),
+                        normalized[2],
+                        payload.hex(),
+                    )
+                    return
+                last_fragment_at = time.monotonic()
                 payloads.append(payload)
                 _LOGGER.debug(
                     "%s - Irrigation config fragment (program=%s, fragment=%s): %s",
@@ -1299,7 +1312,15 @@ class StatelessSolemClient:
                 diagnostic = self.program_write_diagnostics
                 if diagnostic["phase"] in ("preflight", "readback"):
                     normalized = protocol.normalize_config_notification(data)
-                    if normalized is not None and normalized[3] >> 4 == protocol.IRRIGATION_PROGRAM_CLASS:
+                    if (
+                        normalized is not None
+                        and normalized[3] >> 4 == protocol.IRRIGATION_PROGRAM_CLASS
+                        # Write echoes for the just-written program can
+                        # trail into the readback collection window and
+                        # collide by fragment id with read responses
+                        # (issue #73): collect read responses only.
+                        and normalized[0] == protocol.IRRIGATION_CONFIG_READ_RESPONSE
+                    ):
                         payloads.append(bytes(data))
                     return
                 diagnostic["last_reply_header"] = bytes(data[:4]).hex()

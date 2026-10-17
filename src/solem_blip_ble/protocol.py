@@ -751,6 +751,12 @@ def pack_get_irrigation_config() -> bytes:
     return bytes([0x39, 0x00])
 
 
+# Op of the controller's reply to the 0x39 config read, after
+# normalize_config_notification. Write echoes normalize to 0x2F/0x37 instead;
+# config-read collection must ignore them (issue #73).
+IRRIGATION_CONFIG_READ_RESPONSE = 0x3A
+
+
 def normalize_config_notification(data: bytes | bytearray) -> bytes | None:
     """Normalize a V5 irrigation-config notification to canonical layout.
 

@@ -6,6 +6,7 @@ Status byte 8 uses 1-based slots (1=A, 2=B, 3=C); station 5 was the active zone.
 
 from __future__ import annotations
 
+from datetime import date
 import json
 from pathlib import Path
 
@@ -144,5 +145,9 @@ def test_validate_capture_irrigation_programs():
         assert program["week_days"] == expected["week_days"]
         assert program["period_length"] == expected["period_length"]
         assert program["synchro_day"] == expected["synchro_day"]
+        # Bytes 12-15 are the controller's current date on the capture day,
+        # not a client-side interval anchor.
+        assert program["period_start_date"] is None
+        assert program["controller_date"] == date(2026, 6, 1)
         assert program["start_times"] == expected["start_times"]
         assert program["station_durations"] == expected["station_durations"]

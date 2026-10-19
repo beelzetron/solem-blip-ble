@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
 import hashlib
 from typing import Any
 
@@ -89,7 +88,14 @@ class ProgramSnapshot:
         return programs
 
     def write_frames(self) -> list[bytes]:
-        """Return a full byte-preserving write sequence for every stored slot."""
+        """Return a full byte-preserving write sequence for every stored slot.
+
+        This deliberately echoes the captured snapshot bytes for all twelve
+        slots and does NOT re-validate the cycle-4 interval invariant: a
+        restore must reproduce the captured device state, so a captured header
+        whose ``synchro_day`` is not below ``period_length`` is written back
+        unchanged instead of being rejected here.
+        """
         self.require_known_programs()
         grouped: dict[int, list[bytes]] = {
             index: list(self.blocks[index]) for index in range(3)
@@ -188,15 +194,30 @@ class ProgramSnapshot:
     def patch(
         self, index: int, changes: dict[str, Any], physical_stations: int
     ) -> tuple[list[bytes], ProgramSnapshot]:
-        """Patch fields into existing bytes; never invent unused values/dates."""
+        """Patch fields into existing bytes; never invent unused values/dates.
+
+        The cycle-4 interval invariant (``period_length >= 1`` and
+        ``synchro_day < period_length``) is re-validated on the POST-patch
+        bytes, so a captured-but-invalid header is rejected on any patch.
+        ``write_frames`` deliberately does not re-validate it: a restore
+        reproduces captured device state byte for byte.
+        """
         self.require_known_programs()
         if index not in self.blocks or not 1 <= physical_stations <= 12:
             raise ValueError("Invalid program or station count")
         supported = {"name", "inter_station_delay", "water_budget", "cycle", "week_days",
-                     "period_length", "synchro_day", "period_start_date", "start_times",
+                     "period_length", "synchro_day", "start_times",
                      "station_durations"}
         if set(changes) - supported:
-            raise ValueError("Unsupported program field")
+            unsupported = sorted(set(changes) - supported)
+            hint = (
+                "; the header date is controller-owned, use synchro_day"
+                if "period_start_date" in unsupported
+                else ""
+            )
+            raise ValueError(
+                f"Unsupported program field(s): {unsupported}{hint}"
+            )
         blocks = [bytearray(frame) for frame in self.blocks[index]]
         if self.programs[index]["cycle"] not in range(5):
             raise InvalidSnapshot("Unsupported cycle mode")
@@ -225,12 +246,6 @@ class ProgramSnapshot:
                     "period_length": (10, 255, 1), "synchro_day": (11, 255, 0),
                 }[key]
                 blocks[2][offset] = integer(value, maximum, minimum)
-            elif key == "period_start_date":
-                if isinstance(value, str):
-                    value = date.fromisoformat(value)
-                if not isinstance(value, date):
-                    raise ValueError("A valid interval start date is required")
-                blocks[2][12:16] = bytes([value.day, value.month]) + value.year.to_bytes(2, "big")
             elif key == "start_times":
                 if not isinstance(value, list) or len(value) != 8:
                     raise ValueError("Exactly eight start slots are required")
@@ -245,10 +260,17 @@ class ProgramSnapshot:
                     chunk, slot = (4, station) if station < 5 else ((5, station - 5) if station < 10 else (6, station - 10))
                     blocks[chunk][4 + slot * 3:7 + slot * 3] = integer(seconds, 0xFFFFFF).to_bytes(3, "big")
 
-        if blocks[2][8] == 4:
-            parsed_date = protocol.parse_period_start_date(blocks[2])
-            if parsed_date is None or not blocks[2][10] or blocks[2][11] >= blocks[2][10]:
-                raise InvalidSnapshot("Interval date/phase cannot be safely preserved")
+        # Cycle 4 stores a countdown phase: period_length >= 1 and synchro_day
+        # strictly below it. That bound is a defensive client-side rule
+        # mirroring the vendor client, not a verified controller guarantee.
+        if blocks[2][8] == 4 and (
+            not blocks[2][10] or blocks[2][11] >= blocks[2][10]
+        ):
+            raise InvalidSnapshot(
+                f"Interval period_length {blocks[2][10]} and synchro_day "
+                f"{blocks[2][11]} violate period_length >= 1 and "
+                "synchro_day < period_length"
+            )
         changed = [i for i, block in enumerate(blocks) if bytes(block) != self.blocks[index][i]]
         if not changed:
             return [], self

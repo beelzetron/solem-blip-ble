@@ -15,7 +15,7 @@ from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 from bleak_retry_connector import BleakClientWithServiceCache
 
-from solem_blip_ble import protocol
+from solem_blip_ble import client_v2, protocol
 from solem_blip_ble.client_v2 import (
     StatelessSolemClient,
     _ConnectTimedOut,
@@ -29,6 +29,22 @@ from solem_blip_ble.exceptions import (
     UncertainWrite,
 )
 from solem_blip_ble.snapshot import ProgramSnapshot
+
+
+WRITE_DAY = date(2026, 6, 1)
+
+
+class _FixedDate(date):
+    """``date`` subclass whose ``today()`` is pinned to ``WRITE_DAY``."""
+
+    @classmethod
+    def today(cls) -> "_FixedDate":
+        return cls(WRITE_DAY.year, WRITE_DAY.month, WRITE_DAY.day)
+
+
+def _pin_write_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freeze the client's write-day clock so the threaded date is assertable."""
+    monkeypatch.setattr(client_v2, "date", _FixedDate)
 
 
 class FakeV2Client:
@@ -613,6 +629,62 @@ async def test_write_irrigation_program_skips_readback(monkeypatch) -> None:
     assert operation_writes == [[frame] for frame in frames]
 
 
+async def test_set_irrigation_program_threads_one_write_day(monkeypatch) -> None:
+    """The header date and the derived synchro come from a single today read.
+
+    ``date.today`` advances on every call here: with a split read the header
+    would carry the second day while ``synchro_day`` was derived from the
+    first. Both must agree on the one day the write started.
+    """
+    days_read: list[date] = []
+
+    class _AdvancingDate(date):
+        @classmethod
+        def today(cls) -> "_AdvancingDate":
+            days_read.append(cls(2026, 6, len(days_read) + 1))
+            return cast("_AdvancingDate", days_read[-1])
+
+    monkeypatch.setattr(client_v2, "date", _AdvancingDate)
+
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=2)
+    program = {
+        "name": "Siepe",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 4,
+        "synchro_day": 0,
+        "period_start_date": date(2026, 5, 31),
+        "start_times": [360, None, None, None, None, None, None, None],
+        "station_durations": [600, 600],
+    }
+    expected = protocol.normalize_irrigation_program_for_write(
+        cast(protocol.IrrigationProgram, program),
+        today=date(2026, 6, 1),
+        max_stations=protocol.MAX_PROGRAM_STATIONS,
+    )
+    writes: list[bytes] = []
+
+    async def run_operation(operation, *, deadline=None):
+        fake = FakeV2Client()
+        await operation(fake)
+        writes.extend(fake.writes)
+
+    monkeypatch.setattr(client, "_run_operation", run_operation)
+    monkeypatch.setattr(
+        client, "get_irrigation_config", AsyncMock(return_value={0: expected})
+    )
+
+    await client.set_irrigation_program(0, cast(protocol.IrrigationProgram, program))
+
+    assert days_read == [date(2026, 6, 1)]
+    header = next(frame for frame in writes if frame[1] == 0x0E)
+    # Anchor 2026-05-31, write day 2026-06-01, period 4: one day elapsed.
+    assert header[11] == 3
+    assert header[12:16] == bytes([1, 6]) + (2026).to_bytes(2, "big")
+
+
 async def test_set_irrigation_program_verifies_at_full_storage_width(monkeypatch) -> None:
     """Issue #56: expected is normalized at the 12-slot storage width.
 
@@ -641,12 +713,13 @@ async def test_set_irrigation_program_verifies_at_full_storage_width(monkeypatch
     written = {1: expected}
     write = AsyncMock()
     readback = AsyncMock(return_value=written)
+    _pin_write_day(monkeypatch)
     monkeypatch.setattr(client, "write_irrigation_program", write)
     monkeypatch.setattr(client, "get_irrigation_config", readback)
 
     result = await client.set_irrigation_program(1, program)
 
-    write.assert_awaited_once_with(1, program)
+    write.assert_awaited_once_with(1, program, today=WRITE_DAY)
     readback.assert_awaited_once()
     assert result == written
 
@@ -712,12 +785,13 @@ async def test_set_irrigation_program_verifies_against_real_capture_readback(
     program = cast(protocol.IrrigationProgram, dict(snapshot.programs[0]))
     write = AsyncMock()
     readback = AsyncMock(return_value=snapshot.programs)
+    _pin_write_day(monkeypatch)
     monkeypatch.setattr(client, "write_irrigation_program", write)
     monkeypatch.setattr(client, "get_irrigation_config", readback)
 
     result = await client.set_irrigation_program(0, program)
 
-    write.assert_awaited_once_with(0, program)
+    write.assert_awaited_once_with(0, program, today=WRITE_DAY)
     readback.assert_awaited_once()
     assert result == snapshot.programs
 
@@ -739,19 +813,21 @@ async def test_set_irrigation_program_accepts_get_readback_width(monkeypatch) ->
         "week_days": 0x11,
         "period_length": 3,
         "synchro_day": 1,
-        "period_start_date": date(2014, 1, 1),
+        "period_start_date": None,
+        "controller_date": None,
         "start_times": [270, None, None, None, None, None, None, None],
         "station_durations": [0, 1500, 1500, 1500, 0, 0, 0, 0, 0, 0, 0, 0],
     }
     assert len(readback_program["station_durations"]) == protocol.MAX_PROGRAM_STATIONS
     write = AsyncMock()
     readback = AsyncMock(return_value={2: readback_program})
+    _pin_write_day(monkeypatch)
     monkeypatch.setattr(client, "write_irrigation_program", write)
     monkeypatch.setattr(client, "get_irrigation_config", readback)
 
     result = await client.set_irrigation_program(2, readback_program)
 
-    write.assert_awaited_once_with(2, readback_program)
+    write.assert_awaited_once_with(2, readback_program, today=WRITE_DAY)
     readback.assert_awaited_once()
     assert result == {2: readback_program}
 
@@ -777,13 +853,14 @@ async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> 
     )
     write = AsyncMock()
     readback = AsyncMock(return_value={1: expected})
+    _pin_write_day(monkeypatch)
     monkeypatch.setattr(client, "write_irrigation_program", write)
     monkeypatch.setattr(client, "get_irrigation_config", readback)
     client.mock = False
 
     result = await client.set_irrigation_program(1, program)
 
-    write.assert_awaited_once_with(1, program)
+    write.assert_awaited_once_with(1, program, today=WRITE_DAY)
     readback.assert_awaited_once()
     assert result == {1: expected}
 

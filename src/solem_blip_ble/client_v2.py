@@ -49,7 +49,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, TypeVar
 
 from bleak import BleakClient, BleakScanner
@@ -1155,6 +1155,7 @@ class StatelessSolemClient:
                     "period_length": 1,
                     "synchro_day": 0,
                     "period_start_date": None,
+                    "controller_date": None,
                     "start_times": [420 + program_index * 60, None, None, None, None, None, None, None],
                     "station_durations": [
                         600 if station == 0 else 0
@@ -1431,6 +1432,8 @@ class StatelessSolemClient:
         self,
         program_index: int,
         program: protocol.IrrigationProgram,
+        *,
+        today: date | None = None,
     ) -> None:
         """Write one persisted V5 irrigation program without reading it back.
 
@@ -1439,10 +1442,16 @@ class StatelessSolemClient:
         after the controller has had time to settle. It deliberately sends the
         exact same capture-inferred V5 frames as :meth:`set_irrigation_program`
         and does not append the manual-command commit frame.
+
+        ``today`` is the single write day used for both the controller-owned
+        header date and the derived ``synchro_day`` countdown; callers that
+        also normalize the program should pass the same value so the expected
+        readback and the wire frames agree.
         """
         frames = protocol.pack_set_irrigation_program(
             program_index,
             program,
+            today=today,
             # The wire always carries all 12 storage slots, so pack at the full
             # V5 storage width. This also accepts readback-shaped programs from
             # get_irrigation_config on a narrower (6-station) client instead of
@@ -1487,9 +1496,16 @@ class StatelessSolemClient:
         program_index: int,
         program: protocol.IrrigationProgram,
     ) -> dict[int, protocol.IrrigationProgram]:
-        """Write one persisted V5 irrigation program and verify by reading it back."""
+        """Write one persisted V5 irrigation program and verify by reading it back.
+
+        One ``date.today()`` read is shared by the expected-program normalization
+        and the wire write, so the controller-owned header date and the derived
+        ``synchro_day`` countdown always refer to the same write day.
+        """
+        today = date.today()
         expected = protocol.normalize_irrigation_program_for_write(
             program,
+            today=today,
             max_stations=protocol.MAX_PROGRAM_STATIONS,
         )
 
@@ -1498,7 +1514,7 @@ class StatelessSolemClient:
             programs[program_index] = expected
             return programs
 
-        await self.write_irrigation_program(program_index, program)
+        await self.write_irrigation_program(program_index, program, today=today)
         programs = await self.get_irrigation_config()
         written = programs.get(program_index)
         mismatches = protocol.irrigation_program_write_mismatches(written, expected)

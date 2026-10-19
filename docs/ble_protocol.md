@@ -359,14 +359,17 @@ Readback details:
   - byte `8`: `cycle`
   - byte `9`: `weekDays`
   - byte `10`: `periodLength`
-  - byte `11`: `synchroDay` (periodic phase anchor for cycle 4)
+  - byte `11`: `synchroDay` (countdown in days to the next run for cycle 4;
+    expected firmware behavior, pending hardware validation)
 - chunk `3` reads all 8 start times from bytes `4-19`
 - chunks `4-6` decode durations as 3-byte big-endian integers
 - a start time `>= 1440` becomes disabled (`-1`)
 
-Bytes `12-15` on the header chunk store the **period start date** when the program
-is written (day-of-month, month `1-12`, year big-endian). On readback they reflect
-the configured start date for cycle 4 (“every N days” from that anchor).
+Bytes `12-15` on the header chunk are the **controller-owned header date**
+(day-of-month, month `1-12`, year big-endian). A write carries the write day
+there; on readback the value is the controller's own date and is **not** the
+interval anchor (expected firmware behavior, pending hardware validation). The
+cycle-4 interval phase lives only in `synchroDay`.
 
 ### Station Name / Program Mapping Compatibility Path
 

@@ -22,6 +22,7 @@ from solem_blip_ble import (
     SolemConnectionError,
     assemble_irrigation_programs,
     irrigation_config_complete,
+    irrigation_program_write_mismatches,
     parse_firmware_version_response,
     parse_station_name_fragment,
     parse_status_notification,
@@ -105,6 +106,9 @@ def _print_program(program_index: int, program: IrrigationProgram) -> None:
         f" period={program['period_length']}"
         f" synchro_day={program['synchro_day']}"
     )
+    controller_date = program.get("controller_date")
+    header_date = controller_date.isoformat() if controller_date else "(none)"
+    print(f"  controller_date: {header_date}")
     start_times = ", ".join(format_minutes(minutes) for minutes in program["start_times"])
     print(f"  start_times: {start_times}")
     durations = ", ".join(
@@ -764,6 +768,21 @@ async def _capture_off_days(args: argparse.Namespace) -> int:
     return 0
 
 
+def _schedule_write_matches(
+    actual: IrrigationProgram | None,
+    expected: IrrigationProgram,
+) -> bool:
+    """Return True when a read-back program verifies against the write.
+
+    The header date (bytes 12-15) is controller-owned: a device echo carries
+    its own date in ``controller_date`` and leaves ``period_start_date`` unset,
+    so the comparison is field-level and never a whole-dict equality.
+    """
+    if actual is None:
+        return False
+    return not irrigation_program_write_mismatches(actual, expected)
+
+
 async def _capture_schedule_write(args: argparse.Namespace) -> int:
     try:
         expected, writes = schedule_write_capture_writes(
@@ -933,7 +952,7 @@ async def _capture_schedule_write(args: argparse.Namespace) -> int:
     )
     actual = programs.get(args.write_schedule_program - 1)
     print(f"Schedule write capture written to {output_path}")
-    if actual == expected:
+    if actual is not None and _schedule_write_matches(actual, expected):
         print("Read-back verification: PASS")
         _print_program(args.write_schedule_program - 1, actual)
         return 0
@@ -946,6 +965,10 @@ async def _capture_schedule_write(args: argparse.Namespace) -> int:
     else:
         print("Actual:")
         _print_program(args.write_schedule_program - 1, actual)
+        for field, (expected_value, actual_value) in (
+            irrigation_program_write_mismatches(actual, expected).items()
+        ):
+            print(f"{field}: expected {expected_value}, got {actual_value}")
     return 1
 
 

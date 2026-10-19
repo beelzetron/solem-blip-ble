@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 import json
 from pathlib import Path
 
@@ -92,5 +93,9 @@ def test_capture_programs_match_hardware(capture_payloads: list[bytes]):
         assert program["week_days"] == expected["week_days"]
         assert program["period_length"] == expected["period_length"]
         assert program["synchro_day"] == expected["synchro_day"]
+        # Header bytes 12-15 are the controller's own date; the client-side
+        # interval anchor is never reconstructed from a device read.
+        assert program["period_start_date"] is None
+        assert program["controller_date"] == date(2014, 1, 1)
         assert program["start_times"] == expected["start_times"]
         assert program["station_durations"] == expected["station_durations"]

@@ -155,7 +155,9 @@ def test_pack_set_irrigation_program_inferred_v5_frames():
     assert frames == [
         bytes.fromhex("2f12001156617369000000000000000000000000"),
         bytes.fromhex("2f12011100000000000000000000000000000000"),
-        bytes.fromhex("370e001100030064047f0201010607ea"),
+        # Header date bytes 12-15 carry the write day (today), not the anchor;
+        # synchro_day is the countdown derived from the 2026-06-01 anchor.
+        bytes.fromhex("370e001100030064047f02011f0507ea"),
         bytes.fromhex("37120111010e05a0025805a005a005a005a005a0"),
         bytes.fromhex("371102110000000005dc000708000000000000"),
         bytes.fromhex("37110311000000000000000000000000000000"),
@@ -172,12 +174,14 @@ def test_pack_set_irrigation_program_inferred_v5_frames():
         "period_length": 2,
         "synchro_day": 1,
         "period_start_date": date(2026, 6, 1),
+        "controller_date": None,
         "start_times": [270, None, 600, None, None, None, None, None],
         "station_durations": [0, 1500, 1800, 0, 0, 0],
     }
 
 
-def test_irrigation_program_write_mismatches_ignores_period_start_date():
+def test_irrigation_program_write_mismatches_ignores_controller_owned_date():
+    """The header date is controller-owned, so dates never fail verification."""
     expected: protocol.IrrigationProgram = {
         "name": "Prato",
         "inter_station_delay": 0,
@@ -187,12 +191,14 @@ def test_irrigation_program_write_mismatches_ignores_period_start_date():
         "period_length": 2,
         "synchro_day": 0,
         "period_start_date": date(2026, 6, 24),
+        "controller_date": None,
         "start_times": [270, None, None, None, None, None, None, None],
         "station_durations": [0, 1500, 1500],
     }
     written: protocol.IrrigationProgram = {
         **expected,
-        "period_start_date": date(2026, 6, 1),
+        "period_start_date": None,
+        "controller_date": date(2026, 6, 25),
     }
 
     assert protocol.irrigation_program_write_mismatches(written, expected) == {}
@@ -366,6 +372,132 @@ def test_pack_set_irrigation_program_rejects_invalid_values():
         )
 
 
+def _interval_program(
+    *,
+    period_length: int = 2,
+    synchro_day: int = 0,
+    period_start_date: date | None = None,
+) -> protocol.IrrigationProgram:
+    """Build a cycle-4 interval program fixture around the given phase inputs."""
+    return {
+        "name": "Siepe",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": period_length,
+        "synchro_day": synchro_day,
+        "period_start_date": period_start_date,
+        "controller_date": None,
+        "start_times": [270, None, None, None, None, None, None, None],
+        "station_durations": [0, 1800],
+    }
+
+
+@pytest.mark.parametrize(
+    ("anchor", "period_length", "today", "expected"),
+    [
+        # Anchor today: the next run is today, so the countdown is zero.
+        (date(2026, 6, 1), 2, date(2026, 6, 1), 0),
+        # Anchor in the past, one day into a two-day cycle.
+        (date(2026, 5, 31), 2, date(2026, 6, 1), 1),
+        # Anchor exactly one period in the past: a run is due today.
+        (date(2026, 5, 30), 2, date(2026, 6, 1), 0),
+        # Anchor in the future: the first run is one day away.
+        (date(2026, 6, 2), 2, date(2026, 6, 1), 1),
+        # Future anchor one full period out: a run is due today.
+        (date(2026, 6, 3), 2, date(2026, 6, 1), 0),
+        # Seven-day cycle, one day in.
+        (date(2026, 5, 31), 7, date(2026, 6, 1), 6),
+        # Seven-day cycle, exactly one period elapsed.
+        (date(2026, 5, 25), 7, date(2026, 6, 1), 0),
+        # Three-day cycle, one day in.
+        (date(2026, 5, 31), 3, date(2026, 6, 1), 2),
+        # A one-day cycle always runs today.
+        (date(2026, 5, 31), 1, date(2026, 6, 1), 0),
+    ],
+)
+def test_period_start_to_synchro_returns_countdown(anchor, period_length, today, expected):
+    assert protocol.period_start_to_synchro(anchor, period_length, today) == expected
+    assert 0 <= expected < period_length
+
+
+def test_period_start_to_synchro_defaults_to_today(monkeypatch):
+    class _FixedDate(date):
+        @classmethod
+        def today(cls) -> "_FixedDate":
+            return cls(2026, 6, 1)
+
+    monkeypatch.setattr(protocol, "date", _FixedDate)
+
+    assert protocol.period_start_to_synchro(date(2026, 5, 31), 2) == 1
+
+
+def test_period_start_to_synchro_rejects_zero_period():
+    with pytest.raises(ValueError, match="period_length must be at least 1"):
+        protocol.period_start_to_synchro(date(2026, 6, 1), 0, date(2026, 6, 1))
+
+
+def test_pack_set_irrigation_program_writes_today_and_derives_synchro():
+    program = _interval_program(
+        period_length=4, synchro_day=0, period_start_date=date(2026, 6, 1)
+    )
+
+    frames = protocol.pack_set_irrigation_program(
+        0, program, today=date(2026, 6, 2), max_stations=2
+    )
+    header = frames[2]
+
+    # cycle, week_days, period_length, derived countdown (4 - 1 elapsed = 3)
+    assert header[8:12] == bytes([4, 0x7F, 4, 3])
+    # Bytes 12-15 carry the write day, never the client-side anchor.
+    assert header[12:16] == bytes([2, 6]) + (2026).to_bytes(2, "big")
+    normalized = protocol.normalize_irrigation_program_for_write(
+        program, today=date(2026, 6, 2), max_stations=2
+    )
+    assert normalized["synchro_day"] == 3
+    assert normalized["period_start_date"] == date(2026, 6, 1)
+
+
+def test_pack_set_irrigation_program_keeps_explicit_synchro_without_anchor():
+    program = _interval_program(period_length=3, synchro_day=2)
+
+    frames = protocol.pack_set_irrigation_program(
+        0, program, today=date(2026, 6, 2), max_stations=2
+    )
+
+    assert frames[2][11] == 2
+
+
+def test_normalize_irrigation_program_for_write_rejects_synchro_not_below_period():
+    program = _interval_program(period_length=2, synchro_day=2)
+
+    with pytest.raises(
+        ValueError, match="synchro_day 2 must be smaller than period_length 2"
+    ):
+        protocol.normalize_irrigation_program_for_write(
+            program, today=date(2026, 6, 1), max_stations=2
+        )
+
+
+def test_readback_reports_controller_date_and_no_client_anchor():
+    program = _interval_program(period_length=3, synchro_day=1)
+    packed = protocol.pack_set_irrigation_program(
+        0, program, today=date(2026, 6, 4), max_stations=2
+    )
+    # Canonical descending fragment ids, as a real A/B/C read produces.
+    frames = [
+        frame[:2] + bytes([6 - chunk, 0x10]) + frame[4:]
+        for chunk, frame in enumerate(packed)
+    ]
+
+    programs = protocol.assemble_irrigation_programs(frames, max_stations=2)
+
+    assert programs[0]["period_start_date"] is None
+    assert programs[0]["controller_date"] == date(2026, 6, 4)
+    assert programs[0]["synchro_day"] == 1
+
+
 def test_parse_status_on_idle():
     # Minimal 18-byte frame: seq=2, status=0x40 (on, not watering)
     data = bytearray(18)
@@ -536,14 +668,28 @@ def test_parse_ignores_wrong_sequence():
     assert protocol.parse_status_notification(data) is None
 
 
-def test_parse_period_start_date_from_header_bytes():
-    from datetime import date
-
+def test_parse_controller_date_from_header_bytes():
     normalized = bytearray(20)
     normalized[12] = 1
     normalized[13] = 6
     normalized[14:16] = b"\x07\xea"
-    assert protocol.parse_period_start_date(normalized) == date(2026, 6, 1)
+    assert protocol.parse_controller_date(normalized) == date(2026, 6, 1)
+
+
+@pytest.mark.parametrize(
+    ("day", "month", "year"),
+    [(0, 6, 2026), (1, 13, 2026), (1, 0, 2026), (1, 6, 1999), (1, 6, 2101), (31, 2, 2026)],
+)
+def test_parse_controller_date_rejects_invalid_bytes(day, month, year):
+    normalized = bytearray(20)
+    normalized[12] = day
+    normalized[13] = month
+    normalized[14:16] = year.to_bytes(2, "big")
+    assert protocol.parse_controller_date(normalized) is None
+
+
+def test_parse_controller_date_requires_full_header():
+    assert protocol.parse_controller_date(bytearray(15)) is None
 
 
 def test_parse_status_program_run_uses_0x44():

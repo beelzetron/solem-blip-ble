@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import date
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -739,7 +738,8 @@ async def test_set_irrigation_program_accepts_get_readback_width(monkeypatch) ->
         "week_days": 0x11,
         "period_length": 3,
         "synchro_day": 1,
-        "period_start_date": date(2014, 1, 1),
+        "period_start_date": None,
+        "controller_date": None,
         "start_times": [270, None, None, None, None, None, None, None],
         "station_durations": [0, 1500, 1500, 1500, 0, 0, 0, 0, 0, 0, 0, 0],
     }

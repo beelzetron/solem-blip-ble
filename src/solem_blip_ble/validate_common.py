@@ -157,6 +157,7 @@ def schedule_write_capture_writes(
         "period_length": 1,
         "synchro_day": 0,
         "period_start_date": today or date.today(),
+        "controller_date": None,
         "start_times": [start_minutes, None, None, None, None, None, None, None],
         "station_durations": station_durations,
     }

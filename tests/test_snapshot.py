@@ -18,7 +18,8 @@ def _program_frames(index: int) -> list[bytes]:
         "week_days": 0x7F,
         "period_length": 1,
         "synchro_day": 0,
-        "period_start_date": date(2026, 9, 23),
+        "period_start_date": None,
+        "controller_date": None,
         "start_times": [360 if index == 2 else None] + [None] * 7,
         "station_durations": [1200 if station == 5 and index == 2 else 0 for station in range(12)],
     }
@@ -86,6 +87,89 @@ def test_expected_write_is_tied_to_preflight_snapshot() -> None:
         InvalidSnapshot, match="not covered by write frames"
     ):
         current.validate_expected_write(writes, unrelated)
+
+
+def _interval_frames(
+    *, period_length: int = 3, synchro_day: int = 1, today: date = date(2026, 6, 1)
+) -> tuple[bytes, ...]:
+    """Build the seven frames of each of the three cycle-4 interval programs."""
+    frames: list[bytes] = []
+    for index in range(3):
+        program: protocol.IrrigationProgram = {
+            "name": "Siepe",
+            "inter_station_delay": 0,
+            "water_budget": 100,
+            "cycle": 4,
+            "week_days": 0x7F,
+            "period_length": period_length,
+            "synchro_day": synchro_day,
+            "period_start_date": None,
+            "controller_date": None,
+            "start_times": [270, None, None, None, None, None, None, None],
+            "station_durations": [0, 1800] + [0] * 10,
+        }
+        packed = protocol.pack_set_irrigation_program(
+            0, program, today=today, max_stations=12
+        )
+        frames.extend(
+            # Canonical descending fragment ids, as a real A/B/C read produces.
+            frame[:2] + bytes([6 - chunk, 0x10 | index]) + frame[4:]
+            for chunk, frame in enumerate(packed)
+        )
+    return tuple(frames)
+
+
+def _mutate_header(frames: tuple[bytes, ...], offset: int, value: int) -> tuple[bytes, ...]:
+    """Return ``frames`` with one byte of program A's header chunk replaced."""
+    mutated = list(frames)
+    index = next(
+        i
+        for i, frame in enumerate(mutated)
+        if frame[1] == 0x0E and frame[3] == 0x10
+    )
+    header = bytearray(mutated[index])
+    header[offset] = value
+    mutated[index] = bytes(header)
+    return tuple(mutated)
+
+
+def test_patch_rejects_period_start_date() -> None:
+    """The interval anchor is a write input, not a patchable stored field."""
+    snapshot = ProgramSnapshot.from_frames(_interval_frames())
+
+    with pytest.raises(ValueError, match="Unsupported program field"):
+        snapshot.patch(
+            0, {"period_start_date": date(2026, 9, 23)}, physical_stations=12
+        )
+
+
+def test_patch_rejects_cycle_4_synchro_not_below_period() -> None:
+    snapshot = ProgramSnapshot.from_frames(
+        _mutate_header(_interval_frames(period_length=3, synchro_day=1), 11, 3)
+    )
+
+    with pytest.raises(InvalidSnapshot, match="synchro_day"):
+        snapshot.patch(0, {"water_budget": 50}, physical_stations=12)
+
+
+def test_patch_rejects_cycle_4_zero_period_length() -> None:
+    snapshot = ProgramSnapshot.from_frames(
+        _mutate_header(_interval_frames(period_length=3, synchro_day=1), 10, 0)
+    )
+
+    with pytest.raises(InvalidSnapshot, match="period_length"):
+        snapshot.patch(0, {"water_budget": 50}, physical_stations=12)
+
+
+def test_patch_cycle_4_preserves_controller_date_bytes() -> None:
+    snapshot = ProgramSnapshot.from_frames(_interval_frames())
+
+    writes, expected = snapshot.patch(0, {"synchro_day": 2}, physical_stations=12)
+    header = next(frame for frame in writes if frame[1] == 0x0E)
+
+    assert header[11] == 2
+    assert header[12:16] == bytes([1, 6]) + (2026).to_bytes(2, "big")
+    snapshot.validate_expected_write(writes, expected)
 
 
 def test_expected_write_rejects_payload_not_matching_write_frames() -> None:

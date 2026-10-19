@@ -1155,6 +1155,7 @@ class StatelessSolemClient:
                     "period_length": 1,
                     "synchro_day": 0,
                     "period_start_date": None,
+                    "controller_date": None,
                     "start_times": [420 + program_index * 60, None, None, None, None, None, None, None],
                     "station_durations": [
                         600 if station == 0 else 0

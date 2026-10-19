@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
 import hashlib
 from typing import Any
 
@@ -193,7 +192,7 @@ class ProgramSnapshot:
         if index not in self.blocks or not 1 <= physical_stations <= 12:
             raise ValueError("Invalid program or station count")
         supported = {"name", "inter_station_delay", "water_budget", "cycle", "week_days",
-                     "period_length", "synchro_day", "period_start_date", "start_times",
+                     "period_length", "synchro_day", "start_times",
                      "station_durations"}
         if set(changes) - supported:
             raise ValueError("Unsupported program field")
@@ -225,12 +224,6 @@ class ProgramSnapshot:
                     "period_length": (10, 255, 1), "synchro_day": (11, 255, 0),
                 }[key]
                 blocks[2][offset] = integer(value, maximum, minimum)
-            elif key == "period_start_date":
-                if isinstance(value, str):
-                    value = date.fromisoformat(value)
-                if not isinstance(value, date):
-                    raise ValueError("A valid interval start date is required")
-                blocks[2][12:16] = bytes([value.day, value.month]) + value.year.to_bytes(2, "big")
             elif key == "start_times":
                 if not isinstance(value, list) or len(value) != 8:
                     raise ValueError("Exactly eight start slots are required")
@@ -245,10 +238,14 @@ class ProgramSnapshot:
                     chunk, slot = (4, station) if station < 5 else ((5, station - 5) if station < 10 else (6, station - 10))
                     blocks[chunk][4 + slot * 3:7 + slot * 3] = integer(seconds, 0xFFFFFF).to_bytes(3, "big")
 
-        if blocks[2][8] == 4:
-            parsed_date = protocol.parse_period_start_date(blocks[2])
-            if parsed_date is None or not blocks[2][10] or blocks[2][11] >= blocks[2][10]:
-                raise InvalidSnapshot("Interval date/phase cannot be safely preserved")
+        # Cycle 4 stores a countdown phase: the controller requires
+        # period_length >= 1 and synchro_day strictly below it.
+        if blocks[2][8] == 4 and (
+            not blocks[2][10] or blocks[2][11] >= blocks[2][10]
+        ):
+            raise InvalidSnapshot(
+                "Interval period_length must be at least 1 and greater than synchro_day"
+            )
         changed = [i for i, block in enumerate(blocks) if bytes(block) != self.blocks[index][i]]
         if not changed:
             return [], self

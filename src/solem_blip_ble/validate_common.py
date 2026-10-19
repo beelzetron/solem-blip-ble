@@ -148,6 +148,9 @@ def schedule_write_capture_writes(
 
     station_durations = [0] * max_stations
     station_durations[station - 1] = duration_seconds
+    # Bind the write day once: the anchor, the expected synchro countdown and
+    # the header date must all refer to the same day.
+    today = today or date.today()
     program: protocol.IrrigationProgram = {
         "name": program_name,
         "inter_station_delay": 0,
@@ -156,7 +159,7 @@ def schedule_write_capture_writes(
         "week_days": 0x7F,
         "period_length": 1,
         "synchro_day": 0,
-        "period_start_date": today or date.today(),
+        "period_start_date": today,
         "controller_date": None,
         "start_times": [start_minutes, None, None, None, None, None, None, None],
         "station_durations": station_durations,

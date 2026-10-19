@@ -543,6 +543,41 @@ def _validate_u8(value: int, field: str) -> None:
         raise ValueError(f"{field} must be between 0 and 255")
 
 
+def _today() -> date:
+    """Return the current local date; the single clock seam in this module."""
+    return date.today()
+
+
+def _coerce_today(value: date | None) -> date:
+    """Return ``value`` as a ``date``, defaulting to the current date."""
+    if value is None:
+        return _today()
+    if isinstance(value, datetime):
+        raise ValueError(f"today must be a date, got {value!r}")
+    if not isinstance(value, date):
+        raise ValueError(f"today must be a date, got {value!r}")
+    return value
+
+
+def _coerce_period_start_date(value: date | str) -> date:
+    """Return the interval anchor as a ``date`` from a date or ISO-8601 string."""
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"period_start_date must be an ISO date, got {value!r}"
+            ) from exc
+    if isinstance(value, datetime):
+        raise ValueError(f"period_start_date must be a date, got {value!r}")
+    if isinstance(value, date):
+        return value
+    raise ValueError(
+        "period_start_date must be a date or ISO date string, "
+        f"got {value!r}"
+    )
+
+
 def period_start_to_synchro(
     period_start_date: date | str,
     period_length: int,
@@ -552,7 +587,7 @@ def period_start_to_synchro(
     """Return the ``synchro_day`` countdown for a cycle-4 interval anchor.
 
     ``period_start_date`` is the caller's interval anchor, accepted as a
-    ``date`` or an ISO-8601 date string. ``synchro_day`` is TREATED as a
+    ``date`` or an ISO-8601 date string. ``synchro_day`` is treated as a
     countdown, not a phase offset: the number of days from the write day to
     the next run. We expect the firmware to decrement it daily and to run when
     it reaches zero, then reload it with ``period_length`` (pending hardware
@@ -562,27 +597,10 @@ def period_start_to_synchro(
     is a defensive client-side rule mirroring the invariant the vendor client
     maintains; it is not a verified controller guarantee.
     """
-    if isinstance(period_start_date, str):
-        try:
-            anchor = date.fromisoformat(period_start_date)
-        except ValueError as exc:
-            raise ValueError(
-                f"period_start_date must be an ISO date, got {period_start_date!r}"
-            ) from exc
-    elif isinstance(period_start_date, datetime):
-        raise ValueError(
-            f"period_start_date must be a date, got {period_start_date!r}"
-        )
-    elif isinstance(period_start_date, date):
-        anchor = period_start_date
-    else:
-        raise ValueError(
-            "period_start_date must be a date or ISO date string, "
-            f"got {period_start_date!r}"
-        )
+    anchor = _coerce_period_start_date(period_start_date)
     if period_length < 1:
         raise ValueError(f"period_length must be at least 1, got {period_length}")
-    elapsed = ((today or date.today()) - anchor).days % period_length
+    elapsed = (_coerce_today(today) - anchor).days % period_length
     return (period_length - elapsed) % period_length
 
 
@@ -631,10 +649,13 @@ def normalize_irrigation_program_for_write(
 
     For cycle 4, a supplied ``period_start_date`` anchor drives ``synchro_day``
     as the countdown the controller expects; the ``period_start_date`` returned
-    here is the caller's anchor input that already drove that value. The header
-    date on the wire (bytes 12-15) is controller-owned, so ``controller_date``
-    is never derived from the anchor and never verified on readback.
+    here is that anchor coerced to a ``date`` (an ISO string input is parsed),
+    since it is the value that already drove the countdown. The header date on
+    the wire (bytes 12-15) is controller-owned, so ``controller_date`` is never
+    derived from the anchor and never verified on readback.
     """
+    if today is not None:
+        today = _coerce_today(today)
     _validate_u16(program["inter_station_delay"], "inter_station_delay")
     _validate_u16(program["water_budget"], "water_budget")
     _validate_u8(program["cycle"], "cycle")
@@ -644,6 +665,8 @@ def normalize_irrigation_program_for_write(
 
     synchro_day = program["synchro_day"]
     period_start_date = program.get("period_start_date")
+    if period_start_date is not None:
+        period_start_date = _coerce_period_start_date(period_start_date)
     if program["cycle"] == 4:
         period_length = program["period_length"]
         if period_length < 1:
@@ -760,7 +783,7 @@ def pack_set_irrigation_program(
     if not 0 <= program_index < IRRIGATION_PROGRAM_COUNT:
         raise ValueError("program_index must be between 0 and 2")
 
-    write_date = today or date.today()
+    write_date = _coerce_today(today)
     normalized = normalize_irrigation_program_for_write(
         program,
         today=write_date,

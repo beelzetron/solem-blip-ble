@@ -368,7 +368,8 @@ Readback details:
 Bytes `12-15` on the header chunk are the **controller-owned header date**
 (day-of-month, month `1-12`, year big-endian). A write carries the write day
 there; on readback the value is the controller's own date and is **not** the
-interval anchor. The cycle-4 interval phase lives only in `synchroDay`.
+interval anchor (expected firmware behavior, pending hardware validation). The
+cycle-4 interval phase lives only in `synchroDay`.
 
 ### Station Name / Program Mapping Compatibility Path
 

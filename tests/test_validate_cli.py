@@ -1,10 +1,12 @@
 """Tests for the packaged validation CLI helpers."""
 
 import json
+from datetime import date
+
 import pytest
 from pathlib import Path
 
-from solem_blip_ble.validate import build_parser
+from solem_blip_ble.validate import _schedule_write_matches, build_parser
 from solem_blip_ble.validate_common import (
     action_capture_writes,
     action_listen_dwell_seconds,
@@ -153,6 +155,66 @@ def test_schedule_write_capture_writes():
         )
     ]
     assert writes[-1] == ("readback_irrigation_config", protocol.pack_get_irrigation_config())
+
+
+def test_schedule_write_matches_accepts_device_echo_with_controller_date():
+    """C-1: the verdict is field-level, never whole-dict equality.
+
+    A real device echo leaves ``period_start_date`` unset and reports the
+    header date as ``controller_date``; the write-side expected program carries
+    the anchor and no controller date. That divergence must still PASS.
+    """
+    expected, _writes = schedule_write_capture_writes(
+        program_index=1,
+        program_name="Test",
+        station=2,
+        duration_seconds=90,
+        start_minutes=360,
+        max_stations=6,
+        today=date(2026, 6, 1),
+    )
+    echo: protocol.IrrigationProgram = {
+        **expected,
+        "period_start_date": None,
+        "controller_date": date(2026, 6, 1),
+    }
+
+    assert echo != expected
+    assert _schedule_write_matches(echo, expected) is True
+
+
+def test_schedule_write_matches_rejects_wrong_station_duration():
+    expected, _writes = schedule_write_capture_writes(
+        program_index=1,
+        program_name="Test",
+        station=2,
+        duration_seconds=90,
+        start_minutes=360,
+        max_stations=6,
+        today=date(2026, 6, 1),
+    )
+    echo: protocol.IrrigationProgram = {
+        **expected,
+        "period_start_date": None,
+        "controller_date": date(2026, 6, 1),
+        "station_durations": [0, 91, 0, 0, 0, 0],
+    }
+
+    assert _schedule_write_matches(echo, expected) is False
+
+
+def test_schedule_write_matches_rejects_missing_program():
+    expected, _writes = schedule_write_capture_writes(
+        program_index=1,
+        program_name="Test",
+        station=2,
+        duration_seconds=90,
+        start_minutes=360,
+        max_stations=6,
+        today=date(2026, 6, 1),
+    )
+
+    assert _schedule_write_matches(None, expected) is False
 
 
 def test_action_listen_dwell_after_start_commit():

@@ -194,7 +194,14 @@ class ProgramSnapshot:
     def patch(
         self, index: int, changes: dict[str, Any], physical_stations: int
     ) -> tuple[list[bytes], ProgramSnapshot]:
-        """Patch fields into existing bytes; never invent unused values/dates."""
+        """Patch fields into existing bytes; never invent unused values/dates.
+
+        The cycle-4 interval invariant (``period_length >= 1`` and
+        ``synchro_day < period_length``) is re-validated on the POST-patch
+        bytes, so a captured-but-invalid header is rejected on any patch.
+        ``write_frames`` deliberately does not re-validate it: a restore
+        reproduces captured device state byte for byte.
+        """
         self.require_known_programs()
         if index not in self.blocks or not 1 <= physical_stations <= 12:
             raise ValueError("Invalid program or station count")
@@ -203,9 +210,13 @@ class ProgramSnapshot:
                      "station_durations"}
         if set(changes) - supported:
             unsupported = sorted(set(changes) - supported)
+            hint = (
+                "; the header date is controller-owned, use synchro_day"
+                if "period_start_date" in unsupported
+                else ""
+            )
             raise ValueError(
-                f"Unsupported program field(s): {unsupported}; "
-                "the header date is controller-owned, use synchro_day"
+                f"Unsupported program field(s): {unsupported}{hint}"
             )
         blocks = [bytearray(frame) for frame in self.blocks[index]]
         if self.programs[index]["cycle"] not in range(5):

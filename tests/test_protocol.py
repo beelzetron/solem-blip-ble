@@ -1,6 +1,6 @@
 """Unit tests for Solem BL-IP protocol helpers."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import cast
 
 import pytest
@@ -419,10 +419,17 @@ def _interval_program(
     ],
 )
 def test_period_start_to_synchro_returns_countdown(anchor, period_length, today, expected):
-    assert protocol.period_start_to_synchro(
-        anchor, period_length, today=today
-    ) == expected
-    assert 0 <= expected < period_length
+    result = protocol.period_start_to_synchro(anchor, period_length, today=today)
+
+    # Independent check: the countdown is the distance from the write day to
+    # the next anchor anniversary, computed from the anchor and period alone
+    # rather than restated from the function's own formula.
+    elapsed = (today - anchor).days
+    periods = -(-elapsed // period_length)  # ceiling division
+    next_run = anchor + timedelta(days=periods * period_length)
+    assert result == (next_run - today).days
+    assert result == expected
+    assert 0 <= result < period_length
 
 
 def test_period_start_to_synchro_accepts_iso_date_string():
@@ -454,17 +461,9 @@ def test_period_start_to_synchro_rejects_bad_anchor(bad_anchor):
 
 
 def test_period_start_to_synchro_defaults_to_today(monkeypatch):
-    class _FixedDate(date):
-        @classmethod
-        def today(cls) -> "_FixedDate":
-            return cls(2026, 6, 1)
+    monkeypatch.setattr(protocol, "_today", lambda: date(2026, 6, 1))
 
-    monkeypatch.setattr(protocol, "date", _FixedDate)
-
-    # Build the anchor from the patched class so type validation still sees a
-    # ``date`` instance while ``date.today()`` is fixed.
-    anchor = protocol.date(2026, 5, 31)
-    assert protocol.period_start_to_synchro(anchor, 2) == 1
+    assert protocol.period_start_to_synchro(date(2026, 5, 31), 2) == 1
 
 
 def test_period_start_to_synchro_rejects_zero_period():
@@ -513,6 +512,47 @@ def test_pack_set_irrigation_program_accepts_iso_string_anchor():
     )
 
     assert frames[2][11] == 3
+
+
+def test_normalize_irrigation_program_for_write_coerces_iso_anchor_to_date():
+    """I-1: an ISO-string anchor must leave the normalized field a ``date``."""
+    program = cast(
+        protocol.IrrigationProgram,
+        {
+            **_interval_program(period_length=4, synchro_day=0),
+            "period_start_date": "2026-06-01",
+        },
+    )
+
+    normalized = protocol.normalize_irrigation_program_for_write(
+        program, today=date(2026, 6, 2), max_stations=2
+    )
+
+    assert normalized["period_start_date"] == date(2026, 6, 1)
+    assert isinstance(normalized["period_start_date"], date)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda program: protocol.period_start_to_synchro(
+            date(2026, 6, 1), 2, today=datetime(2026, 6, 2, 9, 30)
+        ),
+        lambda program: protocol.normalize_irrigation_program_for_write(
+            program, today=datetime(2026, 6, 2, 9, 30), max_stations=2
+        ),
+        lambda program: protocol.pack_set_irrigation_program(
+            0, program, today=datetime(2026, 6, 2, 9, 30), max_stations=2
+        ),
+    ],
+)
+def test_datetime_today_is_rejected_with_the_field_name(call):
+    """M-5: a datetime write day fails up front naming ``today``."""
+    program = _interval_program(period_length=4, period_start_date=date(2026, 6, 1))
+
+    with pytest.raises(ValueError, match="today") as excinfo:
+        call(program)
+    assert "datetime" in str(excinfo.value)
 
 
 def test_pack_set_irrigation_program_keeps_explicit_synchro_without_anchor():

@@ -88,7 +88,14 @@ class ProgramSnapshot:
         return programs
 
     def write_frames(self) -> list[bytes]:
-        """Return a full byte-preserving write sequence for every stored slot."""
+        """Return a full byte-preserving write sequence for every stored slot.
+
+        This deliberately echoes the captured snapshot bytes for all twelve
+        slots and does NOT re-validate the cycle-4 interval invariant: a
+        restore must reproduce the captured device state, so a captured header
+        whose ``synchro_day`` is not below ``period_length`` is written back
+        unchanged instead of being rejected here.
+        """
         self.require_known_programs()
         grouped: dict[int, list[bytes]] = {
             index: list(self.blocks[index]) for index in range(3)
@@ -195,7 +202,11 @@ class ProgramSnapshot:
                      "period_length", "synchro_day", "start_times",
                      "station_durations"}
         if set(changes) - supported:
-            raise ValueError("Unsupported program field")
+            unsupported = sorted(set(changes) - supported)
+            raise ValueError(
+                f"Unsupported program field(s): {unsupported}; "
+                "the header date is controller-owned, use synchro_day"
+            )
         blocks = [bytearray(frame) for frame in self.blocks[index]]
         if self.programs[index]["cycle"] not in range(5):
             raise InvalidSnapshot("Unsupported cycle mode")
@@ -238,13 +249,16 @@ class ProgramSnapshot:
                     chunk, slot = (4, station) if station < 5 else ((5, station - 5) if station < 10 else (6, station - 10))
                     blocks[chunk][4 + slot * 3:7 + slot * 3] = integer(seconds, 0xFFFFFF).to_bytes(3, "big")
 
-        # Cycle 4 stores a countdown phase: the controller requires
-        # period_length >= 1 and synchro_day strictly below it.
+        # Cycle 4 stores a countdown phase: period_length >= 1 and synchro_day
+        # strictly below it. That bound is a defensive client-side rule
+        # mirroring the vendor client, not a verified controller guarantee.
         if blocks[2][8] == 4 and (
             not blocks[2][10] or blocks[2][11] >= blocks[2][10]
         ):
             raise InvalidSnapshot(
-                "Interval period_length must be at least 1 and greater than synchro_day"
+                f"Interval period_length {blocks[2][10]} and synchro_day "
+                f"{blocks[2][11]} violate period_length >= 1 and "
+                "synchro_day < period_length"
             )
         changed = [i for i, block in enumerate(blocks) if bytes(block) != self.blocks[index][i]]
         if not changed:

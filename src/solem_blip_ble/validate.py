@@ -105,6 +105,9 @@ def _print_program(program_index: int, program: IrrigationProgram) -> None:
         f" period={program['period_length']}"
         f" synchro_day={program['synchro_day']}"
     )
+    controller_date = program.get("controller_date")
+    header_date = controller_date.isoformat() if controller_date else "(none)"
+    print(f"  controller_date: {header_date}")
     start_times = ", ".join(format_minutes(minutes) for minutes in program["start_times"])
     print(f"  start_times: {start_times}")
     durations = ", ".join(

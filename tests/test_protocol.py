@@ -1,6 +1,7 @@
 """Unit tests for Solem BL-IP protocol helpers."""
 
 from datetime import date, datetime
+from typing import cast
 
 import pytest
 
@@ -418,8 +419,38 @@ def _interval_program(
     ],
 )
 def test_period_start_to_synchro_returns_countdown(anchor, period_length, today, expected):
-    assert protocol.period_start_to_synchro(anchor, period_length, today) == expected
+    assert protocol.period_start_to_synchro(
+        anchor, period_length, today=today
+    ) == expected
     assert 0 <= expected < period_length
+
+
+def test_period_start_to_synchro_accepts_iso_date_string():
+    """The anchor may arrive as an ISO-8601 string from configuration storage."""
+    assert protocol.period_start_to_synchro(
+        "2026-05-31", 2, today=date(2026, 6, 1)
+    ) == 1
+    assert protocol.period_start_to_synchro(
+        date(2026, 5, 31), 2, today=date(2026, 6, 1)
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    "bad_anchor",
+    [
+        "2026-13-01",
+        "31/05/2026",
+        "",
+        20260531,
+        None,
+        datetime(2026, 5, 31, 12, 0),
+    ],
+)
+def test_period_start_to_synchro_rejects_bad_anchor(bad_anchor):
+    """Bad strings and non-date types name the field and the received value."""
+    with pytest.raises(ValueError, match="period_start_date") as excinfo:
+        protocol.period_start_to_synchro(bad_anchor, 2, today=date(2026, 6, 1))
+    assert repr(bad_anchor) in str(excinfo.value)
 
 
 def test_period_start_to_synchro_defaults_to_today(monkeypatch):
@@ -430,15 +461,21 @@ def test_period_start_to_synchro_defaults_to_today(monkeypatch):
 
     monkeypatch.setattr(protocol, "date", _FixedDate)
 
-    assert protocol.period_start_to_synchro(date(2026, 5, 31), 2) == 1
+    # Build the anchor from the patched class so type validation still sees a
+    # ``date`` instance while ``date.today()`` is fixed.
+    anchor = protocol.date(2026, 5, 31)
+    assert protocol.period_start_to_synchro(anchor, 2) == 1
 
 
 def test_period_start_to_synchro_rejects_zero_period():
-    with pytest.raises(ValueError, match="period_length must be at least 1"):
-        protocol.period_start_to_synchro(date(2026, 6, 1), 0, date(2026, 6, 1))
+    with pytest.raises(ValueError, match="period_length must be at least 1, got 0"):
+        protocol.period_start_to_synchro(
+            date(2026, 6, 1), 0, today=date(2026, 6, 1)
+        )
 
 
 def test_pack_set_irrigation_program_writes_today_and_derives_synchro():
+    """The anchor takes precedence over an explicit synchro_day on the wire."""
     program = _interval_program(
         period_length=4, synchro_day=0, period_start_date=date(2026, 6, 1)
     )
@@ -448,7 +485,9 @@ def test_pack_set_irrigation_program_writes_today_and_derives_synchro():
     )
     header = frames[2]
 
-    # cycle, week_days, period_length, derived countdown (4 - 1 elapsed = 3)
+    # cycle, week_days, period_length, derived countdown (4 - 1 elapsed = 3);
+    # the explicit synchro_day of 0 is superseded by the anchor.
+    assert program["synchro_day"] == 0
     assert header[8:12] == bytes([4, 0x7F, 4, 3])
     # Bytes 12-15 carry the write day, never the client-side anchor.
     assert header[12:16] == bytes([2, 6]) + (2026).to_bytes(2, "big")
@@ -457,6 +496,23 @@ def test_pack_set_irrigation_program_writes_today_and_derives_synchro():
     )
     assert normalized["synchro_day"] == 3
     assert normalized["period_start_date"] == date(2026, 6, 1)
+
+
+def test_pack_set_irrigation_program_accepts_iso_string_anchor():
+    """An ISO anchor string drives the same countdown as the date object."""
+    program = cast(
+        protocol.IrrigationProgram,
+        {
+            **_interval_program(period_length=4, synchro_day=0),
+            "period_start_date": "2026-06-01",
+        },
+    )
+
+    frames = protocol.pack_set_irrigation_program(
+        0, program, today=date(2026, 6, 2), max_stations=2
+    )
+
+    assert frames[2][11] == 3
 
 
 def test_pack_set_irrigation_program_keeps_explicit_synchro_without_anchor():
@@ -474,6 +530,18 @@ def test_normalize_irrigation_program_for_write_rejects_synchro_not_below_period
 
     with pytest.raises(
         ValueError, match="synchro_day 2 must be smaller than period_length 2"
+    ):
+        protocol.normalize_irrigation_program_for_write(
+            program, today=date(2026, 6, 1), max_stations=2
+        )
+
+
+def test_normalize_irrigation_program_for_write_blames_zero_period_not_synchro():
+    """A zero period is reported as such, not as a synchro_day violation."""
+    program = _interval_program(period_length=0, synchro_day=0)
+
+    with pytest.raises(
+        ValueError, match="cycle 4 requires period_length >= 1, got 0"
     ):
         protocol.normalize_irrigation_program_for_write(
             program, today=date(2026, 6, 1), max_stations=2

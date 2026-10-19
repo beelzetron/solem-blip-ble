@@ -509,8 +509,9 @@ class IrrigationProgram(TypedDict):
     ``period_start_date`` is the CLIENT-SIDE interval anchor: a write input
     only. The controller does not store it, so a device read always yields
     ``None``. ``controller_date`` is the controller-owned header date (bytes
-    12-15) reported by the firmware: it is never taken from the anchor and
-    never compared during write verification.
+    12-15) that the firmware reports; we expect it to track the controller's
+    own date (pending hardware confirmation). It is never taken from the anchor
+    and never compared during write verification.
     """
 
     name: str
@@ -521,7 +522,7 @@ class IrrigationProgram(TypedDict):
     period_length: int
     synchro_day: int
     period_start_date: date | None
-    controller_date: date | None
+    controller_date: NotRequired[date | None]
     start_times: list[int | None]
     station_durations: list[int]
 
@@ -543,20 +544,44 @@ def _validate_u8(value: int, field: str) -> None:
 
 
 def period_start_to_synchro(
-    anchor: date, period_length: int, today: date | None = None
+    period_start_date: date | str,
+    period_length: int,
+    *,
+    today: date | None = None,
 ) -> int:
     """Return the ``synchro_day`` countdown for a cycle-4 interval anchor.
 
-    ``synchro_day`` is a COUNTDOWN, not a phase offset: it is the number of
-    days from the write day to the next run. The firmware decrements it daily
-    and starts a run when it reaches zero, then reloads it with
-    ``period_length``. The value is therefore always smaller than
-    ``period_length`` (the invariant the controller enforces), and it is
-    exactly what the controller expects to receive for a given client-side
-    anchor date.
+    ``period_start_date`` is the caller's interval anchor, accepted as a
+    ``date`` or an ISO-8601 date string. ``synchro_day`` is TREATED as a
+    countdown, not a phase offset: the number of days from the write day to
+    the next run. We expect the firmware to decrement it daily and to run when
+    it reaches zero, then reload it with ``period_length`` (pending hardware
+    validation).
+
+    The result is therefore always smaller than ``period_length``. That bound
+    is a defensive client-side rule mirroring the invariant the vendor client
+    maintains; it is not a verified controller guarantee.
     """
+    if isinstance(period_start_date, str):
+        try:
+            anchor = date.fromisoformat(period_start_date)
+        except ValueError as exc:
+            raise ValueError(
+                f"period_start_date must be an ISO date, got {period_start_date!r}"
+            ) from exc
+    elif isinstance(period_start_date, datetime):
+        raise ValueError(
+            f"period_start_date must be a date, got {period_start_date!r}"
+        )
+    elif isinstance(period_start_date, date):
+        anchor = period_start_date
+    else:
+        raise ValueError(
+            "period_start_date must be a date or ISO date string, "
+            f"got {period_start_date!r}"
+        )
     if period_length < 1:
-        raise ValueError("period_length must be at least 1")
+        raise ValueError(f"period_length must be at least 1, got {period_length}")
     elapsed = ((today or date.today()) - anchor).days % period_length
     return (period_length - elapsed) % period_length
 
@@ -604,10 +629,11 @@ def normalize_irrigation_program_for_write(
 ) -> IrrigationProgram:
     """Return the program shape expected after a successful inferred V5 write.
 
-    For cycle 4, a supplied ``period_start_date`` anchor is converted to the
-    ``synchro_day`` countdown the controller expects. The header date on the
-    wire is controller-owned and never verified, so the dates carried here are
-    informational only.
+    For cycle 4, a supplied ``period_start_date`` anchor drives ``synchro_day``
+    as the countdown the controller expects; the ``period_start_date`` returned
+    here is the caller's anchor input that already drove that value. The header
+    date on the wire (bytes 12-15) is controller-owned, so ``controller_date``
+    is never derived from the anchor and never verified on readback.
     """
     _validate_u16(program["inter_station_delay"], "inter_station_delay")
     _validate_u16(program["water_budget"], "water_budget")
@@ -620,9 +646,13 @@ def normalize_irrigation_program_for_write(
     period_start_date = program.get("period_start_date")
     if program["cycle"] == 4:
         period_length = program["period_length"]
+        if period_length < 1:
+            raise ValueError(
+                f"cycle 4 requires period_length >= 1, got {period_length}"
+            )
         if period_start_date is not None:
             synchro_day = period_start_to_synchro(
-                period_start_date, period_length, today
+                period_start_date, period_length, today=today
             )
         if not 0 <= synchro_day < period_length:
             raise ValueError(
@@ -670,9 +700,9 @@ def irrigation_program_write_mismatches(
     controller's physical count) is expected to be all-zero after a write and
     nonzero hidden slots DO fail verification.
 
-    The header date (bytes 12-15) is controller-owned: the firmware keeps it
-    at its own current date, so ``period_start_date`` and ``controller_date``
-    are never compared here.
+    The header date (bytes 12-15) is controller-owned: we expect the firmware to
+    keep it at its own current date (pending hardware validation), so
+    ``period_start_date`` and ``controller_date`` are never compared here.
     """
     if written is None:
         return {"program": (expected, None)}
@@ -722,9 +752,10 @@ def pack_set_irrigation_program(
     path, so callers must not append the manual ``3b00`` commit frame unless
     hardware validation later proves it is required.
 
-    Header bytes 12-15 are controller-owned: the firmware refreshes them to
-    its own current date, so a write carries ``today`` there. The client-side
-    ``period_start_date`` anchor only drives ``synchro_day``.
+    Header bytes 12-15 are controller-owned: we expect the firmware to refresh
+    them to its own current date (pending hardware validation), so a write
+    carries ``today`` there. The client-side ``period_start_date`` anchor only
+    drives ``synchro_day``.
     """
     if not 0 <= program_index < IRRIGATION_PROGRAM_COUNT:
         raise ValueError("program_index must be between 0 and 2")
@@ -838,9 +869,10 @@ def _parse_config_int3(b0: int, b1: int, b2: int) -> int:
 def parse_controller_date(normalized: bytes | bytearray) -> date | None:
     """Parse the controller-owned header date from bytes 12-15 (day, month, year BE).
 
-    The firmware refreshes these bytes to its own current date, so this is a
-    controller clock reading, not the client-side interval anchor. Returns
-    ``None`` when the bytes do not hold a real calendar date.
+    We expect the firmware to refresh these bytes to its own current date
+    (pending hardware validation), so this is expected to be a controller clock
+    reading, not the client-side interval anchor. Returns ``None`` when the
+    bytes do not hold a real calendar date.
     """
     if len(normalized) < 16:
         return None
@@ -942,7 +974,8 @@ def _apply_irrigation_chunk(
         program["period_length"] = normalized[10]
         if len(normalized) > 11:
             program["synchro_day"] = normalized[11]
-        # Bytes 12-15 are the controller's own date, never the client anchor.
+        # Bytes 12-15 are the controller's own date (expected firmware
+        # behavior, pending hardware validation), never the client anchor.
         program["period_start_date"] = None
         program["controller_date"] = parse_controller_date(normalized)
         return name_part_1

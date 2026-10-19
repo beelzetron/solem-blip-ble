@@ -137,7 +137,9 @@ def test_patch_rejects_period_start_date() -> None:
     """The interval anchor is a write input, not a patchable stored field."""
     snapshot = ProgramSnapshot.from_frames(_interval_frames())
 
-    with pytest.raises(ValueError, match="Unsupported program field"):
+    with pytest.raises(
+        ValueError, match=r"Unsupported program field\(s\): \['period_start_date'\]"
+    ):
         snapshot.patch(
             0, {"period_start_date": date(2026, 9, 23)}, physical_stations=12
         )
@@ -157,8 +159,28 @@ def test_patch_rejects_cycle_4_zero_period_length() -> None:
         _mutate_header(_interval_frames(period_length=3, synchro_day=1), 10, 0)
     )
 
-    with pytest.raises(InvalidSnapshot, match="period_length"):
+    with pytest.raises(InvalidSnapshot, match="period_length 0 and synchro_day 1"):
         snapshot.patch(0, {"water_budget": 50}, physical_stations=12)
+
+
+def test_patch_rejects_patched_synchro_at_period_length() -> None:
+    """The guard re-checks the patched slot, not just the captured bytes."""
+    snapshot = ProgramSnapshot.from_frames(
+        _interval_frames(period_length=3, synchro_day=1)
+    )
+
+    with pytest.raises(InvalidSnapshot, match="period_length 3 and synchro_day 3"):
+        snapshot.patch(0, {"synchro_day": 3}, physical_stations=12)
+
+
+def test_patch_rejects_patched_period_length_below_synchro() -> None:
+    """Shrinking period_length under the stored countdown is rejected."""
+    snapshot = ProgramSnapshot.from_frames(
+        _interval_frames(period_length=3, synchro_day=2)
+    )
+
+    with pytest.raises(InvalidSnapshot, match="period_length 1 and synchro_day 2"):
+        snapshot.patch(0, {"period_length": 1}, physical_stations=12)
 
 
 def test_patch_cycle_4_preserves_controller_date_bytes() -> None:
@@ -170,6 +192,52 @@ def test_patch_cycle_4_preserves_controller_date_bytes() -> None:
     assert header[11] == 2
     assert header[12:16] == bytes([1, 6]) + (2026).to_bytes(2, "big")
     snapshot.validate_expected_write(writes, expected)
+
+
+def _twelve_slot_interval_frames() -> tuple[bytes, ...]:
+    """Build a complete twelve-slot capture whose headers are cycle-4 intervals."""
+    frames: list[bytes] = []
+    for index in range(12):
+        program: protocol.IrrigationProgram = {
+            "name": "Siepe",
+            "inter_station_delay": 0,
+            "water_budget": 100,
+            "cycle": 4,
+            "week_days": 0x7F,
+            "period_length": 3,
+            "synchro_day": 1,
+            "period_start_date": None,
+            "controller_date": None,
+            "start_times": [270, None, None, None, None, None, None, None],
+            "station_durations": [0, 1800] + [0] * 10,
+        }
+        packed = protocol.pack_set_irrigation_program(
+            0, program, today=date(2026, 6, 1), max_stations=12
+        )
+        frames.extend(
+            frame[:2] + bytes([6 - chunk, 0x10 | index]) + frame[4:]
+            for chunk, frame in enumerate(packed)
+        )
+    return tuple(frames)
+
+
+def test_write_frames_echoes_captured_cycle_4_header_without_revalidating() -> None:
+    """A restore reproduces captured bytes, even outside the interval invariant."""
+    captured = _mutate_header(_twelve_slot_interval_frames(), 11, 3)
+    snapshot = ProgramSnapshot.from_frames(captured)
+
+    writes = snapshot.write_frames()
+    written_header = next(
+        frame for frame in writes if frame[1] == 0x0E and frame[3] == 0x10
+    )
+    captured_header = next(
+        frame for frame in captured if frame[1] == 0x0E and frame[3] == 0x10
+    )
+
+    # synchro_day 3 == period_length 3 violates the client-side invariant, but
+    # a restore must echo the captured device state unchanged.
+    assert written_header[11] == 3
+    assert written_header[4:] == captured_header[4:]
 
 
 def test_expected_write_rejects_payload_not_matching_write_frames() -> None:

@@ -1495,14 +1495,23 @@ class StatelessSolemClient:
         self,
         program_index: int,
         program: protocol.IrrigationProgram,
+        *,
+        today: date | None = None,
     ) -> dict[int, protocol.IrrigationProgram]:
         """Write one persisted V5 irrigation program and verify by reading it back.
 
-        One ``date.today()`` read is shared by the expected-program normalization
-        and the wire write, so the controller-owned header date and the derived
-        ``synchro_day`` countdown always refer to the same write day.
+        One write day is shared by the expected-program normalization and the
+        wire write, so the controller-owned header date and the derived
+        ``synchro_day`` countdown always refer to the same day.
+
+        ``today`` is that day. Callers that keep their dates in another time
+        zone (Home Assistant uses its configured zone) pass their own local
+        date, so the packed frame and the readback expectation describe the day
+        the caller shows. ``None`` falls back to ``date.today()``, the process
+        clock.
         """
-        today = date.today()
+        if today is None:
+            today = date.today()
         expected = protocol.normalize_irrigation_program_for_write(
             program,
             today=today,

@@ -685,6 +685,86 @@ async def test_set_irrigation_program_threads_one_write_day(monkeypatch) -> None
     assert header[12:16] == bytes([1, 6]) + (2026).to_bytes(2, "big")
 
 
+async def test_set_irrigation_program_uses_caller_write_day(monkeypatch) -> None:
+    """Issue #77: an explicit write day wins over the process clock.
+
+    A caller can keep its dates in another time zone (Home Assistant uses its
+    configured zone). With the process clock the header date and the derived
+    countdown would describe a different day than the caller shows, so the
+    preview and the frame disagree and a correct write can fail its readback
+    verification.
+    """
+    _pin_write_day(monkeypatch)  # process clock stays on WRITE_DAY
+    caller_day = date(2026, 6, 2)
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=2)
+    program = {
+        "name": "Siepe",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 4,
+        "synchro_day": 0,
+        "period_start_date": date(2026, 5, 31),
+        "start_times": [360, None, None, None, None, None, None, None],
+        "station_durations": [600, 600],
+    }
+    expected = protocol.normalize_irrigation_program_for_write(
+        cast(protocol.IrrigationProgram, program),
+        today=caller_day,
+        max_stations=protocol.MAX_PROGRAM_STATIONS,
+    )
+    writes: list[bytes] = []
+
+    async def run_operation(operation, *, deadline=None):
+        fake = FakeV2Client()
+        await operation(fake)
+        writes.extend(fake.writes)
+
+    monkeypatch.setattr(client, "_run_operation", run_operation)
+    monkeypatch.setattr(
+        client, "get_irrigation_config", AsyncMock(return_value={0: expected})
+    )
+
+    await client.set_irrigation_program(
+        0, cast(protocol.IrrigationProgram, program), today=caller_day
+    )
+
+    header = next(frame for frame in writes if frame[1] == 0x0E)
+    # Anchor 2026-05-31, caller day 2026-06-02, period 4: two days elapsed, so
+    # the countdown is 2. The process clock (2026-06-01) would give 3.
+    assert header[11] == 2
+    assert header[12:16] == bytes([2, 6]) + (2026).to_bytes(2, "big")
+
+
+async def test_set_irrigation_program_mock_uses_caller_write_day(monkeypatch) -> None:
+    """Issue #77: the mock branch normalizes with the caller's day too."""
+    _pin_write_day(monkeypatch)
+    caller_day = date(2026, 6, 2)
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=2, mock=True)
+    program = {
+        "name": "Siepe",
+        "inter_station_delay": 0,
+        "water_budget": 100,
+        "cycle": 4,
+        "week_days": 0x7F,
+        "period_length": 4,
+        "synchro_day": 0,
+        "period_start_date": date(2026, 5, 31),
+        "start_times": [360, None, None, None, None, None, None, None],
+        "station_durations": [600, 600],
+    }
+    monkeypatch.setattr(
+        client, "get_irrigation_config", AsyncMock(return_value={0: dict(program)})
+    )
+
+    programs = await client.set_irrigation_program(
+        0, cast(protocol.IrrigationProgram, program), today=caller_day
+    )
+
+    assert programs[0]["synchro_day"] == 2
+
+
 async def test_set_irrigation_program_verifies_at_full_storage_width(monkeypatch) -> None:
     """Issue #56: expected is normalized at the 12-slot storage width.
 
